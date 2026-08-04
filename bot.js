@@ -1283,6 +1283,82 @@ bot.on(['photo', 'video'], async (ctx) => {
     }
 });
 
+// --- Channel support ---
+// Telegram delivers posts made directly in a Channel as a `channel_post`
+// update, not a `message` update — so bot.command() and bot.on(['photo','video'])
+// above never fire for them. This handles the same setup commands and file
+// tracking when the source/force-sub is a Channel instead of a Group.
+//
+// Channel posts are also anonymous at the Bot API level (no ctx.from), since
+// Telegram never reveals which specific admin posted. Since only channel
+// admins can post at all, authorization here checks that at least one of our
+// trusted ADMIN_IDS currently administers the channel — the channel-level
+// equivalent of the isAdmin(ctx.from.id) check used for groups.
+async function isTrustedChannelAdmin(ctx) {
+    try {
+        const admins = await ctx.telegram.getChatAdministrators(ctx.chat.id);
+        const adminIds = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
+        return admins.some(a => adminIds.includes(String(a.user.id)));
+    } catch (error) {
+        console.error('Could not verify channel admins:', error.message);
+        return false;
+    }
+}
+
+bot.on('channel_post', async (ctx) => {
+    const post = ctx.channelPost;
+
+    // File tracking: only for the already-configured source channel
+    if (post.photo || post.video) {
+        const config = loadConfig();
+        if (config.sourceGroupId && String(ctx.chat.id) === String(config.sourceGroupId)) {
+            const type = post.photo ? 'photo' : 'video';
+            const added = addSharedFile(ctx.chat.id, post.message_id, type);
+            if (added) {
+                console.log(`Tracked ${type} msg #${post.message_id} in share pool (channel)`);
+            }
+        }
+        return;
+    }
+
+    // Setup commands
+    const text = post.text;
+    if (!text || !text.startsWith('/')) {
+        // Not a setup command — check if it's a MEGA link instead
+        if (text) {
+            const megaLink = cleanMegaLink(text);
+            if (megaLink) {
+                if (!(await isTrustedChannelAdmin(ctx))) return;
+                console.log(`🔍 Detected MEGA link in channel ${ctx.chat.id}`);
+                await queue.add(() => processMegaLink(ctx, megaLink));
+            }
+        }
+        return;
+    }
+    const command = text.split(' ')[0].split('@')[0];
+    if (!['/setforcesub', '/setsource', '/unsetforcesub'].includes(command)) return;
+
+    if (!(await isTrustedChannelAdmin(ctx))) return;
+
+    const config = loadConfig();
+
+    if (command === '/setforcesub') {
+        if (!config.forceSubGroupIds.includes(ctx.chat.id)) {
+            config.forceSubGroupIds.push(ctx.chat.id);
+            saveConfig(config);
+        }
+        await ctx.reply(`✅ Added "${ctx.chat.title}" as a force-sub group.\n\nTotal force-sub groups: ${config.forceSubGroupIds.length}`);
+    } else if (command === '/setsource') {
+        config.sourceGroupId = ctx.chat.id;
+        saveConfig(config);
+        await ctx.reply(`✅ Set "${ctx.chat.title}" as the source group.\n\nPhoto/video files posted here will now be tracked automatically.`);
+    } else if (command === '/unsetforcesub') {
+        config.forceSubGroupIds = config.forceSubGroupIds.filter(id => id !== ctx.chat.id);
+        saveConfig(config);
+        await ctx.reply(`✅ Removed "${ctx.chat.title}" from the force-sub list.`);
+    }
+});
+
 // ===== End Force-Sub File Sharing Feature =====
 
 bot.on('message', async (ctx) => {

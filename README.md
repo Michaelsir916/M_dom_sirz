@@ -1,1 +1,10 @@
-# M_dom_sirz
+# mega
+
+
+MEGA UPLOAD 
+
+MEGA TO TELEGRAM 
+
+VIDEO FILE 
+
+BY @MR_BOOMSIR

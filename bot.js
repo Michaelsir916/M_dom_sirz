@@ -1298,15 +1298,19 @@ async function isTrustedChannelAdmin(ctx) {
     try {
         const admins = await ctx.telegram.getChatAdministrators(ctx.chat.id);
         const adminIds = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
-        return admins.some(a => adminIds.includes(String(a.user.id)));
+        const foundIds = admins.map(a => String(a.user.id));
+        const authorized = foundIds.some(id => adminIds.includes(id));
+        console.log(`🔐 Channel admin check for ${ctx.chat.id}: channel admins=[${foundIds.join(',')}] our ADMIN_IDS=[${adminIds.join(',')}] authorized=${authorized}`);
+        return authorized;
     } catch (error) {
-        console.error('Could not verify channel admins:', error.message);
+        console.error('❌ Could not verify channel admins:', error.message);
         return false;
     }
 }
 
 bot.on('channel_post', async (ctx) => {
     const post = ctx.channelPost;
+    console.log(`📨 channel_post received in ${ctx.chat.id}: "${(post.text || '[non-text]').slice(0, 50)}"`);
 
     // File tracking: only for the already-configured source channel
     if (post.photo || post.video) {

@@ -4,6 +4,7 @@ const path = require('path');
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const FILES_PATH = path.join(__dirname, 'shared_files.json');
 const USERS_PATH = path.join(__dirname, 'share_users.json');
+const KNOWN_CHATS_PATH = path.join(__dirname, 'known_chats.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -167,6 +168,41 @@ function getStats() {
     };
 }
 
+// ===== Known Chats (groups/channels the bot has seen) =====
+// Populated automatically whenever the bot receives an update from a
+// group/supergroup/channel. Used to build "tap to pick" buttons instead of
+// making the admin type IDs or run commands inside the target chat.
+function loadKnownChats() {
+    return safeReadJson(KNOWN_CHATS_PATH, {});
+}
+
+function saveKnownChats(chats) {
+    atomicWrite(KNOWN_CHATS_PATH, chats);
+}
+
+// Records/updates a chat's id, title and type. Cheap no-op write skip if unchanged.
+function recordKnownChat(chatId, title, type) {
+    const chats = loadKnownChats();
+    const key = String(chatId);
+    const existing = chats[key];
+    if (existing && existing.title === title && existing.type === type) return;
+    chats[key] = { id: chatId, title: title || 'Untitled', type, last_seen: new Date().toISOString() };
+    saveKnownChats(chats);
+}
+
+function getKnownChats() {
+    return Object.values(loadKnownChats()).sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+}
+
+function removeKnownChat(chatId) {
+    const chats = loadKnownChats();
+    const key = String(chatId);
+    if (chats[key]) {
+        delete chats[key];
+        saveKnownChats(chats);
+    }
+}
+
 // ===== Admin check =====
 function isAdmin(userId) {
     const adminIds = (process.env.ADMIN_IDS || '')
@@ -188,5 +224,8 @@ module.exports = {
     recordRequest,
     getAllUserIds,
     getStats,
-    isAdmin
+    isAdmin,
+    recordKnownChat,
+    getKnownChats,
+    removeKnownChat
 };

@@ -18,7 +18,10 @@ const {
     recordRequest,
     getAllUserIds,
     getStats,
-    isAdmin
+    isAdmin,
+    recordKnownChat,
+    getKnownChats,
+    removeKnownChat
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -40,6 +43,27 @@ async function startMtproto() {
     }
 }
 let botUsername = '';
+
+// In-memory "what is this admin currently typing for" state, keyed by admin
+// user id. Used so button flows (add force-sub, set source, broadcast, custom
+// values) can ask the admin to send one plain message instead of a slash
+// command. Cleared on use, on /cancel, or lost on restart (admin just retaps).
+const pendingAction = {};
+
+function chatTypeIcon(type) {
+    if (type === 'channel') return '📢';
+    if (type === 'group' || type === 'supergroup') return '👥';
+    return '💬';
+}
+
+// Records any non-private chat the bot sees a message from, so it can later
+// be offered as a tap-to-pick button for force-sub / source setup — no need
+// for the admin to enter the chat and type a command.
+function trackKnownChat(ctx) {
+    if (!ctx.chat || ctx.chat.type === 'private') return;
+    recordKnownChat(ctx.chat.id, ctx.chat.title, ctx.chat.type);
+}
+
 function cleanMegaLink(link) {
     if (!link) return null;
     let cleanedLink = link.trim()
@@ -1098,25 +1122,40 @@ bot.action('menu_mega', async (ctx) => {
 
 async function renderFileSharePanel(ctx) {
     const config = loadConfig();
+    const sourceLabel = config.sourceGroupId
+        ? (getKnownChats().find(c => String(c.id) === String(config.sourceGroupId))?.title || config.sourceGroupId)
+        : 'Not set';
     const text = '🎬 *File Sharing*\n\n' +
-        '_Setup (run inside the target group):_\n' +
-        '`/setsource` `/setforcesub` `/unsetforcesub`\n\n' +
-        '_Other (need a value, type manually):_\n' +
-        '`/delfile <index>` `/broadcast <msg>`';
+        `Force-sub groups/channels: ${config.forceSubGroupIds.length}\n` +
+        `Source: ${sourceLabel}\n\n` +
+        '_Everything below is button-driven — no need to enter the target chat._';
 
     const keyboard = {
         inline_keyboard: [
+            [{ text: '➕ Add Force-Sub', callback_data: 'fs_addfs_menu' }, { text: '📋 Force-Sub List', callback_data: 'fs_listforcesub' }],
+            [{ text: '🎯 Set Source', callback_data: 'fs_setsrc_menu' }],
             [{ text: '📁 List Files', callback_data: 'fs_listfiles' }, { text: '📊 Stats', callback_data: 'fs_stats' }],
-            [{ text: '📋 Force-Sub Groups', callback_data: 'fs_listforcesub' }],
             [{ text: `🔢 Per Request: ${config.shareCount}`, callback_data: 'fs_count_menu' }],
             [{ text: `⏱ Cooldown: ${config.cooldownSeconds}s`, callback_data: 'fs_cooldown_menu' }],
             [{ text: `📆 Daily Limit: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}`, callback_data: 'fs_dailylimit_menu' }],
             [{ text: `🗑 Auto-Delete: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + 'm'}`, callback_data: 'fs_autodelete_menu' }],
+            [{ text: '📢 Broadcast', callback_data: 'fs_broadcast_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
 
     await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+// Renders a list of known groups/channels (auto-tracked from any update the
+// bot has seen from them) as tappable buttons, excluding already-picked ones.
+function knownChatPickerKeyboard(excludeIds, prefix, backCallback) {
+    const exclude = new Set(excludeIds.map(String));
+    const chats = getKnownChats().filter(c => !exclude.has(String(c.id)));
+    const rows = chats.slice(0, 20).map(c => [{ text: `${chatTypeIcon(c.type)} ${c.title}`, callback_data: `${prefix}:${c.id}` }]);
+    rows.push([{ text: '⌨️ Type ID / @username instead', callback_data: `${prefix}_manual` }]);
+    rows.push([{ text: '🔙 Back', callback_data: backCallback }]);
+    return { rows, truncated: chats.length > 20, total: chats.length };
 }
 
 bot.action('menu_fileshare', async (ctx) => {
@@ -1130,15 +1169,38 @@ bot.action('fs_listfiles', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     const files = loadSharedFiles();
-    const text = files.length === 0
-        ? 'No files in the pool yet.'
-        : `📁 Files (${files.length} total, showing first 50):\n\n` +
-          files.slice(0, 50).map((f, i) => `${i}. ${f.type} — msg #${f.message_id} — ${f.added_at.slice(0, 10)}`).join('\n') +
-          '\n\nTo remove: `/delfile <index>`';
-    await ctx.editMessageText(text, {
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
-    });
+    if (files.length === 0) {
+        await ctx.editMessageText('No files in the pool yet.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+        });
+        return;
+    }
+    const shown = files.slice(0, 15);
+    const text = `📁 Files (${files.length} total, tap ❌ to remove — showing first ${shown.length}):\n\n` +
+        shown.map((f, i) => `${i}. ${f.type} — msg #${f.message_id} — ${f.added_at.slice(0, 10)}`).join('\n');
+    const rows = shown.map((f, i) => [{ text: `❌ Remove #${i} (${f.type})`, callback_data: `fs_delfile:${i}` }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'menu_fileshare' }]);
+    await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } });
+});
+
+bot.action(/^fs_delfile:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const idx = parseInt(ctx.match[1], 10);
+    const removed = deleteFileByIndex(idx);
+    await ctx.answerCbQuery(removed ? `✅ Removed ${removed.type}` : '❌ Not found (list may have shifted)');
+    const files = loadSharedFiles();
+    if (files.length === 0) {
+        await ctx.editMessageText('No files in the pool yet.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+        });
+        return;
+    }
+    const shown = files.slice(0, 15);
+    const text = `📁 Files (${files.length} total, tap ❌ to remove — showing first ${shown.length}):\n\n` +
+        shown.map((f, i) => `${i}. ${f.type} — msg #${f.message_id} — ${f.added_at.slice(0, 10)}`).join('\n');
+    const rows = shown.map((f, i) => [{ text: `❌ Remove #${i} (${f.type})`, callback_data: `fs_delfile:${i}` }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'menu_fileshare' }]);
+    await ctx.editMessageText(text, { reply_markup: { inline_keyboard: rows } });
 });
 
 bot.action('fs_stats', async (ctx) => {
@@ -1152,27 +1214,132 @@ bot.action('fs_stats', async (ctx) => {
     });
 });
 
+async function renderForceSubList(ctx) {
+    const config = loadConfig();
+    if (config.forceSubGroupIds.length === 0) {
+        await ctx.editMessageText('No force-sub groups/channels set yet.', {
+            reply_markup: { inline_keyboard: [
+                [{ text: '➕ Add Force-Sub', callback_data: 'fs_addfs_menu' }],
+                [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
+            ] }
+        });
+        return;
+    }
+    const entries = await Promise.all(config.forceSubGroupIds.map(async (id) => {
+        try {
+            const chat = await ctx.telegram.getChat(id);
+            recordKnownChat(chat.id, chat.title, chat.type);
+            return { id, label: `${chatTypeIcon(chat.type)} ${chat.title}` };
+        } catch (e) {
+            return { id, label: `⚠️ ${id} (unreachable)` };
+        }
+    }));
+    const text = `📋 *Force-Sub Groups/Channels* (${entries.length}) — tap ❌ to remove:`;
+    const rows = entries.map(e => [{ text: e.label, callback_data: 'noop' }, { text: '❌', callback_data: `fs_rmfs:${e.id}` }]);
+    rows.push([{ text: '➕ Add More', callback_data: 'fs_addfs_menu' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'menu_fileshare' }]);
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
 bot.action('fs_listforcesub', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
+    await renderForceSubList(ctx);
+});
+
+bot.action('noop', async (ctx) => ctx.answerCbQuery());
+
+bot.action(/^fs_rmfs:(-?\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
     const config = loadConfig();
-    let text;
-    if (config.forceSubGroupIds.length === 0) {
-        text = 'No force-sub groups set yet.';
-    } else {
-        const lines = await Promise.all(config.forceSubGroupIds.map(async (id) => {
-            try {
-                const chat = await ctx.telegram.getChat(id);
-                return `• ${chat.title} (${id})`;
-            } catch (e) {
-                return `• ${id} (unreachable)`;
-            }
-        }));
-        text = `📋 Force-Sub Groups:\n\n${lines.join('\n')}`;
-    }
-    await ctx.editMessageText(text, {
+    config.forceSubGroupIds = config.forceSubGroupIds.filter(id => id !== chatId);
+    saveConfig(config);
+    await ctx.answerCbQuery('✅ Removed');
+    await renderForceSubList(ctx);
+});
+
+// --- Add Force-Sub (button-driven, no need to enter the target chat) ---
+bot.action('fs_addfs_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const config = loadConfig();
+    const { rows, truncated, total } = knownChatPickerKeyboard(config.forceSubGroupIds, 'fs_addfs', 'menu_fileshare');
+    const note = total === 0
+        ? '_I haven\'t seen any groups/channels yet — add me to one first, or type an ID/@username._'
+        : truncated ? `_Showing 20 of ${total} known chats._` : '';
+    await ctx.editMessageText(`➕ *Add Force-Sub*\n\nTap a group/channel I already know, or enter one manually.\n\n${note}`, {
         parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^fs_addfs:(-?\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
+    const config = loadConfig();
+    if (!config.forceSubGroupIds.includes(chatId)) {
+        config.forceSubGroupIds.push(chatId);
+        saveConfig(config);
+    }
+    await ctx.answerCbQuery('✅ Added');
+    await renderForceSubList(ctx);
+});
+
+bot.action('fs_addfs_manual', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'add_forcesub_manual' };
+    await ctx.editMessageText('⌨️ Send the group/channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be a member/admin there. Send /cancel to abort.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'fs_listforcesub' }]] }
+    });
+});
+
+// --- Set Source (button-driven) ---
+bot.action('fs_setsrc_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const { rows, truncated, total } = knownChatPickerKeyboard([], 'fs_setsrc', 'menu_fileshare');
+    const note = total === 0
+        ? '_I haven\'t seen any groups/channels yet — add me to one first, or type an ID/@username._'
+        : truncated ? `_Showing 20 of ${total} known chats._` : '';
+    await ctx.editMessageText(`🎯 *Set Source*\n\nPhoto/video files posted there by admins get tracked automatically.\n\n${note}`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^fs_setsrc:(-?\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
+    const config = loadConfig();
+    config.sourceGroupId = chatId;
+    saveConfig(config);
+    const chat = getKnownChats().find(c => String(c.id) === String(chatId));
+    await ctx.answerCbQuery('✅ Source set');
+    await ctx.editMessageText(`✅ Source set to "${chat ? chat.title : chatId}".`, {
         reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+    });
+});
+
+bot.action('fs_setsrc_manual', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'set_source_manual' };
+    await ctx.editMessageText('⌨️ Send the source group/channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be a member/admin there. Send /cancel to abort.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu_fileshare' }]] }
+    });
+});
+
+// --- Broadcast (button-driven) ---
+bot.action('fs_broadcast_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'broadcast' };
+    await ctx.editMessageText('📢 Send the message to broadcast to all /random users now, or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu_fileshare' }]] }
     });
 });
 
@@ -1185,9 +1352,9 @@ bot.action('fs_count_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     const config = loadConfig();
-    await ctx.editMessageText(`🔢 *Files per Request*\n\nCurrent: ${config.shareCount}\n\nPick a value, or type \`/setcount <n>\` for a custom one.`, {
+    await ctx.editMessageText(`🔢 *Files per Request*\n\nCurrent: ${config.shareCount}`, {
         parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [presetRow([1, 2, 3, 5], 'fs_count'), [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+        reply_markup: { inline_keyboard: [presetRow([1, 2, 3, 5], 'fs_count'), [{ text: '✏️ Custom', callback_data: 'fs_custom_count' }], [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
     });
 });
 
@@ -1195,9 +1362,9 @@ bot.action('fs_cooldown_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     const config = loadConfig();
-    await ctx.editMessageText(`⏱ *Cooldown*\n\nCurrent: ${config.cooldownSeconds}s\n\nPick a value, or type \`/setcooldown <sec>\` for a custom one.`, {
+    await ctx.editMessageText(`⏱ *Cooldown*\n\nCurrent: ${config.cooldownSeconds}s`, {
         parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [presetRow([0, 10, 15, 30, 60], 'fs_cooldown', 's'), [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+        reply_markup: { inline_keyboard: [presetRow([0, 10, 15, 30, 60], 'fs_cooldown', 's'), [{ text: '✏️ Custom', callback_data: 'fs_custom_cooldown' }], [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
     });
 });
 
@@ -1205,9 +1372,9 @@ bot.action('fs_dailylimit_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     const config = loadConfig();
-    await ctx.editMessageText(`📆 *Daily Limit*\n\nCurrent: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}\n\nPick a value (0 = unlimited), or type \`/setdailylimit <n>\` for a custom one.`, {
+    await ctx.editMessageText(`📆 *Daily Limit*\n\nCurrent: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}`, {
         parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [presetRow([0, 5, 10, 20], 'fs_dailylimit'), [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+        reply_markup: { inline_keyboard: [presetRow([0, 5, 10, 20], 'fs_dailylimit'), [{ text: '✏️ Custom', callback_data: 'fs_custom_dailylimit' }], [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
     });
 });
 
@@ -1215,9 +1382,28 @@ bot.action('fs_autodelete_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     const config = loadConfig();
-    await ctx.editMessageText(`🗑 *Auto-Delete*\n\nCurrent: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + ' min'}\n\nPick a value (0 = off), or type \`/setautodelete <min>\` for a custom one.`, {
+    await ctx.editMessageText(`🗑 *Auto-Delete*\n\nCurrent: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + ' min'}`, {
         parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [presetRow([0, 10, 30, 60], 'fs_autodelete', 'm'), [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+        reply_markup: { inline_keyboard: [presetRow([0, 10, 30, 60], 'fs_autodelete', 'm'), [{ text: '✏️ Custom', callback_data: 'fs_custom_autodelete' }], [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+    });
+});
+
+const CUSTOM_FIELD_MAP = {
+    custom_count: { key: 'shareCount', label: 'Files per request', min: 1, menu: 'fs_count_menu' },
+    custom_cooldown: { key: 'cooldownSeconds', label: 'Cooldown (seconds)', min: 0, menu: 'fs_cooldown_menu' },
+    custom_dailylimit: { key: 'dailyLimit', label: 'Daily limit', min: 0, menu: 'fs_dailylimit_menu' },
+    custom_autodelete: { key: 'autoDeleteMinutes', label: 'Auto-delete (minutes)', min: 0, menu: 'fs_autodelete_menu' }
+};
+
+bot.action(/^fs_custom_(count|cooldown|dailylimit|autodelete)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const type = `custom_${ctx.match[1]}`;
+    const field = CUSTOM_FIELD_MAP[type];
+    pendingAction[ctx.from.id] = { type };
+    await ctx.editMessageText(`✏️ Send a whole number for *${field.label}* (${field.min}+), or /cancel.`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: field.menu }]] }
     });
 });
 
@@ -1271,6 +1457,7 @@ bot.action('menu_back', async (ctx) => {
 // Only the (chat_id, message_id) is saved — sharing later uses copyMessage.
 bot.on(['photo', 'video'], async (ctx) => {
     if (ctx.chat.type === 'private') return;
+    trackKnownChat(ctx);
 
     const config = loadConfig();
     if (!config.sourceGroupId || String(ctx.chat.id) !== String(config.sourceGroupId)) return;
@@ -1311,6 +1498,7 @@ async function isTrustedChannelAdmin(ctx) {
 bot.on('channel_post', async (ctx) => {
     const post = ctx.channelPost;
     console.log(`📨 channel_post received in ${ctx.chat.id}: "${(post.text || '[non-text]').slice(0, 50)}"`);
+    trackKnownChat(ctx);
 
     // File tracking: only for the already-configured source channel
     if (post.photo || post.video) {
@@ -1365,8 +1553,106 @@ bot.on('channel_post', async (ctx) => {
 
 // ===== End Force-Sub File Sharing Feature =====
 
+// Handles the "next plain message" step of a button flow (add force-sub
+// manually, set source manually, broadcast, or a custom numeric value).
+async function handlePendingAction(ctx, text) {
+    const userId = ctx.from.id;
+    const action = pendingAction[userId];
+    if (!action) return;
+
+    if (text.trim() === '/cancel') {
+        delete pendingAction[userId];
+        await ctx.reply('❌ Cancelled.');
+        return;
+    }
+
+    if (action.type === 'add_forcesub_manual' || action.type === 'set_source_manual') {
+        const identifier = text.trim();
+        if (!identifier) {
+            await ctx.reply('⚠️ Send a chat ID (e.g. -1001234567890) or @username, or /cancel.');
+            return;
+        }
+        let chat;
+        try {
+            const target = identifier.startsWith('@') || isNaN(identifier) ? identifier : Number(identifier);
+            chat = await ctx.telegram.getChat(target);
+        } catch (error) {
+            await ctx.reply(`❌ Couldn't find that chat (${error.message}). Make sure I'm added there, then try again, or /cancel.`);
+            return;
+        }
+        try {
+            await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
+        } catch (error) {
+            await ctx.reply(`⚠️ Found "${chat.title}" but I don't seem to be a member/admin there. Add me first, then try again, or /cancel.`);
+            return;
+        }
+        recordKnownChat(chat.id, chat.title, chat.type);
+        const config = loadConfig();
+        if (action.type === 'add_forcesub_manual') {
+            if (!config.forceSubGroupIds.includes(chat.id)) {
+                config.forceSubGroupIds.push(chat.id);
+                saveConfig(config);
+            }
+            await ctx.reply(`✅ Added "${chat.title}" as a force-sub ${chat.type === 'channel' ? 'channel' : 'group'}.`);
+        } else {
+            config.sourceGroupId = chat.id;
+            saveConfig(config);
+            await ctx.reply(`✅ Set "${chat.title}" as the source ${chat.type === 'channel' ? 'channel' : 'group'}.`);
+        }
+        delete pendingAction[userId];
+        return;
+    }
+
+    if (action.type === 'broadcast') {
+        delete pendingAction[userId];
+        const userIds = getAllUserIds();
+        if (userIds.length === 0) {
+            await ctx.reply('No users have used /random yet.');
+            return;
+        }
+        const status = await ctx.reply(`📢 Broadcasting to ${userIds.length} user(s)...`);
+        let sent = 0, failed = 0;
+        for (const uid of userIds) {
+            try {
+                await ctx.telegram.sendMessage(uid, text);
+                sent++;
+            } catch (e) {
+                failed++;
+            }
+            await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, null, `✅ Broadcast complete.\nSent: ${sent} | Failed: ${failed}`);
+        return;
+    }
+
+    if (CUSTOM_FIELD_MAP[action.type]) {
+        const { key, label, min } = CUSTOM_FIELD_MAP[action.type];
+        const n = parseInt(text.trim(), 10);
+        if (isNaN(n) || n < min) {
+            await ctx.reply(`⚠️ Send a whole number (${min}+) for ${label}, or /cancel.`);
+            return;
+        }
+        const config = loadConfig();
+        config[key] = n;
+        saveConfig(config);
+        delete pendingAction[userId];
+        await ctx.reply(`✅ ${label} set to ${n}.`);
+        return;
+    }
+
+    delete pendingAction[userId];
+}
+
 bot.on('message', async (ctx) => {
     const text = ctx.message.text;
+
+    if (ctx.chat.type !== 'private') trackKnownChat(ctx);
+
+    // --- Pending button-flow input (private chat, admin only) ---
+    if (ctx.chat.type === 'private' && isAdmin(ctx.from.id) && pendingAction[ctx.from.id]) {
+        await handlePendingAction(ctx, text || '');
+        return;
+    }
 
     if (!text) return;
 

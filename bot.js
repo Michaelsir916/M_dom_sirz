@@ -18,6 +18,7 @@ const {
     recordRequest,
     getAllUserIds,
     getStats,
+    getUserStats,
     isAdmin,
     recordKnownChat,
     getKnownChats,
@@ -668,7 +669,7 @@ Send me a MEGA link to get started!`, {
 
     const config = loadConfig();
     if (config.forceSubGroupIds.length === 0) {
-        await ctx.reply('👋 Welcome! Send /random to get files.');
+        await ctx.reply('👋 Welcome! Send /random to get files.', { reply_markup: MY_STATS_KEYBOARD });
         return;
     }
 
@@ -678,7 +679,7 @@ Send me a MEGA link to get started!`, {
         return;
     }
 
-    await ctx.reply('✅ You\'re already a member! Send /random to get files.');
+    await ctx.reply('✅ You\'re already a member! Send /random to get files.', { reply_markup: MY_STATS_KEYBOARD });
 });
 
 bot.help((ctx) => {
@@ -774,7 +775,7 @@ async function sendRandomFiles(ctx) {
     const unseen = getUnseenFiles(ctx.from.id);
 
     if (unseen.length === 0) {
-        await ctx.reply('🎉 You\'ve received all the files currently available! Check back later for new ones.');
+        await ctx.reply('🎉 You\'ve received all the files currently available! Check back later for new ones.', { reply_markup: MY_STATS_KEYBOARD });
         return;
     }
 
@@ -805,12 +806,48 @@ async function sendRandomFiles(ctx) {
     if (successfullySent.length > 0) {
         markSeen(ctx.from.id, successfullySent);
         if (config.autoDeleteMinutes > 0) {
-            await ctx.reply(`⏳ These file(s) will auto-delete in ${config.autoDeleteMinutes} minute(s).`);
+            await ctx.reply(`⏳ These file(s) will auto-delete in ${config.autoDeleteMinutes} minute(s).`, { reply_markup: MY_STATS_KEYBOARD });
+        } else {
+            await ctx.reply('📊 Tap below to check your stats.', { reply_markup: MY_STATS_KEYBOARD });
         }
     } else {
-        await ctx.reply('❌ Could not send the file(s), please try again.');
+        await ctx.reply('❌ Could not send the file(s), please try again.', { reply_markup: MY_STATS_KEYBOARD });
     }
 }
+
+// --- User-facing: My Stats ---
+const MY_STATS_KEYBOARD = { inline_keyboard: [[{ text: '📊 My Stats', callback_data: 'user_mystats' }]] };
+
+function formatMyStats(userId) {
+    const config = loadConfig();
+    const s = getUserStats(userId, config.cooldownSeconds, config.dailyLimit);
+
+    let cooldownLine = '✅ Ready now';
+    if (s.cooldownRemaining > 0) {
+        cooldownLine = `⏳ ${s.cooldownRemaining}s remaining`;
+    }
+
+    let dailyLine = '♾️ Unlimited';
+    if (s.dailyRemaining !== null) {
+        dailyLine = `${s.dailyRemaining} left today`;
+    }
+
+    return `📊 *Your Stats*\n\n` +
+        `Files received (all-time): ${s.totalFilesReceived}\n` +
+        `/random requests today: ${s.requestsToday}\n` +
+        `Cooldown: ${cooldownLine}\n` +
+        `Daily limit: ${dailyLine}`;
+}
+
+bot.command('mystats', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+    await ctx.reply(formatMyStats(ctx.from.id), { parse_mode: 'Markdown' });
+});
+
+bot.action('user_mystats', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.reply(formatMyStats(ctx.from.id), { parse_mode: 'Markdown' });
+});
 
 // --- Admin: force-sub group management ---
 bot.command('setforcesub', async (ctx) => {

@@ -929,7 +929,7 @@ async function sendRandomFiles(ctx) {
 }
 
 // --- User-facing: My Stats ---
-const MY_STATS_KEYBOARD = { inline_keyboard: [[{ text: '📊 My Stats', callback_data: 'user_mystats' }]] };
+const MY_STATS_KEYBOARD = { inline_keyboard: [[{ text: '🎲 Random', callback_data: 'user_random' }, { text: '📊 My Stats', callback_data: 'user_mystats' }]] };
 
 function formatMyStats(userId) {
     const config = loadConfig();
@@ -1202,7 +1202,7 @@ bot.command('redeem', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
     const code = ctx.message.text.trim().split(/\s+/)[1];
     if (!code) {
-        await ctx.reply('Usage: `/redeem CODE`', { parse_mode: 'Markdown' });
+        await ctx.reply('Usage: /redeem CODE\n\nExample: /redeem BONUS5');
         return;
     }
     const result = redeemPromoCode(code, ctx.from.id);
@@ -1236,9 +1236,9 @@ bot.command('peakhours', async (ctx) => {
 });
 
 // --- User-facing ---
-bot.command('random', async (ctx) => {
-    if (ctx.chat.type !== 'private') return;
-
+// Shared by /random, the "🎲 Random" button, and the "✅ I've Joined" recheck
+// flow — force-sub check, cooldown/daily-limit check, then send files.
+async function handleRandomRequest(ctx) {
     const config = loadConfig();
     if (config.forceSubGroupIds.length === 0) {
         await ctx.reply('⚠️ Force-sub group is not configured yet. Please ask the admin.');
@@ -1265,6 +1265,16 @@ bot.command('random', async (ctx) => {
     }
 
     await sendRandomFiles(ctx);
+}
+
+bot.command('random', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+    await handleRandomRequest(ctx);
+});
+
+bot.action('user_random', async (ctx) => {
+    await ctx.answerCbQuery();
+    await handleRandomRequest(ctx);
 });
 
 bot.action('recheck_sub', async (ctx) => {
@@ -1285,20 +1295,7 @@ bot.action('recheck_sub', async (ctx) => {
         await ctx.deleteMessage();
     } catch (e) { /* ignore */ }
 
-    const check = recordRequest(ctx.from.id, config.cooldownSeconds, config.dailyLimit);
-    if (!check.allowed) {
-        if (check.reason === 'cooldown') {
-            await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
-        } else {
-            await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use a promo code with /redeem CODE for extra requests.`);
-        }
-        return;
-    }
-    if (check.usedBonusCredit) {
-        await ctx.reply('🎟 Daily limit reached — used 1 bonus credit for this request.');
-    }
-
-    await sendRandomFiles(ctx);
+    await handleRandomRequest(ctx);
 });
 const ADMIN_START_TEXT = 'Welcome, Admin!\n\nChoose a section to manage:';
 const ADMIN_START_KEYBOARD = {

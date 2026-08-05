@@ -13,6 +13,8 @@ const {
     addSharedFile,
     removeSharedFile,
     deleteFileByIndex,
+    findFilesBySourceLink,
+    removeFilesBySourceLink,
     getUnseenFiles,
     markSeen,
     recordRequest,
@@ -22,7 +24,16 @@ const {
     isAdmin,
     recordKnownChat,
     getKnownChats,
-    removeKnownChat
+    removeKnownChat,
+    createPromoCode,
+    deletePromoCode,
+    listPromoCodes,
+    redeemPromoCode,
+    getPromoRedemptionsSince,
+    getPeakHours,
+    recordError,
+    getRecentErrors,
+    getErrorCountSince
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -50,6 +61,61 @@ let botUsername = '';
 // values) can ask the admin to send one plain message instead of a slash
 // command. Cleared on use, on /cancel, or lost on restart (admin just retaps).
 const pendingAction = {};
+
+// ===== Reliability helpers: admin notifications =====
+function getAdminIds() {
+    return (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
+}
+
+// Where maintenance/alert messages (dead-link cleanup, error alerts, weekly
+// digest, health-check ping) get sent. Defaults to the first admin's DM if
+// no adminLogChatId has been configured.
+function getLogChatId(config) {
+    if (config.adminLogChatId) return config.adminLogChatId;
+    const admins = getAdminIds();
+    return admins.length > 0 ? admins[0] : null;
+}
+
+async function notifyAdmins(text, extra = {}) {
+    const admins = getAdminIds();
+    for (const id of admins) {
+        try {
+            await bot.telegram.sendMessage(id, text, { parse_mode: 'Markdown', ...extra });
+        } catch (e) {
+            console.error(`Could not notify admin ${id}:`, e.message);
+        }
+    }
+}
+
+async function notifyLogChat(text, extra = {}) {
+    const config = loadConfig();
+    const chatId = getLogChatId(config);
+    if (!chatId) return;
+    try {
+        await bot.telegram.sendMessage(chatId, text, { parse_mode: 'Markdown', ...extra });
+    } catch (e) {
+        console.error(`Could not send to log chat ${chatId}:`, e.message);
+    }
+}
+
+// ===== Error-rate alert =====
+// Every recorded error checks whether the threshold was crossed within the
+// configured window. Fires ONE grouped alert per window (not per error) so
+// admins get a "🚨 High error rate" summary instead of spam.
+let lastErrorAlertAt = 0;
+async function checkErrorRateAndAlert() {
+    const config = loadConfig();
+    const windowMs = (config.errorAlertWindowMinutes || 5) * 60 * 1000;
+    const recent = getRecentErrors(windowMs);
+    if (recent.length < (config.errorAlertThreshold || 5)) return;
+    if (Date.now() - lastErrorAlertAt < windowMs) return; // already alerted this window
+    lastErrorAlertAt = Date.now();
+
+    const sample = recent.slice(-5).map(e => `• ${e.message}`).join('\n');
+    await notifyLogChat(
+        `🚨 *High Error Rate*\n\n${recent.length} errors in the last ${config.errorAlertWindowMinutes} minute(s).\n\n*Recent:*\n${sample}`
+    );
+}
 
 function chatTypeIcon(type) {
     if (type === 'channel') return '📢';
@@ -80,6 +146,23 @@ function cleanMegaLink(link) {
     return null;
 }
 
+// If this MEGA link already produced pool entries, treat re-sending it as a
+// delete request (no need to browse /listfiles for the index) instead of
+// re-downloading and re-uploading the same file. Returns true if it handled
+// the message (i.e. deleted something) so the caller should stop there.
+async function tryDeleteBySourceLink(ctx, megaLink) {
+    const matches = findFilesBySourceLink(megaLink);
+    if (matches.length === 0) return false;
+
+    const removed = removeFilesBySourceLink(megaLink);
+    try {
+        await ctx.reply(`🗑 Removed ${removed.length} file(s) from the pool that came from this link.`);
+    } catch (e) {
+        console.error('Cannot confirm source-link deletion:', e.message);
+    }
+    return true;
+}
+
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -103,6 +186,13 @@ function isAudioFile(filename) {
     const audioExtensions = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.wma', '.opus'];
     const ext = path.extname(filename).toLowerCase();
     return audioExtensions.includes(ext);
+}
+
+function classifyFileType(filename) {
+    if (isVideoFile(filename)) return 'video';
+    if (isImageFile(filename)) return 'photo';
+    if (isAudioFile(filename)) return 'audio';
+    return 'document';
 }
 
 async function sendTelegramFile(ctx, filePath, fileName, fileSize, progressCallback) {
@@ -316,14 +406,19 @@ async function downloadMegaFile(megaUrl, userId, onProgress) {
                     console.error('❌ Error loading attributes:', err.message);
 
                     let errorMsg = `Failed to load: ${err.message}`;
+                    let expired = false;
 
                     if (err.message.includes('ENOENT') || err.message.includes('not found')) {
                         errorMsg = 'File/Folder not found. Link may be expired or invalid.';
+                        expired = true;
                     } else if (err.message.includes('decryption')) {
                         errorMsg = 'Decryption failed. Check if your link has the correct key';
+                        expired = true;
                     }
 
-                    reject(new Error(errorMsg));
+                    const rejection = new Error(errorMsg);
+                    rejection.linkExpired = expired; // lets processMegaLink show a distinct ⚠️ expiry warning
+                    reject(rejection);
                     return;
                 }
 
@@ -495,9 +590,12 @@ async function processMegaLink(ctx, megaLink) {
             }
 
             try {
-                await sendTelegramFile(ctx, result.path, result.name, result.size, (progress) => {
+                const sentMsg = await sendTelegramFile(ctx, result.path, result.name, result.size, (progress) => {
                     uploadUpdater(progress, result.name, result.size, 1, 1);
                 });
+                if (sentMsg && sentMsg.id && String(chatId) === String(loadConfig().sourceGroupId)) {
+                    addSharedFile(chatId, sentMsg.id, classifyFileType(result.name), megaLink);
+                }
                 await deleteStatus();
 
                 if (chatType !== 'private') {
@@ -560,9 +658,12 @@ async function processMegaLink(ctx, megaLink) {
                         continue;
                     }
 
-                    await sendTelegramFile(ctx, file.path, file.name, file.size, (progress) => {
+                    const sentMsg = await sendTelegramFile(ctx, file.path, file.name, file.size, (progress) => {
                         folderUploadUpdater(progress, file.name, file.size, i + 1);
                     });
+                    if (sentMsg && sentMsg.id && String(chatId) === String(loadConfig().sourceGroupId)) {
+                        addSharedFile(chatId, sentMsg.id, classifyFileType(file.name), megaLink);
+                    }
 
                     sentCount++;
 
@@ -608,13 +709,25 @@ async function processMegaLink(ctx, megaLink) {
 
     } catch (error) {
         console.error('❌ Main error:', error.message);
+        recordError(`MEGA link failed (${chatId}): ${error.message}`);
+        checkErrorRateAndAlert();
 
-        let errorMessage = `❌ *Download Failed*\n\n`;
-        errorMessage += `*Error:* ${error.message}\n\n`;
-        errorMessage += `*Please check:*\n`;
-        errorMessage += `1. Link is correct and not expired\n`;
-        errorMessage += `2. Includes #key at the end\n`;
-        errorMessage += `3. File/folder exists`;
+        let errorMessage;
+        if (error.linkExpired) {
+            // Fast, distinct warning for a link that's simply dead/expired,
+            // instead of a generic "download failed".
+            errorMessage = `⚠️ *Link Expired / Invalid*\n\n` +
+                `*Error:* ${error.message}\n\n` +
+                `This MEGA link couldn't be read at all — it's likely expired, deleted, or mistyped. ` +
+                `Nothing was downloaded.`;
+        } else {
+            errorMessage = `❌ *Download Failed*\n\n`;
+            errorMessage += `*Error:* ${error.message}\n\n`;
+            errorMessage += `*Please check:*\n`;
+            errorMessage += `1. Link is correct and not expired\n`;
+            errorMessage += `2. Includes #key at the end\n`;
+            errorMessage += `3. File/folder exists`;
+        }
 
         try {
             await ctx.reply(errorMessage, { parse_mode: 'Markdown' });
@@ -832,11 +945,16 @@ function formatMyStats(userId) {
         dailyLine = `${s.dailyRemaining} left today`;
     }
 
-    return `📊 *Your Stats*\n\n` +
+    let text = `📊 *Your Stats*\n\n` +
         `Files received (all-time): ${s.totalFilesReceived}\n` +
         `/random requests today: ${s.requestsToday}\n` +
         `Cooldown: ${cooldownLine}\n` +
-        `Daily limit: ${dailyLine}`;
+        `Daily limit: ${dailyLine}\n` +
+        `🎟 Bonus credits: ${s.bonusCredits}`;
+    if (s.bonusCredits === 0) {
+        text += `\n\n_Got a promo code? Redeem it with /redeem CODE for extra requests past today's limit._`;
+    }
+    return text;
 }
 
 bot.command('mystats', async (ctx) => {
@@ -1028,6 +1146,95 @@ bot.command('broadcast', async (ctx) => {
     await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, null, `✅ Broadcast complete.\nSent: ${sent} | Failed: ${failed}`);
 });
 
+// --- Admin: promo codes (bonus credits) ---
+bot.command('gencode', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const parts = ctx.message.text.trim().split(/\s+/).slice(1);
+    const [code, creditsStr, maxUsesStr] = parts;
+    const credits = parseInt(creditsStr, 10);
+    const maxUses = maxUsesStr !== undefined ? parseInt(maxUsesStr, 10) : 0;
+
+    if (!code || isNaN(credits) || credits <= 0) {
+        await ctx.reply(
+            'Usage: `/gencode CODE credits [maxUses]`\n\n' +
+            'Example: `/gencode BONUS5 3` — grants 3 bonus requests, unlimited redemptions\n' +
+            '`/gencode BONUS5 3 50` — same, but capped at 50 redemptions total',
+            { parse_mode: 'Markdown' }
+        );
+        return;
+    }
+
+    const entry = createPromoCode(code, credits, isNaN(maxUses) ? 0 : maxUses);
+    await ctx.reply(
+        `✅ Promo code created: \`${entry.code}\`\n` +
+        `Grants: ${entry.credits} bonus request(s)\n` +
+        `Max redemptions: ${entry.maxUses === 0 ? 'Unlimited' : entry.maxUses}`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+bot.command('delcode', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const code = ctx.message.text.trim().split(/\s+/)[1];
+    if (!code) {
+        await ctx.reply('Usage: `/delcode CODE`', { parse_mode: 'Markdown' });
+        return;
+    }
+    const ok = deletePromoCode(code);
+    await ctx.reply(ok ? `✅ Deleted code \`${code.toUpperCase()}\`.` : '❌ No such code.', { parse_mode: 'Markdown' });
+});
+
+bot.command('listcodes', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const codes = listPromoCodes();
+    if (codes.length === 0) {
+        await ctx.reply('No promo codes yet. Create one with `/gencode CODE credits`.', { parse_mode: 'Markdown' });
+        return;
+    }
+    const lines = codes.slice(0, 30).map(c =>
+        `\`${c.code}\` — ${c.credits} credit(s), used ${c.usedBy.length}${c.maxUses > 0 ? `/${c.maxUses}` : ''} time(s)`
+    );
+    await ctx.reply(`🎟 *Promo Codes* (${codes.length}):\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+});
+
+// Any user can redeem a code for bonus /random requests.
+bot.command('redeem', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+    const code = ctx.message.text.trim().split(/\s+/)[1];
+    if (!code) {
+        await ctx.reply('Usage: `/redeem CODE`', { parse_mode: 'Markdown' });
+        return;
+    }
+    const result = redeemPromoCode(code, ctx.from.id);
+    if (!result.success) {
+        const reasons = {
+            not_found: '❌ That code doesn\'t exist.',
+            already_used: '❌ You\'ve already redeemed this code.',
+            exhausted: '❌ This code has reached its redemption limit.'
+        };
+        await ctx.reply(reasons[result.reason] || '❌ Could not redeem that code.');
+        return;
+    }
+    await ctx.reply(`🎉 Redeemed! You got ${result.credits} bonus /random request(s) past your daily limit.`);
+});
+
+// --- Admin: peak-hour insight ---
+bot.command('peakhours', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const hours = getPeakHours();
+    const max = Math.max(...hours, 1);
+    const lines = hours.map((count, h) => {
+        const barLen = Math.round((count / max) * 12);
+        const bar = '▓'.repeat(barLen) + '░'.repeat(12 - barLen);
+        return `${String(h).padStart(2, '0')}:00 ${bar} ${count}`;
+    });
+    const peakHour = hours.indexOf(max === 1 && hours.every(h => h === 0) ? 0 : max);
+    await ctx.reply(
+        `📈 *Peak-Hour Insight* (all-time /random requests)\n\n\`\`\`\n${lines.join('\n')}\n\`\`\`\n\nBusiest hour: ${String(peakHour).padStart(2, '0')}:00`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
 // --- User-facing ---
 bot.command('random', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
@@ -1049,9 +1256,12 @@ bot.command('random', async (ctx) => {
         if (check.reason === 'cooldown') {
             await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
         } else {
-            await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow.`);
+            await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use a promo code with /redeem CODE for extra requests.`);
         }
         return;
+    }
+    if (check.usedBonusCredit) {
+        await ctx.reply('🎟 Daily limit reached — used 1 bonus credit for this request.');
     }
 
     await sendRandomFiles(ctx);
@@ -1080,15 +1290,16 @@ bot.action('recheck_sub', async (ctx) => {
         if (check.reason === 'cooldown') {
             await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
         } else {
-            await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow.`);
+            await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use a promo code with /redeem CODE for extra requests.`);
         }
         return;
+    }
+    if (check.usedBonusCredit) {
+        await ctx.reply('🎟 Daily limit reached — used 1 bonus credit for this request.');
     }
 
     await sendRandomFiles(ctx);
 });
-
-// --- Admin-only /start menu ---
 const ADMIN_START_TEXT = 'Welcome, Admin!\n\nChoose a section to manage:';
 const ADMIN_START_KEYBOARD = {
     inline_keyboard: [
@@ -1105,7 +1316,8 @@ async function setupCommandMenus() {
     try {
         await bot.telegram.setMyCommands([
             { command: 'start', description: 'Start the bot' },
-            { command: 'random', description: 'Get a random file' }
+            { command: 'random', description: 'Get a random file' },
+            { command: 'redeem', description: 'Redeem a promo code' }
         ]);
     } catch (error) {
         console.error('Could not set default commands:', error.message);
@@ -1125,7 +1337,11 @@ async function setupCommandMenus() {
         { command: 'listfiles', description: 'View the file pool' },
         { command: 'delfile', description: 'Remove a file by index' },
         { command: 'stats', description: 'Pool & usage stats' },
-        { command: 'broadcast', description: 'Message all /random users' }
+        { command: 'broadcast', description: 'Message all /random users' },
+        { command: 'gencode', description: 'Create a promo code' },
+        { command: 'delcode', description: 'Delete a promo code' },
+        { command: 'listcodes', description: 'List promo codes' },
+        { command: 'peakhours', description: 'Busiest hours for /random' }
     ];
 
     const adminIds = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
@@ -1177,6 +1393,7 @@ async function renderFileSharePanel(ctx) {
             [{ text: `📆 Daily Limit: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}`, callback_data: 'fs_dailylimit_menu' }],
             [{ text: `🗑 Auto-Delete: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + 'm'}`, callback_data: 'fs_autodelete_menu' }],
             [{ text: '📢 Broadcast', callback_data: 'fs_broadcast_menu' }],
+            [{ text: '🎟 Promo Codes', callback_data: 'fs_codes' }, { text: '📈 Peak Hours', callback_data: 'fs_peakhours' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
@@ -1245,6 +1462,41 @@ bot.action('fs_stats', async (ctx) => {
     await ctx.answerCbQuery();
     const s = getStats();
     const text = `📊 *Stats*\n\nTotal files: ${s.totalFiles}\nTotal users: ${s.totalUsers}\nRequests today: ${s.requestsToday}`;
+    await ctx.editMessageText(text, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+    });
+});
+
+bot.action('fs_codes', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const codes = listPromoCodes();
+    const text = codes.length === 0
+        ? '🎟 *Promo Codes*\n\nNo codes yet.\n\nCreate one with `/gencode CODE credits [maxUses]`.'
+        : `🎟 *Promo Codes* (${codes.length})\n\n` + codes.slice(0, 30).map(c =>
+            `\`${c.code}\` — ${c.credits} credit(s), used ${c.usedBy.length}${c.maxUses > 0 ? `/${c.maxUses}` : ''} time(s)`
+        ).join('\n') + '\n\nManage with `/gencode`, `/delcode`, `/listcodes`.';
+    await ctx.editMessageText(text, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
+    });
+});
+
+bot.action('fs_peakhours', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const hours = getPeakHours();
+    const max = Math.max(...hours, 1);
+    const anyData = hours.some(h => h > 0);
+    const lines = hours.map((count, h) => {
+        const barLen = Math.round((count / max) * 12);
+        const bar = '▓'.repeat(barLen) + '░'.repeat(12 - barLen);
+        return `${String(h).padStart(2, '0')}:00 ${bar} ${count}`;
+    });
+    const peakHour = hours.indexOf(max);
+    const text = `📈 *Peak-Hour Insight*\n\n\`\`\`\n${lines.join('\n')}\n\`\`\`` +
+        (anyData ? `\n\nBusiest hour: ${String(peakHour).padStart(2, '0')}:00` : '\n\nNo requests recorded yet.');
     await ctx.editMessageText(text, {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
@@ -1559,6 +1811,7 @@ bot.on('channel_post', async (ctx) => {
             if (megaLink) {
                 if (!(await isTrustedChannelAdmin(ctx))) return;
                 console.log(`🔍 Detected MEGA link in channel ${ctx.chat.id}`);
+                if (await tryDeleteBySourceLink(ctx, megaLink)) return;
                 await queue.add(() => processMegaLink(ctx, megaLink));
             }
         }
@@ -1716,6 +1969,8 @@ bot.on('message', async (ctx) => {
         return;
     }
 
+    if (await tryDeleteBySourceLink(ctx, megaLink)) return;
+
     if (ctx.chat.type !== 'private') {
         try {
             const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, ctx.botInfo.id);
@@ -1775,6 +2030,8 @@ bot.on('document', (ctx) => {
 
 bot.catch((err, ctx) => {
     console.error('Bot error:', err);
+    recordError(`${ctx?.chat?.type || '?'} ${ctx?.chat?.id || '?'}: ${err.message}`);
+    checkErrorRateAndAlert();
     try {
         if (ctx.chat.type === 'private') {
             ctx.reply('❌ An internal error occurred. Please try again.');
@@ -1783,6 +2040,95 @@ bot.catch((err, ctx) => {
         console.error('Failed to send error:', e);
     }
 });
+
+// ===== Health-check / auto-restart notice =====
+// Anything that crashes the process (uncaught error, unhandled rejection)
+// gets logged + a best-effort alert to the admin, then the process exits so
+// the process manager (pm2, systemd, etc.) restarts it. The startup message
+// below fires on every restart, so it doubles as the "I'm back up" alert.
+process.on('uncaughtException', (err) => {
+    console.error('💥 Uncaught exception:', err);
+    recordError(`uncaughtException: ${err.message}`);
+    notifyAdmins(`💥 *Bot Crashed*\n\nUncaught exception:\n\`${err.message}\`\n\nRestarting...`)
+        .finally(() => process.exit(1));
+});
+
+process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    console.error('💥 Unhandled rejection:', msg);
+    recordError(`unhandledRejection: ${msg}`);
+    checkErrorRateAndAlert();
+    // Rejections alone don't necessarily corrupt state, so we don't force-exit here.
+});
+
+// ===== Scheduled jobs: dead-link cleaner + weekly digest =====
+// Dead-link cleaner: periodically forwards each pooled file to the admin log
+// chat (then immediately deletes that copy) purely to test whether the
+// source message still exists. If Telegram rejects the forward, the source
+// was deleted, so the pool entry is dropped too. Runs in small batches with
+// a delay between checks to stay well clear of flood limits.
+async function runDeadLinkCleaner() {
+    const config = loadConfig();
+    const logChatId = getLogChatId(config);
+    if (!logChatId) return;
+
+    const files = loadSharedFiles();
+    const batch = files.slice(0, 25); // cap per run
+    let removed = 0;
+
+    for (const f of batch) {
+        try {
+            const fwd = await bot.telegram.forwardMessage(logChatId, f.chat_id, f.message_id, { disable_notification: true });
+            await bot.telegram.deleteMessage(logChatId, fwd.message_id).catch(() => {});
+        } catch (e) {
+            // Source message is gone (deleted / chat unreachable) — drop it from the pool.
+            removeSharedFile(f.chat_id, f.message_id);
+            removed++;
+        }
+        await new Promise(r => setTimeout(r, 300));
+    }
+
+    if (removed > 0) {
+        await notifyLogChat(`🧹 *Dead-Link Cleaner*\n\nChecked ${batch.length} file(s), removed ${removed} dead entr${removed === 1 ? 'y' : 'ies'} from the pool.`);
+    }
+}
+
+// Weekly digest: files/requests/errors/promo redemptions + peak hour, sent
+// to the log chat once every 7 days.
+let lastDigestAt = 0;
+async function maybeSendWeeklyDigest() {
+    const config = loadConfig();
+    if (!config.weeklyDigestEnabled) return;
+    const weekMs = 7 * 24 * 60 * 60 * 1000;
+    if (Date.now() - lastDigestAt < weekMs) return;
+    lastDigestAt = Date.now();
+
+    const since = Date.now() - weekMs;
+    const stats = getStats();
+    const errorCount = getErrorCountSince(since);
+    const promoRedemptions = getPromoRedemptionsSince(since);
+    const hours = getPeakHours();
+    const peakHour = hours.indexOf(Math.max(...hours));
+
+    const text = `📊 *Weekly Digest*\n\n` +
+        `Total files in pool: ${stats.totalFiles}\n` +
+        `Total users: ${stats.totalUsers}\n` +
+        `Requests today: ${stats.requestsToday}\n` +
+        `Errors (7d): ${errorCount}\n` +
+        `Promo redemptions (7d): ${promoRedemptions}\n` +
+        `Peak hour (all-time): ${String(peakHour).padStart(2, '0')}:00 (${hours[peakHour]} requests)`;
+
+    await notifyLogChat(text);
+}
+
+function startScheduledJobs() {
+    const config = loadConfig();
+    const intervalMs = (config.deadLinkCheckHours || 6) * 60 * 60 * 1000;
+    setInterval(() => runDeadLinkCleaner().catch(e => console.error('Dead-link cleaner error:', e.message)), intervalMs);
+    // Also check once shortly after startup, and check weekly-digest eligibility every hour.
+    setTimeout(() => runDeadLinkCleaner().catch(e => console.error('Dead-link cleaner error:', e.message)), 60 * 1000);
+    setInterval(() => maybeSendWeeklyDigest().catch(e => console.error('Weekly digest error:', e.message)), 60 * 60 * 1000);
+}
 
 bot.telegram.getMe().then(botInfo => {
     botUsername = botInfo.username;
@@ -1807,6 +2153,8 @@ bot.telegram.getMe().then(botInfo => {
             console.log('3. Users can then just send MEGA links');
             console.log('====================================');
             await setupCommandMenus();
+            startScheduledJobs();
+            notifyAdmins(`✅ *Bot Started*\n\n@${botUsername} is up and running.`).catch(() => {});
         })
         .catch(err => {
             console.error('❌ Failed to start bot:', err);

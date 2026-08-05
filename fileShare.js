@@ -149,6 +149,34 @@ function recordRequest(userId, cooldownSeconds, dailyLimit) {
     return { allowed: true };
 }
 
+// Returns THIS user's own /random stats (not admin-wide): files received,
+// cooldown remaining, daily-limit remaining. Read-only, does not persist.
+function getUserStats(userId, cooldownSeconds, dailyLimit) {
+    const users = loadUsers();
+    const u = getUser(users, userId);
+    const now = Date.now();
+    const today = new Date().toISOString().slice(0, 10);
+
+    let cooldownRemaining = 0;
+    if (cooldownSeconds > 0 && u.lastRequestAt) {
+        const elapsedSec = (now - u.lastRequestAt) / 1000;
+        if (elapsedSec < cooldownSeconds) {
+            cooldownRemaining = Math.ceil(cooldownSeconds - elapsedSec);
+        }
+    }
+
+    const requestsToday = (u.dailyDate === today) ? u.dailyCount : 0;
+    const dailyRemaining = dailyLimit > 0 ? Math.max(0, dailyLimit - requestsToday) : null; // null = unlimited
+
+    return {
+        totalFilesReceived: (u.seen || []).length,
+        totalRequests: u.totalRequests || 0,
+        requestsToday,
+        cooldownRemaining,
+        dailyRemaining
+    };
+}
+
 function getAllUserIds() {
     return Object.keys(loadUsers());
 }
@@ -224,6 +252,7 @@ module.exports = {
     recordRequest,
     getAllUserIds,
     getStats,
+    getUserStats,
     isAdmin,
     recordKnownChat,
     getKnownChats,

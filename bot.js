@@ -1687,7 +1687,7 @@ bot.on('channel_post', async (ctx) => {
         return;
     }
     const command = text.split(' ')[0].split('@')[0];
-    if (!['/setforcesub', '/setsource', '/unsetforcesub'].includes(command)) return;
+    if (!['/setforcesub', '/setsource', '/unsetforcesub', '/setlogchannel', '/unsetlogchannel'].includes(command)) return;
 
     if (!(await isTrustedChannelAdmin(ctx))) return;
 
@@ -1707,6 +1707,14 @@ bot.on('channel_post', async (ctx) => {
         config.forceSubGroupIds = config.forceSubGroupIds.filter(id => id !== ctx.chat.id);
         saveConfig(config);
         await ctx.reply(`✅ Removed "${ctx.chat.title}" from the force-sub list.`);
+    } else if (command === '/setlogchannel') {
+        config.errorLogChatId = ctx.chat.id;
+        saveConfig(config);
+        await ctx.reply(`✅ "${ctx.chat.title}" set as the error log channel. Bot errors will be posted here from now on.`);
+    } else if (command === '/unsetlogchannel') {
+        config.errorLogChatId = null;
+        saveConfig(config);
+        await ctx.reply('✅ Error log channel removed. Errors will only go to console now.');
     }
 });
 

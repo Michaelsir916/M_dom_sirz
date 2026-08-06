@@ -5,9 +5,6 @@ const CONFIG_PATH = path.join(__dirname, 'config.json');
 const FILES_PATH = path.join(__dirname, 'shared_files.json');
 const USERS_PATH = path.join(__dirname, 'share_users.json');
 const KNOWN_CHATS_PATH = path.join(__dirname, 'known_chats.json');
-const PROMO_PATH = path.join(__dirname, 'promo_codes.json');
-const ERRORLOG_PATH = path.join(__dirname, 'error_log.json');
-const PEAKHOURS_PATH = path.join(__dirname, 'peak_hours.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -16,11 +13,8 @@ const DEFAULT_CONFIG = {
     autoDeleteMinutes: 0,   // 0 = disabled
     dailyLimit: 0,          // 0 = unlimited
     cooldownSeconds: 10,
-    adminLogChatId: null,        // where dead-link checks / digests are posted; falls back to first ADMIN_ID
-    errorAlertThreshold: 5,      // errors within the window below before an alert fires
-    errorAlertWindowMinutes: 5,
-    deadLinkCheckHours: 6,       // how often the dead-link cleaner scans the pool
-    weeklyDigestEnabled: true
+    referralBonus: 3,       // bonus file-credits earned per successful referral
+    errorLogChatId: null    // channel/group id where bot errors are posted
 };
 
 function atomicWrite(filePath, data) {
@@ -58,24 +52,14 @@ function saveSharedFiles(files) {
     atomicWrite(FILES_PATH, files);
 }
 
-// Adds a file reference. Dedupes on (chat_id, message_id). If the entry
-// already exists and a sourceLink is now known but wasn't recorded yet
-// (e.g. the generic listener beat the direct call to it), it gets filled in.
-function addSharedFile(chatId, messageId, type, sourceLink = null) {
+// Adds a file reference. Dedupes on (chat_id, message_id).
+function addSharedFile(chatId, messageId, type) {
     const files = loadSharedFiles();
-    const existing = files.find(f => f.chat_id === chatId && f.message_id === messageId);
-    if (existing) {
-        if (sourceLink && !existing.source_link) {
-            existing.source_link = sourceLink;
-            saveSharedFiles(files);
-        }
-        return false;
-    }
+    if (files.some(f => f.chat_id === chatId && f.message_id === messageId)) return false;
     files.push({
         chat_id: chatId,
         message_id: messageId,
         type,
-        source_link: sourceLink || null,
         added_at: new Date().toISOString()
     });
     saveSharedFiles(files);
@@ -97,23 +81,6 @@ function deleteFileByIndex(index) {
     return removed;
 }
 
-// Finds every pool entry that came from a given MEGA link (admin re-sends the
-// same source link to remove it instead of hunting for the index).
-function findFilesBySourceLink(link) {
-    return loadSharedFiles().filter(f => f.source_link === link);
-}
-
-// Removes every pool entry that came from a given MEGA link. Returns the
-// removed entries.
-function removeFilesBySourceLink(link) {
-    const files = loadSharedFiles();
-    const removed = files.filter(f => f.source_link === link);
-    if (removed.length === 0) return removed;
-    const remaining = files.filter(f => f.source_link !== link);
-    saveSharedFiles(remaining);
-    return removed;
-}
-
 // ===== Per-user tracking: cooldown, daily limit, "seen" history (no repeats) =====
 function loadUsers() {
     return safeReadJson(USERS_PATH, {});
@@ -126,8 +93,14 @@ function saveUsers(users) {
 function getUser(users, userId) {
     const key = String(userId);
     if (!users[key]) {
-        users[key] = { lastRequestAt: 0, dailyDate: '', dailyCount: 0, totalRequests: 0, seen: [], bonusCredits: 0 };
+        users[key] = {
+            lastRequestAt: 0, dailyDate: '', dailyCount: 0, totalRequests: 0, seen: [],
+            referrals: [], referredBy: null, bonusCredits: 0
+        };
     }
+    // Backfill fields for users created before the referral system existed
+    if (users[key].referrals === undefined) users[key].referrals = [];
+    if (users[key].referredBy === undefined) users[key].referredBy = null;
     if (users[key].bonusCredits === undefined) users[key].bonusCredits = 0;
     return users[key];
 }
@@ -153,9 +126,7 @@ function markSeen(userId, files) {
     saveUsers(users);
 }
 
-// Checks + records a /random request (cooldown + daily limit). Returns { allowed, reason, retryAfter, usedBonusCredit }
-// If the daily limit is hit but the user has redeemed promo-code bonus
-// credits, one credit is spent instead of blocking the request.
+// Checks + records a /random request (cooldown + daily limit). Returns { allowed, reason, retryAfter }
 function recordRequest(userId, cooldownSeconds, dailyLimit) {
     const users = loadUsers();
     const key = String(userId);
@@ -175,23 +146,75 @@ function recordRequest(userId, cooldownSeconds, dailyLimit) {
         u.dailyCount = 0;
     }
 
-    let usedBonusCredit = false;
     if (dailyLimit > 0 && u.dailyCount >= dailyLimit) {
-        if ((u.bonusCredits || 0) > 0) {
-            u.bonusCredits -= 1;
-            usedBonusCredit = true;
-        } else {
-            return { allowed: false, reason: 'daily_limit' };
-        }
+        return { allowed: false, reason: 'daily_limit' };
     }
 
-    if (!usedBonusCredit) u.dailyCount += 1;
+    u.dailyCount += 1;
     u.totalRequests = (u.totalRequests || 0) + 1;
     u.lastRequestAt = now;
     users[key] = u;
     saveUsers(users);
-    recordHourlyRequest();
-    return { allowed: true, usedBonusCredit };
+    return { allowed: true };
+}
+
+// ===== Referral system =====
+
+// True if this user has never interacted with the bot before (no entry yet).
+// Must be checked BEFORE any call that implicitly creates the user record.
+function isNewUser(userId) {
+    const users = loadUsers();
+    return !users[String(userId)];
+}
+
+// Links a new user to whoever referred them, and credits the referrer with
+// bonus file-credits. Only awards once per new user (checked via referredBy).
+function registerReferral(newUserId, referrerId) {
+    const newKey = String(newUserId);
+    const refKey = String(referrerId);
+
+    if (newKey === refKey) return { success: false, reason: 'self' };
+
+    const users = loadUsers();
+    const newUser = getUser(users, newKey);
+
+    if (newUser.referredBy) return { success: false, reason: 'already_referred' };
+
+    const referrer = getUser(users, refKey);
+    if (!referrer.referrals.includes(newKey)) referrer.referrals.push(newKey);
+
+    const config = loadConfig();
+    referrer.bonusCredits = (referrer.bonusCredits || 0) + config.referralBonus;
+    newUser.referredBy = refKey;
+
+    users[newKey] = newUser;
+    users[refKey] = referrer;
+    saveUsers(users);
+
+    return { success: true, referrerId: refKey, bonus: config.referralBonus, referralCount: referrer.referrals.length };
+}
+
+// Spends one bonus credit (earned via referrals) to bypass the daily limit.
+// Returns true if a credit was available and consumed.
+function consumeBonusCredit(userId) {
+    const users = loadUsers();
+    const key = String(userId);
+    const u = getUser(users, key);
+    if ((u.bonusCredits || 0) <= 0) return false;
+    u.bonusCredits -= 1;
+    users[key] = u;
+    saveUsers(users);
+    return true;
+}
+
+function getReferralStats(userId) {
+    const users = loadUsers();
+    const u = getUser(users, userId);
+    return {
+        referralCount: (u.referrals || []).length,
+        bonusCredits: u.bonusCredits || 0,
+        referredBy: u.referredBy || null
+    };
 }
 
 // Returns THIS user's own /random stats (not admin-wide): files received,
@@ -219,6 +242,7 @@ function getUserStats(userId, cooldownSeconds, dailyLimit) {
         requestsToday,
         cooldownRemaining,
         dailyRemaining,
+        referralCount: (u.referrals || []).length,
         bonusCredits: u.bonusCredits || 0
     };
 }
@@ -277,118 +301,6 @@ function removeKnownChat(chatId) {
     }
 }
 
-// ===== Promo codes (bonus credits) =====
-// A code grants N bonus /random requests to whoever redeems it, usable once
-// the user's daily limit is hit. maxUses = 0 means unlimited redemptions.
-function loadPromoCodes() {
-    return safeReadJson(PROMO_PATH, {});
-}
-
-function savePromoCodes(codes) {
-    atomicWrite(PROMO_PATH, codes);
-}
-
-function createPromoCode(code, credits, maxUses = 0) {
-    const codes = loadPromoCodes();
-    const key = String(code).trim().toUpperCase();
-    if (!key) return null;
-    codes[key] = {
-        code: key,
-        credits,
-        maxUses,
-        usedBy: [], // [{ userId, at }]
-        createdAt: new Date().toISOString()
-    };
-    savePromoCodes(codes);
-    return codes[key];
-}
-
-function deletePromoCode(code) {
-    const codes = loadPromoCodes();
-    const key = String(code).trim().toUpperCase();
-    if (!codes[key]) return false;
-    delete codes[key];
-    savePromoCodes(codes);
-    return true;
-}
-
-function listPromoCodes() {
-    return Object.values(loadPromoCodes()).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-}
-
-// Returns { success, reason } or { success: true, credits }
-function redeemPromoCode(code, userId) {
-    const codes = loadPromoCodes();
-    const key = String(code).trim().toUpperCase();
-    const entry = codes[key];
-    if (!entry) return { success: false, reason: 'not_found' };
-
-    const uid = String(userId);
-    if (entry.usedBy.some(e => e.userId === uid)) {
-        return { success: false, reason: 'already_used' };
-    }
-    if (entry.maxUses > 0 && entry.usedBy.length >= entry.maxUses) {
-        return { success: false, reason: 'exhausted' };
-    }
-
-    entry.usedBy.push({ userId: uid, at: Date.now() });
-    savePromoCodes(codes);
-
-    const users = loadUsers();
-    const u = getUser(users, uid);
-    u.bonusCredits = (u.bonusCredits || 0) + entry.credits;
-    users[uid] = u;
-    saveUsers(users);
-
-    return { success: true, credits: entry.credits };
-}
-
-// Count of promo redemptions since a given timestamp (used by the weekly digest)
-function getPromoRedemptionsSince(sinceTs) {
-    const codes = loadPromoCodes();
-    let count = 0;
-    for (const entry of Object.values(codes)) {
-        count += entry.usedBy.filter(e => e.at >= sinceTs).length;
-    }
-    return count;
-}
-
-// ===== Peak-hour insight =====
-// One counter bucket per hour-of-day (0-23), incremented on every allowed
-// /random request. Helps decide good broadcast timing.
-function getPeakHours() {
-    const hours = safeReadJson(PEAKHOURS_PATH, null);
-    if (!Array.isArray(hours) || hours.length !== 24) return new Array(24).fill(0);
-    return hours;
-}
-
-function recordHourlyRequest() {
-    const hours = getPeakHours();
-    const h = new Date().getHours();
-    hours[h] = (hours[h] || 0) + 1;
-    atomicWrite(PEAKHOURS_PATH, hours);
-}
-
-// ===== Error log (used for the grouped error-rate alert + weekly digest) =====
-function recordError(message) {
-    const log = safeReadJson(ERRORLOG_PATH, []);
-    log.push({ at: Date.now(), message: String(message).slice(0, 300) });
-    const trimmed = log.slice(-500); // keep it bounded
-    atomicWrite(ERRORLOG_PATH, trimmed);
-    return trimmed;
-}
-
-function getRecentErrors(windowMs) {
-    const log = safeReadJson(ERRORLOG_PATH, []);
-    const cutoff = Date.now() - windowMs;
-    return log.filter(e => e.at >= cutoff);
-}
-
-function getErrorCountSince(sinceTs) {
-    const log = safeReadJson(ERRORLOG_PATH, []);
-    return log.filter(e => e.at >= sinceTs).length;
-}
-
 // ===== Admin check =====
 function isAdmin(userId) {
     const adminIds = (process.env.ADMIN_IDS || '')
@@ -405,25 +317,18 @@ module.exports = {
     addSharedFile,
     removeSharedFile,
     deleteFileByIndex,
-    findFilesBySourceLink,
-    removeFilesBySourceLink,
     getUnseenFiles,
     markSeen,
     recordRequest,
     getAllUserIds,
     getStats,
     getUserStats,
+    isNewUser,
+    registerReferral,
+    consumeBonusCredit,
+    getReferralStats,
     isAdmin,
     recordKnownChat,
     getKnownChats,
-    removeKnownChat,
-    createPromoCode,
-    deletePromoCode,
-    listPromoCodes,
-    redeemPromoCode,
-    getPromoRedemptionsSince,
-    getPeakHours,
-    recordError,
-    getRecentErrors,
-    getErrorCountSince
+    removeKnownChat
 };

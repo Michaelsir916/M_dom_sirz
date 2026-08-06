@@ -930,22 +930,30 @@ async function formatMyReferral(ctx) {
     const link = `https://t.me/${username}?start=ref_${ctx.from.id}`;
     const stats = getReferralStats(ctx.from.id);
     const config = loadConfig();
-    return `🎁 <b>Invite &amp; Earn</b>\n\n` +
+    const text = `🎁 <b>Invite &amp; Earn</b>\n\n` +
         `Share your link — each friend who joins through it (for the first time) gives you <b>+${config.referralBonus} bonus file credit(s)</b>.\n` +
         `Bonus credits let you use /random even after your daily limit or cooldown.\n\n` +
         `🔗 <code>${link}</code>\n\n` +
         `👥 Referrals so far: ${stats.referralCount}\n` +
         `💎 Bonus credits available: ${stats.bonusCredits}`;
+
+    const shareText = `🎁 Get free files! Join via my link:`;
+    const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(shareText)}`;
+    const replyMarkup = { inline_keyboard: [[{ text: '📤 Share with Friends', url: shareUrl }]] };
+
+    return { text, replyMarkup };
 }
 
 bot.command('myreferral', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
-    await ctx.reply(await formatMyReferral(ctx), { parse_mode: 'HTML' });
+    const { text, replyMarkup } = await formatMyReferral(ctx);
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: replyMarkup });
 });
 
 bot.action('user_referral', async (ctx) => {
     await ctx.answerCbQuery();
-    await ctx.reply(await formatMyReferral(ctx), { parse_mode: 'HTML' });
+    const { text, replyMarkup } = await formatMyReferral(ctx);
+    await ctx.reply(text, { parse_mode: 'HTML', reply_markup: replyMarkup });
 });
 
 // --- Admin: force-sub group management ---

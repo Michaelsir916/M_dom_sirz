@@ -5,6 +5,9 @@ const CONFIG_PATH = path.join(__dirname, 'config.json');
 const FILES_PATH = path.join(__dirname, 'shared_files.json');
 const USERS_PATH = path.join(__dirname, 'share_users.json');
 const KNOWN_CHATS_PATH = path.join(__dirname, 'known_chats.json');
+const BROADCAST_HISTORY_PATH = path.join(__dirname, 'broadcast_history.json');
+const SCHEDULED_BROADCASTS_PATH = path.join(__dirname, 'scheduled_broadcasts.json');
+const AUTOPOST_PATH = path.join(__dirname, 'autopost_configs.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -15,7 +18,10 @@ const DEFAULT_CONFIG = {
     cooldownSeconds: 10,
     referralBonus: 3,       // bonus file-credits earned per successful referral
     errorLogChatId: null,   // channel/group id where bot errors are posted
-    forceSubInviteLinks: {} // groupId -> cached "request to join" invite link
+    forceSubInviteLinks: {}, // groupId -> cached "request to join" invite link
+    broadcastForwardMode: false, // false = copyMessage (no tag), true = forwardMessage (tag)
+    broadcastBatchSize: 25,      // messages sent per second-ish batch (stay under Telegram's ~30/sec cap)
+    protectContent: false        // true = files sent to users can't be forwarded/saved
 };
 
 function atomicWrite(filePath, data) {
@@ -132,6 +138,7 @@ function recordRequest(userId, cooldownSeconds, dailyLimit) {
     const users = loadUsers();
     const key = String(userId);
     const u = getUser(users, key);
+    if (u.blocked) u.blocked = false; // they're back — clear the stale block flag
     const now = Date.now();
     const today = new Date().toISOString().slice(0, 10);
 
@@ -248,8 +255,24 @@ function getUserStats(userId, cooldownSeconds, dailyLimit) {
     };
 }
 
-function getAllUserIds() {
-    return Object.keys(loadUsers());
+// includeBlocked=false (default) excludes users flagged blocked (they've
+// blocked the bot, per a prior failed send) so broadcasts/stats skip them.
+function getAllUserIds(includeBlocked = false) {
+    const users = loadUsers();
+    return Object.keys(users).filter(key => includeBlocked || !users[key].blocked);
+}
+
+// Flags a user as having blocked the bot (learned from a failed send).
+// Kept as a flag rather than a delete so their stats/history aren't lost —
+// if they unblock and use the bot again the flag is cleared automatically
+// the next time recordRequest() touches their record.
+function markUserBlocked(userId) {
+    const users = loadUsers();
+    const key = String(userId);
+    const u = getUser(users, key);
+    u.blocked = true;
+    users[key] = u;
+    saveUsers(users);
 }
 
 function getStats() {
@@ -302,6 +325,128 @@ function removeKnownChat(chatId) {
     }
 }
 
+// ===== Broadcast history =====
+function loadBroadcastHistory() {
+    return safeReadJson(BROADCAST_HISTORY_PATH, []);
+}
+
+function saveBroadcastHistory(list) {
+    atomicWrite(BROADCAST_HISTORY_PATH, list);
+}
+
+// Records a completed broadcast. Keeps only the most recent 200 entries.
+function addBroadcastHistory(entry) {
+    const list = loadBroadcastHistory();
+    list.unshift({
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        at: new Date().toISOString(),
+        ...entry
+    });
+    saveBroadcastHistory(list.slice(0, 200));
+}
+
+function getBroadcastHistory(limit = 10) {
+    return loadBroadcastHistory().slice(0, limit);
+}
+
+// ===== Scheduled broadcasts =====
+function loadScheduledBroadcasts() {
+    return safeReadJson(SCHEDULED_BROADCASTS_PATH, []);
+}
+
+function saveScheduledBroadcasts(list) {
+    atomicWrite(SCHEDULED_BROADCASTS_PATH, list);
+}
+
+// entry: { sendAt (ISO string), kind: 'text'|'photo'|'video'|'animation',
+//          text, fileId, caption, forwardMode, createdBy }
+function addScheduledBroadcast(entry) {
+    const list = loadScheduledBroadcasts();
+    const record = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), sent: false, ...entry };
+    list.push(record);
+    saveScheduledBroadcasts(list);
+    return record;
+}
+
+function removeScheduledBroadcast(id) {
+    const list = loadScheduledBroadcasts();
+    const filtered = list.filter(s => s.id !== id);
+    if (filtered.length !== list.length) saveScheduledBroadcasts(filtered);
+    return filtered.length !== list.length;
+}
+
+function markScheduledBroadcastSent(id) {
+    const list = loadScheduledBroadcasts();
+    const rec = list.find(s => s.id === id);
+    if (rec) {
+        rec.sent = true;
+        saveScheduledBroadcasts(list);
+    }
+}
+
+// Due = not sent yet and sendAt has passed
+function getDueScheduledBroadcasts() {
+    const now = Date.now();
+    return loadScheduledBroadcasts().filter(s => !s.sent && new Date(s.sendAt).getTime() <= now);
+}
+
+function getPendingScheduledBroadcasts() {
+    return loadScheduledBroadcasts().filter(s => !s.sent);
+}
+
+// ===== Auto-post system (per-admin, isolated channels) =====
+// Keyed by admin user id. Each admin configures their own destination
+// channel, interval, caption, thumbnail source and blur — fully isolated
+// from every other admin's configuration.
+function loadAutopostConfigs() {
+    return safeReadJson(AUTOPOST_PATH, {});
+}
+
+function saveAutopostConfigs(configs) {
+    atomicWrite(AUTOPOST_PATH, configs);
+}
+
+const DEFAULT_AUTOPOST = {
+    channelId: null,
+    intervalHours: 0,      // 0 = disabled
+    caption: 'New Post 🎬',
+    thumbnailMode: 'video', // 'video' = use the video's own thumbnail, 'custom' = admin-uploaded
+    customThumbnailFileId: null,
+    blurEnabled: false,
+    enabled: false,
+    postedTags: [],         // "chatId:messageId" tags already posted, never repeats
+    lastPostAt: 0
+};
+
+function getAutopostConfig(adminId) {
+    const configs = loadAutopostConfigs();
+    const key = String(adminId);
+    return { ...DEFAULT_AUTOPOST, ...(configs[key] || {}) };
+}
+
+function setAutopostConfig(adminId, patch) {
+    const configs = loadAutopostConfigs();
+    const key = String(adminId);
+    configs[key] = { ...DEFAULT_AUTOPOST, ...(configs[key] || {}), ...patch };
+    saveAutopostConfigs(configs);
+    return configs[key];
+}
+
+function getAllAutopostConfigs() {
+    const configs = loadAutopostConfigs();
+    return Object.keys(configs).map(adminId => ({ adminId, ...DEFAULT_AUTOPOST, ...configs[adminId] }));
+}
+
+function markAutopostTagPosted(adminId, tag) {
+    const configs = loadAutopostConfigs();
+    const key = String(adminId);
+    const cfg = { ...DEFAULT_AUTOPOST, ...(configs[key] || {}) };
+    if (!cfg.postedTags.includes(tag)) cfg.postedTags.push(tag);
+    cfg.lastPostAt = Date.now();
+    configs[key] = cfg;
+    saveAutopostConfigs(configs);
+}
+
 // ===== Admin check =====
 function isAdmin(userId) {
     const adminIds = (process.env.ADMIN_IDS || '')
@@ -331,5 +476,17 @@ module.exports = {
     isAdmin,
     recordKnownChat,
     getKnownChats,
-    removeKnownChat
+    removeKnownChat,
+    markUserBlocked,
+    addBroadcastHistory,
+    getBroadcastHistory,
+    addScheduledBroadcast,
+    removeScheduledBroadcast,
+    markScheduledBroadcastSent,
+    getDueScheduledBroadcasts,
+    getPendingScheduledBroadcasts,
+    getAutopostConfig,
+    setAutopostConfig,
+    getAllAutopostConfigs,
+    markAutopostTagPosted
 };

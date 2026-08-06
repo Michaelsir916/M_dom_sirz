@@ -904,22 +904,22 @@ async function formatMyReferral(ctx) {
     const link = `https://t.me/${username}?start=ref_${ctx.from.id}`;
     const stats = getReferralStats(ctx.from.id);
     const config = loadConfig();
-    return `🎁 *Invite & Earn*\n\n` +
-        `Share your link — each friend who joins through it (for the first time) gives you *+${config.referralBonus} bonus file credit(s)*.\n` +
+    return `🎁 <b>Invite &amp; Earn</b>\n\n` +
+        `Share your link — each friend who joins through it (for the first time) gives you <b>+${config.referralBonus} bonus file credit(s)</b>.\n` +
         `Bonus credits let you use /random even after your daily limit or cooldown.\n\n` +
-        `🔗 ${link}\n\n` +
+        `🔗 <code>${link}</code>\n\n` +
         `👥 Referrals so far: ${stats.referralCount}\n` +
         `💎 Bonus credits available: ${stats.bonusCredits}`;
 }
 
 bot.command('myreferral', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
-    await ctx.reply(await formatMyReferral(ctx), { parse_mode: 'Markdown' });
+    await ctx.reply(await formatMyReferral(ctx), { parse_mode: 'HTML' });
 });
 
 bot.action('user_referral', async (ctx) => {
     await ctx.answerCbQuery();
-    await ctx.reply(await formatMyReferral(ctx), { parse_mode: 'Markdown' });
+    await ctx.reply(await formatMyReferral(ctx), { parse_mode: 'HTML' });
 });
 
 // --- Admin: force-sub group management ---

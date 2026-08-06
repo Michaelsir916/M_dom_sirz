@@ -5,6 +5,9 @@ const mega = require('megajs');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const fetch = require('node-fetch');
+let sharp;
+try { sharp = require('sharp'); } catch (e) { sharp = null; } // blur feature degrades gracefully if not installed
 require('dotenv').config();
 const {
     loadConfig,
@@ -26,7 +29,19 @@ const {
     isAdmin,
     recordKnownChat,
     getKnownChats,
-    removeKnownChat
+    removeKnownChat,
+    markUserBlocked,
+    addBroadcastHistory,
+    getBroadcastHistory,
+    addScheduledBroadcast,
+    removeScheduledBroadcast,
+    markScheduledBroadcastSent,
+    getDueScheduledBroadcasts,
+    getPendingScheduledBroadcasts,
+    getAutopostConfig,
+    setAutopostConfig,
+    getAllAutopostConfigs,
+    markAutopostTagPosted
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -75,6 +90,12 @@ async function logError(label, error) {
 // command. Cleared on use, on /cancel, or lost on restart (admin just retaps).
 const pendingAction = {};
 
+// In-memory holder for an auto-post "test preview" awaiting the admin's
+// ✅ Post / ❌ Skip tap (setup-time confirm only — scheduled runs never wait
+// on this). Keyed by admin user id. Lost on restart, which is fine — the
+// admin just re-runs the test.
+const pendingAutopostPreview = {};
+
 function chatTypeIcon(type) {
     if (type === 'channel') return '📢';
     if (type === 'group' || type === 'supergroup') return '👥';
@@ -87,6 +108,74 @@ function chatTypeIcon(type) {
 function trackKnownChat(ctx) {
     if (!ctx.chat || ctx.chat.type === 'private') return;
     recordKnownChat(ctx.chat.id, ctx.chat.title, ctx.chat.type);
+}
+
+// ===== Broadcast tag helpers (encode a chat_id:message_id pair into a
+// Telegram /start deep-link payload, which only allows [A-Za-z0-9_-]) =====
+function encodeFileTag(chatId, messageId) {
+    const sign = chatId < 0 ? 'm' : 'p';
+    return `get-${sign}${Math.abs(chatId)}-${messageId}`;
+}
+
+function decodeFileTag(payload) {
+    const match = /^get-([mp])(\d+)-(\d+)$/.exec(payload);
+    if (!match) return null;
+    const chatId = match[1] === 'm' ? -Number(match[2]) : Number(match[2]);
+    return { chatId, messageId: Number(match[3]) };
+}
+
+// ===== Rate-limited broadcast core =====
+// Sends to every user via sendFn(userId), staying under Telegram's ~30
+// msgs/sec global cap by batching (config.broadcastBatchSize per second).
+// Auto-flags users who've blocked the bot, and retries once for anyone
+// who got rate-limited (429) mid-broadcast. Records the result to history.
+async function broadcastToUsers(sendFn, meta) {
+    const config = loadConfig();
+    const batchSize = Math.max(1, config.broadcastBatchSize || 25);
+    const userIds = getAllUserIds();
+    let sent = 0, blocked = 0, failed = 0;
+    const retryQueue = [];
+
+    for (let i = 0; i < userIds.length; i += batchSize) {
+        const batch = userIds.slice(i, i + batchSize);
+        await Promise.all(batch.map(async (uid) => {
+            try {
+                await sendFn(uid);
+                sent++;
+            } catch (error) {
+                const code = error?.response?.error_code;
+                const desc = error?.response?.description || error.message || '';
+                if (code === 403 || /blocked|deactivated|kicked/i.test(desc)) {
+                    markUserBlocked(uid);
+                    blocked++;
+                } else if (code === 429) {
+                    retryQueue.push(uid);
+                } else {
+                    failed++;
+                }
+            }
+        }));
+        if (i + batchSize < userIds.length) await new Promise(r => setTimeout(r, 1000));
+    }
+
+    // One retry pass for anyone who was rate-limited mid-broadcast
+    if (retryQueue.length > 0) {
+        await new Promise(r => setTimeout(r, 2000));
+        for (const uid of retryQueue) {
+            try {
+                await sendFn(uid);
+                sent++;
+            } catch (error) {
+                const code = error?.response?.error_code;
+                if (code === 403) { markUserBlocked(uid); blocked++; }
+                else failed++;
+            }
+        }
+    }
+
+    const result = { total: userIds.length, sent, failed, blocked };
+    addBroadcastHistory({ ...meta, ...result });
+    return result;
 }
 
 function cleanMegaLink(link) {
@@ -655,6 +744,22 @@ async function processMegaLink(ctx, megaLink) {
 bot.start(async (ctx) => {
     const chatType = ctx.chat.type;
 
+    // Deep-link from an auto-post's "🎬 Get Full Video" button: deliver that
+    // one specific video, same as /random (copyMessage, respects forward protection).
+    if (chatType === 'private' && ctx.startPayload && ctx.startPayload.startsWith('get-')) {
+        const decoded = decodeFileTag(ctx.startPayload);
+        if (decoded) {
+            const config = loadConfig();
+            try {
+                await ctx.telegram.copyMessage(ctx.chat.id, decoded.chatId, decoded.messageId,
+                    config.protectContent ? { protect_content: true } : {});
+            } catch (error) {
+                await ctx.reply('❌ Sorry, this file is no longer available.');
+            }
+            return;
+        }
+    }
+
     if (chatType !== 'private') {
         const chatName = `in this ${chatType}`;
         await ctx.reply(`🤖 *MEGA Downloader Bot*
@@ -854,7 +959,8 @@ async function sendRandomFiles(ctx) {
 
     for (const file of picked) {
         try {
-            const sent = await ctx.telegram.copyMessage(ctx.chat.id, file.chat_id, file.message_id);
+            const sent = await ctx.telegram.copyMessage(ctx.chat.id, file.chat_id, file.message_id,
+                config.protectContent ? { protect_content: true } : {});
             successfullySent.push(file);
 
             if (config.autoDeleteMinutes > 0) {
@@ -1147,27 +1253,129 @@ bot.command('broadcast', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
     const msg = ctx.message.text.split(' ').slice(1).join(' ');
     if (!msg) {
-        await ctx.reply('Usage: `/broadcast your message`', { parse_mode: 'Markdown' });
+        await ctx.reply('Usage: `/broadcast your message`\n\nTip: you can also send a photo/video/GIF with a caption starting `/broadcast` to broadcast media, or use the 📢 Broadcast button in the admin panel.', { parse_mode: 'Markdown' });
         return;
     }
-    const userIds = getAllUserIds();
-    if (userIds.length === 0) {
+    if (getAllUserIds().length === 0) {
         await ctx.reply('No users have used /random yet.');
         return;
     }
-    const status = await ctx.reply(`📢 Broadcasting to ${userIds.length} user(s)...`);
-    let sent = 0, failed = 0;
-    for (const uid of userIds) {
-        try {
-            await ctx.telegram.sendMessage(uid, msg);
-            sent++;
-        } catch (e) {
-            failed++;
-        }
-        await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, null, `✅ Broadcast complete.\nSent: ${sent} | Failed: ${failed}`);
+    await runTextBroadcast(ctx, msg);
 });
+
+// Shared executor for a plain-text broadcast, used by /broadcast, the
+// button flow, and scheduled broadcasts.
+async function runTextBroadcast(ctx, text, meta = {}) {
+    const userIds = getAllUserIds();
+    const status = ctx ? await ctx.telegram.sendMessage(ctx.chat.id, `📢 Broadcasting to ${userIds.length} user(s)...`) : null;
+    const result = await broadcastToUsers(
+        (uid) => bot.telegram.sendMessage(uid, text),
+        { kind: 'text', preview: text.slice(0, 80), by: meta.by || (ctx ? ctx.from.id : 'scheduler') }
+    );
+    const summary = `✅ Broadcast complete.\nSent: ${result.sent} | Blocked: ${result.blocked} | Failed: ${result.failed} (of ${result.total})`;
+    if (status) await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, null, summary);
+    return result;
+}
+
+// Shared executor for a media broadcast (photo/video/animation + caption).
+async function runMediaBroadcast(ctx, kind, fileId, caption) {
+    const userIds = getAllUserIds();
+    const status = await ctx.reply(`📢 Broadcasting ${kind} to ${userIds.length} user(s)...`);
+    const sendFn = (uid) => {
+        const opts = caption ? { caption } : {};
+        if (kind === 'photo') return bot.telegram.sendPhoto(uid, fileId, opts);
+        if (kind === 'video') return bot.telegram.sendVideo(uid, fileId, opts);
+        return bot.telegram.sendAnimation(uid, fileId, opts);
+    };
+    const result = await broadcastToUsers(sendFn, { kind, preview: (caption || '').slice(0, 80), by: ctx.from.id });
+    await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, null,
+        `✅ Broadcast complete.\nSent: ${result.sent} | Blocked: ${result.blocked} | Failed: ${result.failed} (of ${result.total})`);
+    return result;
+}
+
+bot.command('broadcasthistory', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const history = getBroadcastHistory(10);
+    if (history.length === 0) {
+        await ctx.reply('No broadcasts sent yet.');
+        return;
+    }
+    const lines = history.map(h => {
+        const when = new Date(h.at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+        return `• ${when} — ${h.kind}${h.preview ? ` "${h.preview}"` : ''}\n  ✅${h.sent} ❌${h.failed} 🚫${h.blocked} / ${h.total}`;
+    });
+    await ctx.reply(`📜 *Last ${history.length} broadcasts*\n\n${lines.join('\n\n')}`, { parse_mode: 'Markdown' });
+});
+
+// /schedulebroadcast 2026-08-07 09:00 Your message here
+bot.command('schedulebroadcast', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    if (ctx.chat.type !== 'private') return;
+    const parts = ctx.message.text.split(' ');
+    const dateStr = parts[1];
+    const timeStr = parts[2];
+    const text = parts.slice(3).join(' ');
+    if (!dateStr || !timeStr || !text) {
+        await ctx.reply('Usage: `/schedulebroadcast 2026-08-07 09:00 Your message`\n\nTime is IST (Asia/Kolkata).', { parse_mode: 'Markdown' });
+        return;
+    }
+    // Interpret the given date/time as IST (UTC+5:30)
+    const isoIst = `${dateStr}T${timeStr}:00+05:30`;
+    const sendAt = new Date(isoIst);
+    if (isNaN(sendAt.getTime()) || sendAt.getTime() <= Date.now()) {
+        await ctx.reply('⚠️ Could not parse that date/time, or it\'s already in the past.');
+        return;
+    }
+    const record = addScheduledBroadcast({ sendAt: sendAt.toISOString(), kind: 'text', text, createdBy: ctx.from.id });
+    await ctx.reply(`⏰ Scheduled for ${sendAt.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST.\nID: \`${record.id}\`\n\nCancel with \`/cancelbroadcast ${record.id}\``, { parse_mode: 'Markdown' });
+});
+
+bot.command('listscheduled', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const pending = getPendingScheduledBroadcasts();
+    if (pending.length === 0) {
+        await ctx.reply('No scheduled broadcasts pending.');
+        return;
+    }
+    const lines = pending.map(s => `• \`${s.id}\` — ${new Date(s.sendAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST — "${(s.text || s.caption || '').slice(0, 50)}"`);
+    await ctx.reply(`⏰ *Pending Scheduled Broadcasts*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+});
+
+bot.command('cancelbroadcast', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return;
+    const id = ctx.message.text.split(' ')[1];
+    if (!id) {
+        await ctx.reply('Usage: `/cancelbroadcast <id>` (see `/listscheduled`)', { parse_mode: 'Markdown' });
+        return;
+    }
+    const ok = removeScheduledBroadcast(id);
+    await ctx.reply(ok ? '✅ Cancelled.' : '❌ No scheduled broadcast found with that ID.');
+});
+
+// Checked every minute — fires any scheduled broadcast whose time has come.
+async function processDueScheduledBroadcasts() {
+    const due = getDueScheduledBroadcasts();
+    for (const s of due) {
+        try {
+            if (s.kind === 'text') {
+                await runTextBroadcast(null, s.text, { by: s.createdBy });
+            } else {
+                const userIds = getAllUserIds();
+                const sendFn = (uid) => {
+                    const opts = s.caption ? { caption: s.caption } : {};
+                    if (s.kind === 'photo') return bot.telegram.sendPhoto(uid, s.fileId, opts);
+                    if (s.kind === 'video') return bot.telegram.sendVideo(uid, s.fileId, opts);
+                    return bot.telegram.sendAnimation(uid, s.fileId, opts);
+                };
+                await broadcastToUsers(sendFn, { kind: s.kind, preview: (s.caption || '').slice(0, 80), by: s.createdBy, scheduled: true });
+            }
+            markScheduledBroadcastSent(s.id);
+        } catch (error) {
+            logError('Scheduled broadcast', error);
+            markScheduledBroadcastSent(s.id); // don't retry-loop a broken entry forever
+        }
+    }
+}
 
 // --- User-facing ---
 // Wraps recordRequest(): if the daily limit is hit but the user has earned
@@ -1282,7 +1490,11 @@ async function setupCommandMenus() {
         { command: 'listfiles', description: 'View the file pool' },
         { command: 'delfile', description: 'Remove a file by index' },
         { command: 'stats', description: 'Pool & usage stats' },
-        { command: 'broadcast', description: 'Message all /random users' }
+        { command: 'broadcast', description: 'Message all /random users' },
+        { command: 'broadcasthistory', description: 'Last 10 broadcasts' },
+        { command: 'schedulebroadcast', description: 'Schedule a text broadcast' },
+        { command: 'listscheduled', description: 'List pending scheduled broadcasts' },
+        { command: 'cancelbroadcast', description: 'Cancel a scheduled broadcast' }
     ];
 
     const adminIds = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
@@ -1333,13 +1545,24 @@ async function renderFileSharePanel(ctx) {
             [{ text: `⏱ Cooldown: ${config.cooldownSeconds}s`, callback_data: 'fs_cooldown_menu' }],
             [{ text: `📆 Daily Limit: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}`, callback_data: 'fs_dailylimit_menu' }],
             [{ text: `🗑 Auto-Delete: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + 'm'}`, callback_data: 'fs_autodelete_menu' }],
+            [{ text: `🔐 Forward Protection: ${config.protectContent ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_protect' }],
             [{ text: '📢 Broadcast', callback_data: 'fs_broadcast_menu' }],
+            [{ text: '🖼 Auto-Post', callback_data: 'ap_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
 
     await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
 }
+
+bot.action('fs_toggle_protect', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const config = loadConfig();
+    config.protectContent = !config.protectContent;
+    saveConfig(config);
+    await ctx.answerCbQuery(`Forward protection ${config.protectContent ? 'ON' : 'OFF'}`);
+    await renderFileSharePanel(ctx);
+});
 
 // Renders a list of known groups/channels (auto-tracked from any update the
 // bot has seen from them) as tappable buttons, excluding already-picked ones.
@@ -1528,13 +1751,336 @@ bot.action('fs_setsrc_manual', async (ctx) => {
 });
 
 // --- Broadcast (button-driven) ---
+async function renderBroadcastMenu(ctx) {
+    const config = loadConfig();
+    const pendingCount = getPendingScheduledBroadcasts().length;
+    const text = '📢 *Broadcast*\n\n' +
+        `Forward mode: ${config.broadcastForwardMode ? 'ON (shows "Forwarded from")' : 'OFF (looks native)'}\n` +
+        `Pending scheduled: ${pendingCount}\n\n` +
+        'Tap *Send Now* then send text, photo, video, or GIF (with caption). ' +
+        'Use `/schedulebroadcast YYYY-MM-DD HH:MM text` for scheduled text broadcasts, and `/broadcasthistory` to review past sends.';
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: '📤 Send Now', callback_data: 'fs_broadcast_send' }],
+            [{ text: `🔁 Forward: ${config.broadcastForwardMode ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_forward' }],
+            [{ text: '📜 History', callback_data: 'fs_broadcast_history' }],
+            [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
+        ]
+    };
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
 bot.action('fs_broadcast_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
+    await renderBroadcastMenu(ctx);
+});
+
+bot.action('fs_toggle_forward', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const config = loadConfig();
+    config.broadcastForwardMode = !config.broadcastForwardMode;
+    saveConfig(config);
+    await ctx.answerCbQuery(`Forward mode ${config.broadcastForwardMode ? 'ON' : 'OFF'}`);
+    await renderBroadcastMenu(ctx);
+});
+
+bot.action('fs_broadcast_history', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const history = getBroadcastHistory(10);
+    const text = history.length === 0
+        ? 'No broadcasts sent yet.'
+        : '📜 *Last broadcasts*\n\n' + history.map(h => {
+            const when = new Date(h.at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+            return `• ${when} — ${h.kind}\n  ✅${h.sent} ❌${h.failed} 🚫${h.blocked} / ${h.total}`;
+        }).join('\n');
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'fs_broadcast_menu' }]] } });
+});
+
+bot.action('fs_broadcast_send', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'broadcast' };
-    await ctx.editMessageText('📢 Send the message to broadcast to all /random users now, or /cancel.', {
-        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu_fileshare' }]] }
+    await ctx.editMessageText('📢 Send the text message to broadcast now — or send a photo/video/GIF with a caption — or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'fs_broadcast_menu' }]] }
     });
+});
+
+// --- Auto-Post system (per-admin, isolated) ---
+
+// Forwards the video silently to the admin's own DM just to read its
+// Telegram-generated thumbnail file_id, then deletes the forwarded copy.
+async function getVideoThumbnailFileId(adminId, chatId, messageId) {
+    try {
+        const fwd = await bot.telegram.forwardMessage(adminId, chatId, messageId, { disable_notification: true });
+        const thumb = (fwd.video && (fwd.video.thumb || fwd.video.thumbnail)) || null;
+        const thumbFileId = thumb ? thumb.file_id : null;
+        bot.telegram.deleteMessage(adminId, fwd.message_id).catch(() => {});
+        return thumbFileId;
+    } catch (error) {
+        console.error('getVideoThumbnailFileId failed:', error.message);
+        return null;
+    }
+}
+
+async function blurThumbnail(fileId) {
+    if (!sharp) return null;
+    try {
+        const link = await bot.telegram.getFileLink(fileId);
+        const res = await fetch(link.href || link.toString());
+        const buffer = Buffer.from(await res.arrayBuffer());
+        return await sharp(buffer).blur(25).toBuffer();
+    } catch (error) {
+        console.error('blurThumbnail failed:', error.message);
+        return null;
+    }
+}
+
+// Core auto-post engine, shared by the "🧪 Test Preview" setup flow and the
+// automatic interval-based scheduler. preview=true sends the candidate post
+// to the admin's own DM with Confirm/Skip instead of posting to the channel
+// — setup-time only. Scheduled runs (preview=false) post directly, no confirm.
+async function runAutopostForAdmin(adminId, { preview = false } = {}) {
+    const cfg = getAutopostConfig(adminId);
+    if (!cfg.channelId) return { error: 'no_channel' };
+
+    const files = loadSharedFiles().filter(f => f.type === 'video');
+    const unposted = files.filter(f => !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`));
+    if (unposted.length === 0) return { error: 'no_files' };
+    const file = unposted[0];
+    const tag = `${file.chat_id}:${file.message_id}`;
+
+    let thumbSource;
+    if (cfg.thumbnailMode === 'custom' && cfg.customThumbnailFileId) {
+        thumbSource = cfg.customThumbnailFileId;
+    } else {
+        const thumbFileId = await getVideoThumbnailFileId(adminId, file.chat_id, file.message_id);
+        if (!thumbFileId) return { error: 'no_thumbnail' };
+        thumbSource = thumbFileId;
+    }
+
+    if (cfg.blurEnabled) {
+        const blurred = await blurThumbnail(thumbSource);
+        if (blurred) thumbSource = { source: blurred };
+    }
+
+    const deepLink = `https://t.me/${botUsername}?start=${encodeFileTag(file.chat_id, file.message_id)}`;
+    const keyboard = { inline_keyboard: [[{ text: '🎬 Get Full Video', url: deepLink }]] };
+
+    if (preview) {
+        const msg = await bot.telegram.sendPhoto(adminId, thumbSource, {
+            caption: `🧪 Preview\n\n${cfg.caption}`,
+            reply_markup: { inline_keyboard: [
+                [{ text: '✅ Post to Channel', callback_data: 'ap_confirm' }, { text: '❌ Skip', callback_data: 'ap_cancel' }]
+            ] }
+        });
+        pendingAutopostPreview[adminId] = { tag, caption: cfg.caption, thumbSource, keyboard };
+        return { previewed: true };
+    }
+
+    await bot.telegram.sendPhoto(cfg.channelId, thumbSource, { caption: cfg.caption, reply_markup: keyboard });
+    markAutopostTagPosted(adminId, tag);
+    return { posted: true, tag };
+}
+
+// Checked every minute — fires any admin's auto-post whose interval has elapsed.
+async function processAutopostTicks() {
+    for (const cfg of getAllAutopostConfigs()) {
+        if (!cfg.enabled || !cfg.channelId || !cfg.intervalHours) continue;
+        const dueAt = (cfg.lastPostAt || 0) + cfg.intervalHours * 3600 * 1000;
+        if (Date.now() < dueAt) continue;
+        try {
+            const result = await runAutopostForAdmin(cfg.adminId, { preview: false });
+            if (result.error) console.log(`Auto-post skipped for admin ${cfg.adminId}: ${result.error}`);
+        } catch (error) {
+            logError(`Auto-post tick (admin ${cfg.adminId})`, error);
+        }
+    }
+}
+
+async function renderAutopostPanel(ctx) {
+    const adminId = ctx.from.id;
+    const cfg = getAutopostConfig(adminId);
+    const channelLabel = cfg.channelId
+        ? (getKnownChats().find(c => String(c.id) === String(cfg.channelId))?.title || cfg.channelId)
+        : 'Not set';
+    const text = '🖼 *Auto-Post* (only visible/controllable by you)\n\n' +
+        `Channel: ${channelLabel}\n` +
+        `Interval: ${cfg.intervalHours === 0 ? 'Not set' : 'Every ' + cfg.intervalHours + 'h'}\n` +
+        `Caption: "${cfg.caption}"\n` +
+        `Thumbnail: ${cfg.thumbnailMode === 'custom' ? (cfg.customThumbnailFileId ? 'Custom (uploaded)' : 'Custom (not uploaded yet!)') : "Video's own"}\n` +
+        `Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}${sharp ? '' : ' (⚠️ sharp not installed — run npm install)'}\n` +
+        `Status: ${cfg.enabled ? '✅ Running' : '⏸ Paused'}\n` +
+        `Posted so far: ${cfg.postedTags.length}`;
+
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: '🎯 Set Channel', callback_data: 'ap_setchannel_menu' }],
+            [{ text: `⏱ Interval: ${cfg.intervalHours === 0 ? 'Not set' : cfg.intervalHours + 'h'}`, callback_data: 'ap_interval_menu' }],
+            [{ text: '✏️ Set Caption', callback_data: 'ap_caption' }],
+            [{ text: `🖼 Thumbnail Source: ${cfg.thumbnailMode === 'custom' ? 'Custom' : 'Video'}`, callback_data: 'ap_thumb_toggle' }],
+            [{ text: '📤 Upload Custom Thumbnail', callback_data: 'ap_thumb_upload' }],
+            [{ text: `🔵 Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}`, callback_data: 'ap_blur_toggle' }],
+            [{ text: cfg.enabled ? '⏸ Pause' : '▶️ Enable', callback_data: 'ap_toggle_enabled' }],
+            [{ text: '🧪 Test Preview', callback_data: 'ap_test' }],
+            [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
+        ]
+    };
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.action('ap_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    await renderAutopostPanel(ctx);
+});
+
+bot.action('ap_setchannel_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const { rows, truncated, total } = knownChatPickerKeyboard([], 'ap_setchannel', 'ap_menu');
+    const note = total === 0
+        ? '_I haven\'t seen any channels yet — add me to yours as admin first, or type an ID/@username._'
+        : truncated ? `_Showing 20 of ${total} known chats._` : '';
+    await ctx.editMessageText(`🎯 *Set Your Auto-Post Channel*\n\nOnly you post here — pick your own channel.\n\n${note}`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^ap_setchannel:(-?\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
+    setAutopostConfig(ctx.from.id, { channelId: chatId });
+    const chat = getKnownChats().find(c => String(c.id) === String(chatId));
+    await ctx.answerCbQuery('✅ Channel set');
+    await ctx.editMessageText(`✅ Auto-post channel set to "${chat ? chat.title : chatId}".`, {
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'ap_menu' }]] }
+    });
+});
+
+bot.action('ap_setchannel_manual', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'ap_setchannel_manual' };
+    await ctx.editMessageText('⌨️ Send the channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
+    });
+});
+
+bot.action('ap_interval_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const cfg = getAutopostConfig(ctx.from.id);
+    await ctx.editMessageText(`⏱ *Auto-Post Interval*\n\nCurrent: ${cfg.intervalHours === 0 ? 'Not set' : cfg.intervalHours + 'h'}`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [presetRow([1, 3, 6, 12, 24], 'ap_interval', 'h'), [{ text: '✏️ Custom', callback_data: 'ap_interval_custom' }], [{ text: '🔙 Back', callback_data: 'ap_menu' }]] }
+    });
+});
+
+bot.action(/^ap_interval:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const n = parseInt(ctx.match[1], 10);
+    setAutopostConfig(ctx.from.id, { intervalHours: n });
+    await ctx.answerCbQuery(`✅ Every ${n}h`);
+    await renderAutopostPanel(ctx);
+});
+
+bot.action('ap_interval_custom', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'autopost_interval_custom' };
+    await ctx.editMessageText('✏️ Send the interval in whole hours (1+), or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_interval_menu' }]] }
+    });
+});
+
+bot.action('ap_caption', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'autopost_caption' };
+    await ctx.editMessageText('✏️ Send the caption to use for every auto-post, or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
+    });
+});
+
+bot.action('ap_thumb_toggle', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const cfg = getAutopostConfig(ctx.from.id);
+    const next = cfg.thumbnailMode === 'custom' ? 'video' : 'custom';
+    setAutopostConfig(ctx.from.id, { thumbnailMode: next });
+    await ctx.answerCbQuery(`Thumbnail source: ${next}`);
+    await renderAutopostPanel(ctx);
+});
+
+bot.action('ap_thumb_upload', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'autopost_thumbnail' };
+    await ctx.editMessageText('📤 Send the photo to use as the thumbnail for every auto-post, or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
+    });
+});
+
+bot.action('ap_blur_toggle', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!sharp) {
+        await ctx.answerCbQuery('⚠️ Install the "sharp" package on the server first (npm install sharp).');
+        return;
+    }
+    const cfg = getAutopostConfig(ctx.from.id);
+    setAutopostConfig(ctx.from.id, { blurEnabled: !cfg.blurEnabled });
+    await ctx.answerCbQuery(`Blur ${!cfg.blurEnabled ? 'ON' : 'OFF'}`);
+    await renderAutopostPanel(ctx);
+});
+
+bot.action('ap_toggle_enabled', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const cfg = getAutopostConfig(ctx.from.id);
+    if (!cfg.enabled) {
+        if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a channel first.'); return; }
+        if (!cfg.intervalHours) { await ctx.answerCbQuery('⚠️ Set an interval first.'); return; }
+    }
+    setAutopostConfig(ctx.from.id, { enabled: !cfg.enabled });
+    await ctx.answerCbQuery(!cfg.enabled ? '▶️ Enabled' : '⏸ Paused');
+    await renderAutopostPanel(ctx);
+});
+
+bot.action('ap_test', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const cfg = getAutopostConfig(ctx.from.id);
+    if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a channel first.'); return; }
+    await ctx.answerCbQuery('🧪 Generating preview...');
+    const result = await runAutopostForAdmin(ctx.from.id, { preview: true });
+    if (result.error === 'no_files') await ctx.reply('⚠️ No unposted videos in the source pool yet.');
+    else if (result.error === 'no_thumbnail') await ctx.reply('⚠️ Could not read a thumbnail from that video — try uploading a custom thumbnail instead (🖼 Thumbnail Source → Custom).');
+});
+
+bot.action('ap_confirm', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const pending = pendingAutopostPreview[ctx.from.id];
+    if (!pending) { await ctx.answerCbQuery('⚠️ Preview expired — run Test Preview again.'); return; }
+    const cfg = getAutopostConfig(ctx.from.id);
+    if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ No channel set.'); return; }
+    try {
+        await bot.telegram.sendPhoto(cfg.channelId, pending.thumbSource, { caption: pending.caption, reply_markup: pending.keyboard });
+        markAutopostTagPosted(ctx.from.id, pending.tag);
+        await ctx.answerCbQuery('✅ Posted!');
+        await ctx.editMessageCaption('✅ Posted to channel.').catch(() => {});
+    } catch (error) {
+        await ctx.answerCbQuery('❌ Failed to post.');
+        logError('Auto-post confirm', error);
+    }
+    delete pendingAutopostPreview[ctx.from.id];
+});
+
+bot.action('ap_cancel', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    delete pendingAutopostPreview[ctx.from.id];
+    await ctx.answerCbQuery('Skipped');
+    await ctx.editMessageCaption('❌ Skipped — not posted.').catch(() => {});
 });
 
 // --- Quick-preset setting panels ---
@@ -1647,15 +2193,59 @@ bot.action('menu_back', async (ctx) => {
     await ctx.editMessageText(ADMIN_START_TEXT, { reply_markup: ADMIN_START_KEYBOARD });
 });
 
-// Track photo/video files posted by admin in the configured source group.
-// Only the (chat_id, message_id) is saved — sharing later uses copyMessage.
-bot.on(['photo', 'video'], async (ctx) => {
-    if (ctx.chat.type === 'private') return;
+// Single combined handler for photo/video/animation messages — kept as one
+// handler (rather than several bot.on() calls) so Telegraf's middleware chain
+// doesn't short-circuit: a handler that returns without calling next() stops
+// any later-registered handler for the same event from ever running.
+//
+// Private chat + admin: (a) 📢 Broadcast button flow — admin sends media+caption,
+// (b) caption-prefixed `/broadcast ...` on any media, (c) uploading a custom
+// thumbnail for the auto-post feature.
+// Group/channel chat: tracks photo/video files posted in the configured
+// source group into the share pool (unchanged from before).
+bot.on(['photo', 'video', 'animation'], async (ctx) => {
+    if (ctx.chat.type === 'private') {
+        if (!isAdmin(ctx.from.id)) return;
+
+        const kind = ctx.message.animation ? 'animation' : (ctx.message.video ? 'video' : 'photo');
+        const fileId = ctx.message.animation ? ctx.message.animation.file_id
+            : ctx.message.video ? ctx.message.video.file_id
+            : ctx.message.photo[ctx.message.photo.length - 1].file_id;
+        const caption = ctx.message.caption || '';
+
+        // (c) Auto-post custom thumbnail upload — only photos accepted
+        if (pendingAction[ctx.from.id]?.type === 'autopost_thumbnail') {
+            delete pendingAction[ctx.from.id];
+            if (kind !== 'photo') {
+                await ctx.reply('⚠️ Please send a photo for the custom thumbnail. Try again from the Auto-Post menu.');
+                return;
+            }
+            setAutopostConfig(ctx.from.id, { thumbnailMode: 'custom', customThumbnailFileId: fileId });
+            await ctx.reply('✅ Custom thumbnail saved. It will be used for every auto-post.');
+            return;
+        }
+
+        // (a) Broadcast button flow — admin tapped "Send Now" then sent media
+        if (pendingAction[ctx.from.id]?.type === 'broadcast') {
+            delete pendingAction[ctx.from.id];
+            await runMediaBroadcast(ctx, kind, fileId, caption.replace(/^\/broadcast\s*/i, ''));
+            return;
+        }
+
+        // (b) Caption-prefixed /broadcast on media, sent without using the button
+        if (/^\/broadcast\b/i.test(caption)) {
+            await runMediaBroadcast(ctx, kind, fileId, caption.replace(/^\/broadcast\s*/i, ''));
+        }
+        return;
+    }
+
+    // --- Group/channel: track photo/video files posted in the source group ---
     trackKnownChat(ctx);
 
     const config = loadConfig();
     if (!config.sourceGroupId || String(ctx.chat.id) !== String(config.sourceGroupId)) return;
     if (!ctx.from || !isAdmin(ctx.from.id)) return;
+    if (!ctx.message.photo && !ctx.message.video) return; // ignore animations for the source pool
 
     const type = Array.isArray(ctx.message.photo) ? 'photo' : 'video';
     const added = addSharedFile(ctx.chat.id, ctx.message.message_id, type);
@@ -1830,25 +2420,59 @@ async function handlePendingAction(ctx, text) {
         return;
     }
 
+    if (action.type === 'ap_setchannel_manual') {
+        const identifier = text.trim();
+        if (!identifier) {
+            await ctx.reply('⚠️ Send a chat ID (e.g. -1001234567890) or @username, or /cancel.');
+            return;
+        }
+        let chat;
+        try {
+            const target = identifier.startsWith('@') || isNaN(identifier) ? identifier : Number(identifier);
+            chat = await ctx.telegram.getChat(target);
+        } catch (error) {
+            await ctx.reply(`❌ Couldn't find that chat (${error.message}). Make sure I'm added there, then try again, or /cancel.`);
+            return;
+        }
+        try {
+            await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
+        } catch (error) {
+            await ctx.reply(`⚠️ Found "${chat.title}" but I don't seem to be a member/admin there. Add me first, then try again, or /cancel.`);
+            return;
+        }
+        recordKnownChat(chat.id, chat.title, chat.type);
+        setAutopostConfig(userId, { channelId: chat.id });
+        delete pendingAction[userId];
+        await ctx.reply(`✅ Auto-post destination set to "${chat.title}". This channel is used only for your auto-posts.`);
+        return;
+    }
+
     if (action.type === 'broadcast') {
         delete pendingAction[userId];
-        const userIds = getAllUserIds();
-        if (userIds.length === 0) {
+        if (getAllUserIds().length === 0) {
             await ctx.reply('No users have used /random yet.');
             return;
         }
-        const status = await ctx.reply(`📢 Broadcasting to ${userIds.length} user(s)...`);
-        let sent = 0, failed = 0;
-        for (const uid of userIds) {
-            try {
-                await ctx.telegram.sendMessage(uid, text);
-                sent++;
-            } catch (e) {
-                failed++;
-            }
-            await new Promise(resolve => setTimeout(resolve, 100));
+        await runTextBroadcast(ctx, text);
+        return;
+    }
+
+    if (action.type === 'autopost_caption') {
+        delete pendingAction[userId];
+        setAutopostConfig(userId, { caption: text });
+        await ctx.reply('✅ Auto-post caption saved.');
+        return;
+    }
+
+    if (action.type === 'autopost_interval_custom') {
+        delete pendingAction[userId];
+        const n = parseInt(text.trim(), 10);
+        if (isNaN(n) || n < 1) {
+            await ctx.reply('⚠️ Send a whole number of hours (1+), or /cancel.');
+            return;
         }
-        await ctx.telegram.editMessageText(ctx.chat.id, status.message_id, null, `✅ Broadcast complete.\nSent: ${sent} | Failed: ${failed}`);
+        setAutopostConfig(userId, { intervalHours: n });
+        await ctx.reply(`✅ Auto-post interval set to every ${n}h.`);
         return;
     }
 
@@ -2012,6 +2636,15 @@ bot.telegram.getMe().then(botInfo => {
             console.log('3. Users can then just send MEGA links');
             console.log('====================================');
             await setupCommandMenus();
+
+            // Background schedulers: scheduled broadcasts + per-admin auto-posts.
+            // Checked every 60s — cheap and frequent enough for hour-scale intervals.
+            setInterval(() => {
+                processDueScheduledBroadcasts().catch(err => logError('Scheduled broadcast tick', err));
+            }, 60 * 1000);
+            setInterval(() => {
+                processAutopostTicks().catch(err => logError('Auto-post tick', err));
+            }, 60 * 1000);
         })
         .catch(err => {
             console.error('❌ Failed to start bot:', err);

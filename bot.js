@@ -786,13 +786,39 @@ async function getUnjoinedGroups(ctx, groupIds, userId) {
     return unjoined;
 }
 
+// Returns a cached "request to join" invite link for this force-sub group,
+// creating (and persisting) one the first time it's needed. Using
+// creates_join_request:true means tapping the link never drops the user
+// straight into the channel — it queues a join request that we auto-approve
+// in the chat_join_request handler below.
+async function getOrCreateJoinRequestLink(ctx, groupId) {
+    const config = loadConfig();
+    if (!config.forceSubInviteLinks) config.forceSubInviteLinks = {};
+    const cached = config.forceSubInviteLinks[groupId];
+    if (cached) return cached;
+
+    const link = await ctx.telegram.createChatInviteLink(groupId, {
+        creates_join_request: true,
+        name: 'Bot force-sub link'
+    });
+    config.forceSubInviteLinks[groupId] = link.invite_link;
+    saveConfig(config);
+    return link.invite_link;
+}
+
 async function sendJoinPrompt(ctx, groupIds) {
     const buttons = [];
     for (const groupId of groupIds) {
         try {
             const chat = await ctx.telegram.getChat(groupId);
-            let inviteLink = chat.invite_link || await ctx.telegram.exportChatInviteLink(groupId);
-            buttons.push([{ text: `➡️ Join ${chat.title || 'Group'}`, url: inviteLink }]);
+            let inviteLink;
+            try {
+                inviteLink = await getOrCreateJoinRequestLink(ctx, groupId);
+            } catch (linkError) {
+                console.error(`Join-request link failed for ${groupId}, falling back to instant-join link:`, linkError.message);
+                inviteLink = chat.invite_link || await ctx.telegram.exportChatInviteLink(groupId);
+            }
+            buttons.push([{ text: `➡️ Request to Join ${chat.title || 'Group'}`, url: inviteLink }]);
         } catch (error) {
             console.error(`Could not generate invite link for ${groupId}:`, error.message);
         }
@@ -805,7 +831,7 @@ async function sendJoinPrompt(ctx, groupIds) {
 
     buttons.push([{ text: '✅ I\'ve Joined — Verify', callback_data: 'recheck_sub' }]);
 
-    await ctx.reply('🔒 *Join the group(s) below to unlock files*', {
+    await ctx.reply('🔒 *Tap below to request access — you\'ll be auto-approved instantly*', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: buttons }
     });
@@ -945,6 +971,7 @@ bot.command('unsetforcesub', async (ctx) => {
     }
     const config = loadConfig();
     config.forceSubGroupIds = config.forceSubGroupIds.filter(id => id !== ctx.chat.id);
+    if (config.forceSubInviteLinks) delete config.forceSubInviteLinks[ctx.chat.id];
     saveConfig(config);
     await ctx.reply(`✅ Removed "${ctx.chat.title}" from the force-sub list.`);
 });
@@ -1654,6 +1681,30 @@ async function isTrustedChannelAdmin(ctx) {
     }
 }
 
+// Auto-approves join requests for any chat currently set as a force-sub
+// group/channel — this is what makes the "request to join" invite links
+// (see getOrCreateJoinRequestLink) actually unlock instantly instead of
+// waiting on a human admin to approve each request.
+bot.on('chat_join_request', async (ctx) => {
+    try {
+        const req = ctx.chatJoinRequest;
+        const chatId = req.chat.id;
+        const userId = req.from.id;
+
+        const config = loadConfig();
+        if (!config.forceSubGroupIds.includes(chatId)) return; // not one of ours — leave it alone
+
+        await ctx.telegram.approveChatJoinRequest(chatId, userId);
+        console.log(`✅ Auto-approved join request: user ${userId} -> chat "${req.chat.title}" (${chatId})`);
+
+        try {
+            await ctx.telegram.sendMessage(userId, `✅ You're approved for "${req.chat.title}"! Send /random to get files.`);
+        } catch (e) { /* user hasn't opened a DM with the bot yet — ignore */ }
+    } catch (error) {
+        logError('chat_join_request auto-approve', error);
+    }
+});
+
 bot.on('channel_post', async (ctx) => {
     const post = ctx.channelPost;
     console.log(`📨 channel_post received in ${ctx.chat.id}: "${(post.text || '[non-text]').slice(0, 50)}"`);
@@ -1705,6 +1756,7 @@ bot.on('channel_post', async (ctx) => {
         await ctx.reply(`✅ Set "${ctx.chat.title}" as the source group.\n\nPhoto/video files posted here will now be tracked automatically.`);
     } else if (command === '/unsetforcesub') {
         config.forceSubGroupIds = config.forceSubGroupIds.filter(id => id !== ctx.chat.id);
+        if (config.forceSubInviteLinks) delete config.forceSubInviteLinks[ctx.chat.id];
         saveConfig(config);
         await ctx.reply(`✅ Removed "${ctx.chat.title}" from the force-sub list.`);
     } else if (command === '/setlogchannel') {

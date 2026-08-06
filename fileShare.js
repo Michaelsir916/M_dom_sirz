@@ -14,7 +14,8 @@ const DEFAULT_CONFIG = {
     dailyLimit: 0,          // 0 = unlimited
     cooldownSeconds: 10,
     referralBonus: 3,       // bonus file-credits earned per successful referral
-    errorLogChatId: null    // channel/group id where bot errors are posted
+    errorLogChatId: null,   // channel/group id where bot errors are posted
+    forceSubInviteLinks: {} // groupId -> cached "request to join" invite link
 };
 
 function atomicWrite(filePath, data) {

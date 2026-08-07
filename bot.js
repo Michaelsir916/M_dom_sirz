@@ -47,11 +47,34 @@ const {
     recordJoinRequest,
     hasJoinRequest,
     markJoinRequestApproved,
-    getDueJoinRequestsForApproval
+    getDueJoinRequestsForApproval,
+    isMaintenanceAllowed,
+    addMaintenanceWhitelist,
+    removeMaintenanceWhitelist,
+    getMaintenanceWhitelist
 } = require('./fileShare');
 const queue = require('./queue');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// Runs before every single handler. When maintenance mode is ON, only admins
+// and whitelisted users pass through — everyone else gets a plain notice.
+// Channel posts are anonymous (no ctx.from), so they're left alone here;
+// the per-command trusted-admin checks elsewhere still gate those.
+bot.use(async (ctx, next) => {
+    const config = loadConfig();
+    if (!config.maintenanceMode || !ctx.from) return next();
+    if (isMaintenanceAllowed(ctx.from.id)) return next();
+
+    if (ctx.updateType === 'callback_query') {
+        await ctx.answerCbQuery('🛠 Bot under maintenance.', { show_alert: true }).catch(() => {});
+        return;
+    }
+    if (ctx.chat && ctx.chat.type === 'private') {
+        await ctx.reply('🛠 Bot under maintenance.').catch(() => {});
+    }
+    // In groups, stay silent rather than replying to every message.
+});
 
 const apiId = Number(process.env.API_ID);
 const apiHash = process.env.API_HASH;
@@ -1560,6 +1583,7 @@ async function renderFileSharePanel(ctx) {
             [{ text: `🔐 Forward Protection: ${config.protectContent ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_protect' }],
             [{ text: '📢 Broadcast', callback_data: 'fs_broadcast_menu' }],
             [{ text: '🖼 Auto-Post', callback_data: 'ap_menu' }],
+            [{ text: '🛠 Maintenance Mode', callback_data: 'mm_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
@@ -1574,6 +1598,77 @@ bot.action('fs_toggle_protect', async (ctx) => {
     saveConfig(config);
     await ctx.answerCbQuery(`Forward protection ${config.protectContent ? 'ON' : 'OFF'}`);
     await renderFileSharePanel(ctx);
+});
+
+// --- Maintenance mode ---
+async function renderMaintenancePanel(ctx) {
+    const config = loadConfig();
+    const whitelist = getMaintenanceWhitelist();
+    const text = '🛠 *Maintenance Mode*\n\n' +
+        `Status: ${config.maintenanceMode ? '🔴 ON — bot paused for everyone else' : '🟢 OFF — normal'}\n\n` +
+        'When ON: MEGA downloads and all normal features stop for everyone ' +
+        'except admins and users added below. They see "Bot under maintenance."\n\n' +
+        `*Whitelisted users* (${whitelist.length}):\n` +
+        (whitelist.length ? whitelist.map(id => `• \`${id}\``).join('\n') : '_None yet._');
+
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: config.maintenanceMode ? '🟢 Turn OFF' : '🔴 Turn ON', callback_data: 'mm_toggle' }],
+            [{ text: '➕ Add User', callback_data: 'mm_add_user' }, { text: '➖ Remove User', callback_data: 'mm_remove_menu' }],
+            [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
+        ]
+    };
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.action('mm_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    await renderMaintenancePanel(ctx);
+});
+
+bot.action('mm_toggle', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const config = loadConfig();
+    config.maintenanceMode = !config.maintenanceMode;
+    saveConfig(config);
+    await ctx.answerCbQuery(config.maintenanceMode ? '🔴 Maintenance ON' : '🟢 Maintenance OFF');
+    await renderMaintenancePanel(ctx);
+});
+
+bot.action('mm_add_user', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'mm_add_user' };
+    await ctx.editMessageText('⌨️ Send the Telegram user ID to allow during maintenance, or /cancel.\n\n_Tip: ask them to send /start to any bot that shows their ID, e.g. @userinfobot._', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mm_menu' }]] }
+    });
+});
+
+bot.action('mm_remove_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const whitelist = getMaintenanceWhitelist();
+    if (whitelist.length === 0) {
+        await ctx.editMessageText('No whitelisted users to remove.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'mm_menu' }]] }
+        });
+        return;
+    }
+    const rows = whitelist.map(id => [{ text: `➖ ${id}`, callback_data: `mm_remove:${id}` }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'mm_menu' }]);
+    await ctx.editMessageText('➖ *Tap a user to remove from the maintenance whitelist:*', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^mm_remove:(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    removeMaintenanceWhitelist(ctx.match[1]);
+    await ctx.answerCbQuery('✅ Removed');
+    await renderMaintenancePanel(ctx);
 });
 
 // Renders a list of known groups/channels (auto-tracked from any update the
@@ -2511,6 +2606,18 @@ async function handlePendingAction(ctx, text) {
             await ctx.reply(`✅ Set "${chat.title}" as the source ${chat.type === 'channel' ? 'channel' : 'group'}.`);
         }
         delete pendingAction[userId];
+        return;
+    }
+
+    if (action.type === 'mm_add_user') {
+        delete pendingAction[userId];
+        const idText = text.trim();
+        if (!/^\d+$/.test(idText)) {
+            await ctx.reply('⚠️ That doesn\'t look like a numeric Telegram user ID.');
+            return;
+        }
+        addMaintenanceWhitelist(idText);
+        await ctx.reply(`✅ User \`${idText}\` can now use the bot during maintenance.`, { parse_mode: 'Markdown' });
         return;
     }
 

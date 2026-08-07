@@ -41,7 +41,13 @@ const {
     getAutopostConfig,
     setAutopostConfig,
     getAllAutopostConfigs,
-    markAutopostTagPosted
+    markAutopostTagPosted,
+    getForceSubSettings,
+    setForceSubSettings,
+    recordJoinRequest,
+    hasJoinRequest,
+    markJoinRequestApproved,
+    getDueJoinRequestsForApproval
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -873,6 +879,12 @@ Just send any MEGA link in chat, I'll process it automatically.
 // shared to users via copyMessage — no file_id stored, no "Forwarded from" tag.
 
 async function checkMembership(ctx, groupId, userId) {
+    const settings = getForceSubSettings(groupId);
+    if (settings.mode === 'pending') {
+        // "Pending" groups never actually let the user in (or only after a
+        // delay) — sending the join request itself is treated as proof.
+        return hasJoinRequest(groupId, userId);
+    }
     try {
         const member = await ctx.telegram.getChatMember(groupId, userId);
         return ['member', 'administrator', 'creator'].includes(member.status);
@@ -936,7 +948,7 @@ async function sendJoinPrompt(ctx, groupIds) {
 
     buttons.push([{ text: '✅ I\'ve Joined — Verify', callback_data: 'recheck_sub' }]);
 
-    await ctx.reply('🔒 *Tap below to request access — you\'ll be auto-approved instantly*', {
+    await ctx.reply('🔒 *Tap below to request access — then tap Verify*', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: buttons }
     });
@@ -1651,12 +1663,60 @@ async function renderForceSubList(ctx) {
             return { id, label: `⚠️ ${id} (unreachable)` };
         }
     }));
-    const text = `📋 *Force-Sub Groups/Channels* (${entries.length}) — tap ❌ to remove:`;
-    const rows = entries.map(e => [{ text: e.label, callback_data: 'noop' }, { text: '❌', callback_data: `fs_rmfs:${e.id}` }]);
+    const text = `📋 *Force-Sub Groups/Channels* (${entries.length})\n\n` +
+        `🔓 Auto = requests approved instantly\n` +
+        `⏳ Pending = request alone unlocks files; real approval is delayed/manual`;
+    const rows = [];
+    for (const e of entries) {
+        const settings = getForceSubSettings(e.id);
+        rows.push([{ text: e.label, callback_data: 'noop' }, { text: '❌', callback_data: `fs_rmfs:${e.id}` }]);
+        const modeLabel = settings.mode === 'pending'
+            ? `⏳ Pending${settings.delayHours > 0 ? ` (${settings.delayHours}h)` : ' (manual)'}`
+            : '🔓 Auto-Approve';
+        const modeRow = [{ text: modeLabel, callback_data: `fs_fsmode:${e.id}` }];
+        if (settings.mode === 'pending') modeRow.push({ text: '⏱ Delay', callback_data: `fs_fsdelay_menu:${e.id}` });
+        rows.push(modeRow);
+    }
     rows.push([{ text: '➕ Add More', callback_data: 'fs_addfs_menu' }]);
     rows.push([{ text: '🔙 Back', callback_data: 'menu_fileshare' }]);
     await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
 }
+
+bot.action(/^fs_fsmode:(-?\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
+    const settings = getForceSubSettings(chatId);
+    const next = settings.mode === 'pending' ? 'auto' : 'pending';
+    setForceSubSettings(chatId, { mode: next });
+    await ctx.answerCbQuery(next === 'pending' ? '⏳ Pending mode ON' : '🔓 Auto-approve ON');
+    await renderForceSubList(ctx);
+});
+
+bot.action(/^fs_fsdelay_menu:(-?\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
+    await ctx.answerCbQuery();
+    const settings = getForceSubSettings(chatId);
+    const presets = [0, 1, 6, 24, 72];
+    const rows = [presets.map(h => ({
+        text: `${h === 0 ? 'Never' : h + 'h'}${settings.delayHours === h ? ' ✓' : ''}`,
+        callback_data: `fs_fsdelay:${chatId}:${h}`
+    }))];
+    rows.push([{ text: '🔙 Back', callback_data: 'fs_listforcesub' }]);
+    await ctx.editMessageText('⏱ *Auto-approve delay*\n\n"Never" = request stays pending until you approve it manually in Telegram.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^fs_fsdelay:(-?\d+):(\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
+    const hours = Number(ctx.match[2]);
+    setForceSubSettings(chatId, { delayHours: hours });
+    await ctx.answerCbQuery(hours === 0 ? 'Set to manual-only' : `✅ Auto-approve in ${hours}h`);
+    await renderForceSubList(ctx);
+});
 
 bot.action('fs_listforcesub', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
@@ -2292,6 +2352,23 @@ bot.on('chat_join_request', async (ctx) => {
         const config = loadConfig();
         if (!config.forceSubGroupIds.includes(chatId)) return; // not one of ours — leave it alone
 
+        const settings = getForceSubSettings(chatId);
+
+        if (settings.mode === 'pending') {
+            // Record it as proof-of-request (unlocks files immediately) but
+            // don't approve — either it auto-approves later (delayHours) or
+            // stays pending forever for the admin to handle manually.
+            recordJoinRequest(chatId, userId);
+            console.log(`⏳ Join request recorded (pending mode): user ${userId} -> chat "${req.chat.title}" (${chatId})`);
+            try {
+                const delayNote = settings.delayHours > 0
+                    ? ` (it'll be approved automatically in ~${settings.delayHours}h)`
+                    : '';
+                await ctx.telegram.sendMessage(userId, `✅ Request received for "${req.chat.title}"${delayNote}. Send /random to get files now!`);
+            } catch (e) { /* user hasn't opened a DM with the bot yet — ignore */ }
+            return;
+        }
+
         await ctx.telegram.approveChatJoinRequest(chatId, userId);
         console.log(`✅ Auto-approved join request: user ${userId} -> chat "${req.chat.title}" (${chatId})`);
 
@@ -2299,368 +2376,16 @@ bot.on('chat_join_request', async (ctx) => {
             await ctx.telegram.sendMessage(userId, `✅ You're approved for "${req.chat.title}"! Send /random to get files.`);
         } catch (e) { /* user hasn't opened a DM with the bot yet — ignore */ }
     } catch (error) {
-        logError('chat_join_request auto-approve', error);
+        logError('chat_join_request handling', error);
     }
 });
 
-bot.on('channel_post', async (ctx) => {
-    const post = ctx.channelPost;
-    console.log(`📨 channel_post received in ${ctx.chat.id}: "${(post.text || '[non-text]').slice(0, 50)}"`);
-    trackKnownChat(ctx);
-
-    // File tracking: only for the already-configured source channel
-    if (post.photo || post.video) {
-        const config = loadConfig();
-        if (config.sourceGroupId && String(ctx.chat.id) === String(config.sourceGroupId)) {
-            const type = post.photo ? 'photo' : 'video';
-            const added = addSharedFile(ctx.chat.id, post.message_id, type);
-            if (added) {
-                console.log(`Tracked ${type} msg #${post.message_id} in share pool (channel)`);
-            }
-        }
-        return;
-    }
-
-    // Setup commands
-    const text = post.text;
-    if (!text || !text.startsWith('/')) {
-        // Not a setup command — check if it's a MEGA link instead
-        if (text) {
-            const megaLink = cleanMegaLink(text);
-            if (megaLink) {
-                if (!(await isTrustedChannelAdmin(ctx))) return;
-                console.log(`🔍 Detected MEGA link in channel ${ctx.chat.id}`);
-                await queue.add(() => processMegaLink(ctx, megaLink));
-            }
-        }
-        return;
-    }
-    const command = text.split(' ')[0].split('@')[0];
-    if (!['/setforcesub', '/setsource', '/unsetforcesub', '/setlogchannel', '/unsetlogchannel'].includes(command)) return;
-
-    if (!(await isTrustedChannelAdmin(ctx))) return;
-
-    const config = loadConfig();
-
-    if (command === '/setforcesub') {
-        if (!config.forceSubGroupIds.includes(ctx.chat.id)) {
-            config.forceSubGroupIds.push(ctx.chat.id);
-            saveConfig(config);
-        }
-        await ctx.reply(`✅ Added "${ctx.chat.title}" as a force-sub group.\n\nTotal force-sub groups: ${config.forceSubGroupIds.length}`);
-    } else if (command === '/setsource') {
-        config.sourceGroupId = ctx.chat.id;
-        saveConfig(config);
-        await ctx.reply(`✅ Set "${ctx.chat.title}" as the source group.\n\nPhoto/video files posted here will now be tracked automatically.`);
-    } else if (command === '/unsetforcesub') {
-        config.forceSubGroupIds = config.forceSubGroupIds.filter(id => id !== ctx.chat.id);
-        if (config.forceSubInviteLinks) delete config.forceSubInviteLinks[ctx.chat.id];
-        saveConfig(config);
-        await ctx.reply(`✅ Removed "${ctx.chat.title}" from the force-sub list.`);
-    } else if (command === '/setlogchannel') {
-        config.errorLogChatId = ctx.chat.id;
-        saveConfig(config);
-        await ctx.reply(`✅ "${ctx.chat.title}" set as the error log channel. Bot errors will be posted here from now on.`);
-    } else if (command === '/unsetlogchannel') {
-        config.errorLogChatId = null;
-        saveConfig(config);
-        await ctx.reply('✅ Error log channel removed. Errors will only go to console now.');
-    }
-});
-
-// ===== End Force-Sub File Sharing Feature =====
-
-// Handles the "next plain message" step of a button flow (add force-sub
-// manually, set source manually, broadcast, or a custom numeric value).
-async function handlePendingAction(ctx, text) {
-    const userId = ctx.from.id;
-    const action = pendingAction[userId];
-    if (!action) return;
-
-    if (text.trim() === '/cancel') {
-        delete pendingAction[userId];
-        await ctx.reply('❌ Cancelled.');
-        return;
-    }
-
-    if (action.type === 'add_forcesub_manual' || action.type === 'set_source_manual') {
-        const identifier = text.trim();
-        if (!identifier) {
-            await ctx.reply('⚠️ Send a chat ID (e.g. -1001234567890) or @username, or /cancel.');
-            return;
-        }
-        let chat;
+// Checked every few minutes — approves any "pending" mode join request whose
+// configured delay has elapsed.
+async function processDelayedJoinApprovals() {
+    const due = getDueJoinRequestsForApproval();
+    for (const req of due) {
         try {
-            const target = identifier.startsWith('@') || isNaN(identifier) ? identifier : Number(identifier);
-            chat = await ctx.telegram.getChat(target);
-        } catch (error) {
-            await ctx.reply(`❌ Couldn't find that chat (${error.message}). Make sure I'm added there, then try again, or /cancel.`);
-            return;
-        }
-        try {
-            await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
-        } catch (error) {
-            await ctx.reply(`⚠️ Found "${chat.title}" but I don't seem to be a member/admin there. Add me first, then try again, or /cancel.`);
-            return;
-        }
-        recordKnownChat(chat.id, chat.title, chat.type);
-        const config = loadConfig();
-        if (action.type === 'add_forcesub_manual') {
-            if (!config.forceSubGroupIds.includes(chat.id)) {
-                config.forceSubGroupIds.push(chat.id);
-                saveConfig(config);
-            }
-            await ctx.reply(`✅ Added "${chat.title}" as a force-sub ${chat.type === 'channel' ? 'channel' : 'group'}.`);
-        } else {
-            config.sourceGroupId = chat.id;
-            saveConfig(config);
-            await ctx.reply(`✅ Set "${chat.title}" as the source ${chat.type === 'channel' ? 'channel' : 'group'}.`);
-        }
-        delete pendingAction[userId];
-        return;
-    }
-
-    if (action.type === 'ap_setchannel_manual') {
-        const identifier = text.trim();
-        if (!identifier) {
-            await ctx.reply('⚠️ Send a chat ID (e.g. -1001234567890) or @username, or /cancel.');
-            return;
-        }
-        let chat;
-        try {
-            const target = identifier.startsWith('@') || isNaN(identifier) ? identifier : Number(identifier);
-            chat = await ctx.telegram.getChat(target);
-        } catch (error) {
-            await ctx.reply(`❌ Couldn't find that chat (${error.message}). Make sure I'm added there, then try again, or /cancel.`);
-            return;
-        }
-        try {
-            await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
-        } catch (error) {
-            await ctx.reply(`⚠️ Found "${chat.title}" but I don't seem to be a member/admin there. Add me first, then try again, or /cancel.`);
-            return;
-        }
-        recordKnownChat(chat.id, chat.title, chat.type);
-        setAutopostConfig(userId, { channelId: chat.id });
-        delete pendingAction[userId];
-        await ctx.reply(`✅ Auto-post destination set to "${chat.title}". This channel is used only for your auto-posts.`);
-        return;
-    }
-
-    if (action.type === 'broadcast') {
-        delete pendingAction[userId];
-        if (getAllUserIds().length === 0) {
-            await ctx.reply('No users have used /random yet.');
-            return;
-        }
-        await runTextBroadcast(ctx, text);
-        return;
-    }
-
-    if (action.type === 'autopost_caption') {
-        delete pendingAction[userId];
-        setAutopostConfig(userId, { caption: text });
-        await ctx.reply('✅ Auto-post caption saved.');
-        return;
-    }
-
-    if (action.type === 'autopost_interval_custom') {
-        delete pendingAction[userId];
-        const n = parseInt(text.trim(), 10);
-        if (isNaN(n) || n < 1) {
-            await ctx.reply('⚠️ Send a whole number of hours (1+), or /cancel.');
-            return;
-        }
-        setAutopostConfig(userId, { intervalHours: n });
-        await ctx.reply(`✅ Auto-post interval set to every ${n}h.`);
-        return;
-    }
-
-    if (CUSTOM_FIELD_MAP[action.type]) {
-        const { key, label, min } = CUSTOM_FIELD_MAP[action.type];
-        const n = parseInt(text.trim(), 10);
-        if (isNaN(n) || n < min) {
-            await ctx.reply(`⚠️ Send a whole number (${min}+) for ${label}, or /cancel.`);
-            return;
-        }
-        const config = loadConfig();
-        config[key] = n;
-        saveConfig(config);
-        delete pendingAction[userId];
-        await ctx.reply(`✅ ${label} set to ${n}.`);
-        return;
-    }
-
-    delete pendingAction[userId];
-}
-
-bot.on('message', async (ctx) => {
-    const text = ctx.message.text;
-
-    if (ctx.chat.type !== 'private') trackKnownChat(ctx);
-
-    // --- Pending button-flow input (private chat, admin only) ---
-    if (ctx.chat.type === 'private' && isAdmin(ctx.from.id) && pendingAction[ctx.from.id]) {
-        await handlePendingAction(ctx, text || '');
-        return;
-    }
-
-    if (!text) return;
-
-    const megaLink = cleanMegaLink(text);
-
-    if (!megaLink) {
-        if (ctx.chat.type !== 'private') {
-            const botUsername = ctx.botInfo?.username;
-            if (botUsername && text.includes(`@${botUsername}`)) {
-                await ctx.reply(`🤖 Hi! Send me a MEGA link to download files.\n\nExample: \`https://mega.nz/file/ABC123#XYZ456\``, {
-                    parse_mode: 'Markdown'
-                });
-            }
-        }
-        return;
-    }
-
-    console.log(`🔍 Detected MEGA link in ${ctx.chat.type} ${ctx.chat.id}`);
-
-    if (!isAdmin(ctx.from.id)) {
-        if (ctx.chat.type === 'private') {
-            await ctx.reply('❌ This feature is available to admins only.');
-        }
-        return;
-    }
-
-    if (ctx.chat.type !== 'private') {
-        try {
-            const chatMember = await ctx.telegram.getChatMember(ctx.chat.id, ctx.botInfo.id);
-
-            if (ctx.chat.type === 'channel') {
-                if (chatMember.status !== 'administrator') {
-                    console.log(`❌ Bot is not admin in channel ${ctx.chat.id}`);
-
-                    if (ctx.from) {
-                        try {
-                            await ctx.telegram.sendMessage(
-                                ctx.from.id,
-                                `❌ I cannot process MEGA links in this channel because I'm not an admin.\n\nPlease make me an admin with permission to read and post messages.`
-                            );
-                        } catch (e) {
-                            console.error('Cannot send private message:', e.message);
-                        }
-                    }
-                    return;
-                }
-
-                if (!chatMember.can_post_messages) {
-                    console.log(`❌ Bot cannot post messages in channel ${ctx.chat.id}`);
-                    return;
-                }
-            }
-
-            if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
-                if (chatMember.status === 'restricted') {
-                    // Check if bot can send messages
-                    if (!chatMember.can_send_messages) {
-                        console.log(`❌ Bot cannot send messages in group ${ctx.chat.id}`);
-                        return;
-                    }
-                } else if (chatMember.status !== 'administrator' && chatMember.status !== 'member') {
-                    console.log(`❌ Bot doesn't have proper status in group ${ctx.chat.id}: ${chatMember.status}`);
-                    return;
-                }
-            }
-
-        } catch (error) {
-            console.error(`❌ Error checking permissions in ${ctx.chat.type} ${ctx.chat.id}:`, error.message);
-            return;
-        }
-    }
-
-    await queue.add(() => processMegaLink(ctx, megaLink));
-});
-
-bot.on('document', (ctx) => {
-    if (ctx.chat.type === 'private') {
-        ctx.reply('📎 Send me a MEGA link to download files!\n\nExample:\n\`https://mega.nz/file/ABC123#XYZ456\`', {
-            parse_mode: 'Markdown'
-        });
-    }
-});
-
-bot.catch((err, ctx) => {
-    console.error('Bot error:', err);
-    try {
-        if (ctx.chat.type === 'private') {
-            ctx.reply('❌ An internal error occurred. Please try again.');
-        }
-    } catch (e) {
-        console.error('Failed to send error:', e);
-    }
-});
-
-// Catches any error thrown inside command/action handlers that wasn't
-// already try/caught locally, so a single bad update can't crash the bot
-// silently — it gets logged (and sent to the error log channel if set).
-bot.catch((error, ctx) => {
-    logError(`Handler error (${ctx.updateType})`, error);
-});
-
-process.on('unhandledRejection', (error) => {
-    logError('Unhandled promise rejection', error);
-});
-
-process.on('uncaughtException', (error) => {
-    logError('Uncaught exception', error);
-});
-
-bot.telegram.getMe().then(botInfo => {
-    botUsername = botInfo.username;
-    console.log(`🤖 Bot username: @${botUsername}`);
-
-    console.log('🚀 Starting MEGA Downloader Bot...');
-    console.log('👥 Working in: Private chats, Groups, Channels');
-    console.log('📁 Temp directory:', os.tmpdir());
-    console.log('🔗 Bot invite link: https://t.me/' + botUsername);
-
-    bot.launch()
-        .then(async () => {
-            console.log('✅ Bot started successfully!');
-            console.log('🔗 Ready to process MEGA links in all chat types...');
-            console.log('\n=== IMPORTANT FOR GROUPS/CHANNELS ===');
-            console.log('1. Add bot to group/channel as ADMIN');
-            console.log('2. Enable these permissions:');
-            console.log('   • Read messages (IMPORTANT!)');
-            console.log('   • Send messages');
-            console.log('   • Send media');
-            console.log('   • Send documents');
-            console.log('3. Users can then just send MEGA links');
-            console.log('====================================');
-            await setupCommandMenus();
-
-            // Background schedulers: scheduled broadcasts + per-admin auto-posts.
-            // Checked every 60s — cheap and frequent enough for hour-scale intervals.
-            setInterval(() => {
-                processDueScheduledBroadcasts().catch(err => logError('Scheduled broadcast tick', err));
-            }, 60 * 1000);
-            setInterval(() => {
-                processAutopostTicks().catch(err => logError('Auto-post tick', err));
-            }, 60 * 1000);
-        })
-        .catch(err => {
-            console.error('❌ Failed to start bot:', err);
-            process.exit(1);
-        });
-}).catch(err => {
-    console.error('❌ Failed to get bot info:', err);
-    process.exit(1);
-});
-
-process.once('SIGINT', () => {
-    console.log('🛑 Shutting down...');
-    bot.stop('SIGINT');
-});
-
-process.once('SIGTERM', () => {
-    console.log('🛑 Shutting down...');
-    bot.stop('SIGTERM');
-});
+            await bot.telegram.approveChatJoinRequest(req.chatId, req.userId);
+            markJoinRequestApproved(req.chatId, req.userId);
+            console.log(`✅ Delayed-approved join request: user ${req.userId} -> 

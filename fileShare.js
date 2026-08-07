@@ -433,7 +433,7 @@ function saveAutopostConfigs(configs) {
 
 const DEFAULT_AUTOPOST = {
     channelId: null,
-    intervalHours: 0,      // 0 = disabled
+    intervalMinutes: 0,    // 0 = disabled; stored in minutes so hours+minutes are both supported
     caption: 'New Post 🎬',
     thumbnailMode: 'video', // 'video' = use the video's own thumbnail, 'custom' = admin-uploaded
     customThumbnailFileId: null,
@@ -443,23 +443,34 @@ const DEFAULT_AUTOPOST = {
     lastPostAt: 0
 };
 
+// Old configs stored `intervalHours` (whole hours only). Migrate them to
+// `intervalMinutes` on read so existing setups keep working unchanged.
+function normalizeAutopostConfig(raw) {
+    const cfg = { ...DEFAULT_AUTOPOST, ...raw };
+    if (!cfg.intervalMinutes && raw && raw.intervalHours) {
+        cfg.intervalMinutes = raw.intervalHours * 60;
+    }
+    delete cfg.intervalHours;
+    return cfg;
+}
+
 function getAutopostConfig(adminId) {
     const configs = loadAutopostConfigs();
     const key = String(adminId);
-    return { ...DEFAULT_AUTOPOST, ...(configs[key] || {}) };
+    return normalizeAutopostConfig(configs[key] || {});
 }
 
 function setAutopostConfig(adminId, patch) {
     const configs = loadAutopostConfigs();
     const key = String(adminId);
-    configs[key] = { ...DEFAULT_AUTOPOST, ...(configs[key] || {}), ...patch };
+    configs[key] = normalizeAutopostConfig({ ...(configs[key] || {}), ...patch });
     saveAutopostConfigs(configs);
     return configs[key];
 }
 
 function getAllAutopostConfigs() {
     const configs = loadAutopostConfigs();
-    return Object.keys(configs).map(adminId => ({ adminId, ...DEFAULT_AUTOPOST, ...configs[adminId] }));
+    return Object.keys(configs).map(adminId => ({ adminId, ...normalizeAutopostConfig(configs[adminId]) }));
 }
 
 function markAutopostTagPosted(adminId, tag) {

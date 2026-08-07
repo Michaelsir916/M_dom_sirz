@@ -309,17 +309,36 @@ function saveKnownChats(chats) {
 }
 
 // Records/updates a chat's id, title and type. Cheap no-op write skip if unchanged.
-function recordKnownChat(chatId, title, type) {
+// addedBy (optional): the user id of the admin who added the bot to this chat,
+// captured from the my_chat_member update. Once set, it's never overwritten by
+// later calls that don't pass it (so a plain message/channel_post sighting
+// can't clobber the real "who added it" attribution).
+function recordKnownChat(chatId, title, type, addedBy) {
     const chats = loadKnownChats();
     const key = String(chatId);
     const existing = chats[key];
-    if (existing && existing.title === title && existing.type === type) return;
-    chats[key] = { id: chatId, title: title || 'Untitled', type, last_seen: new Date().toISOString() };
+    const resolvedAddedBy = addedBy !== undefined ? addedBy : (existing ? existing.addedBy : undefined);
+    if (existing && existing.title === title && existing.type === type && existing.addedBy === resolvedAddedBy) return;
+    chats[key] = {
+        id: chatId,
+        title: title || 'Untitled',
+        type,
+        addedBy: resolvedAddedBy,
+        last_seen: new Date().toISOString()
+    };
     saveKnownChats(chats);
 }
 
-function getKnownChats() {
-    return Object.values(loadKnownChats()).sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+// adminId (optional): if provided, only returns chats added by that admin,
+// PLUS legacy chats with no recorded addedBy (grandfathered in so nothing
+// already configured silently disappears — they'll get properly attributed
+// the next time the bot sees a my_chat_member update for them).
+function getKnownChats(adminId) {
+    const all = Object.values(loadKnownChats());
+    const filtered = adminId === undefined
+        ? all
+        : all.filter(c => c.addedBy === undefined || c.addedBy === null || String(c.addedBy) === String(adminId));
+    return filtered.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
 }
 
 function removeKnownChat(chatId) {

@@ -247,23 +247,20 @@ function isAudioFile(filename) {
     return audioExtensions.includes(ext);
 }
 
-async function sendTelegramFile(ctx, filePath, fileName, fileSize, progressCallback) {
-    const caption = `${fileName}\nSize: ${formatBytes(fileSize)}`;
-    const chatId = ctx.chat.id;
+async function sendTelegramFile(ctx, filePath, fileName, fileSize, progressCallback, destinationChatId) {
+    const chatId = destinationChatId || ctx.chat.id;
+    const sendingElsewhere = destinationChatId && destinationChatId !== ctx.chat.id;
 
     try {
         await startMtproto();
         const forceDocument = !isVideoFile(fileName) && !isImageFile(fileName) && !isAudioFile(fileName);
-        let captionPrefix = '📄';
-        if (isVideoFile(fileName)) captionPrefix = '🎬';
-        else if (isImageFile(fileName)) captionPrefix = '🖼️';
-        else if (isAudioFile(fileName)) captionPrefix = '🎵';
 
         return await client.sendFile(chatId, {
             file: filePath,
-            caption: '',
+            caption: '', // never leak the filename/mega link/info into the destination — clean file only
             forceDocument: forceDocument,
-            replyTo: ctx.message ? ctx.message.message_id : undefined,
+            // Don't reply-thread into a message that lives in a different chat
+            replyTo: (!sendingElsewhere && ctx.message) ? ctx.message.message_id : undefined,
             progressCallback: progressCallback
         });
     } catch (error) {
@@ -569,6 +566,15 @@ async function processMegaLink(ctx, megaLink) {
     const chatId = ctx.chat.id;
     const chatType = ctx.chat.type;
 
+    // Admin-only: if a MEGA upload channel is configured and mode is 'channel',
+    // the actual files go there instead of the chat the link was sent in.
+    // Progress/status messages always stay in the original chat regardless.
+    const config = loadConfig();
+    const uploadDestination = (ctx.from && isAdmin(ctx.from.id) && config.megaUploadMode === 'channel' && config.megaUploadChannelId)
+        ? config.megaUploadChannelId
+        : chatId;
+    const sendingToChannel = uploadDestination !== chatId;
+
     console.log(`📩 Processing MEGA link in ${chatType} ${chatId} from user ${userId}`);
 
     try {
@@ -639,12 +645,18 @@ async function processMegaLink(ctx, megaLink) {
             try {
                 await sendTelegramFile(ctx, result.path, result.name, result.size, (progress) => {
                     uploadUpdater(progress, result.name, result.size, 1, 1);
-                });
+                }, uploadDestination);
                 await deleteStatus();
 
                 if (chatType !== 'private') {
                     try {
-                        await ctx.reply(`✅ *File sent successfully!*`);
+                        await ctx.reply(`✅ *File sent successfully!*${sendingToChannel ? ' (to your configured channel)' : ''}`);
+                    } catch (e) {
+                        console.error('Cannot send success message:', e.message);
+                    }
+                } else if (sendingToChannel) {
+                    try {
+                        await ctx.reply(`✅ *File sent to your configured channel!*`, { parse_mode: 'Markdown' });
                     } catch (e) {
                         console.error('Cannot send success message:', e.message);
                     }
@@ -704,7 +716,7 @@ async function processMegaLink(ctx, megaLink) {
 
                     await sendTelegramFile(ctx, file.path, file.name, file.size, (progress) => {
                         folderUploadUpdater(progress, file.name, file.size, i + 1);
-                    });
+                    }, uploadDestination);
 
                     sentCount++;
 
@@ -736,6 +748,7 @@ async function processMegaLink(ctx, megaLink) {
             }
 
             summary += `💾 *Total Size:* ${formatBytes(result.totalSize)}`;
+            if (sendingToChannel) summary += `\n📤 *Sent to your configured channel*`;
 
             try {
                 await ctx.reply(summary, { parse_mode: 'Markdown' });
@@ -1584,6 +1597,7 @@ async function renderFileSharePanel(ctx) {
             [{ text: '📢 Broadcast', callback_data: 'fs_broadcast_menu' }],
             [{ text: '🖼 Auto-Post', callback_data: 'ap_menu' }],
             [{ text: '🛠 Maintenance Mode', callback_data: 'mm_menu' }],
+            [{ text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
@@ -1669,6 +1683,89 @@ bot.action(/^mm_remove:(\d+)$/, async (ctx) => {
     removeMaintenanceWhitelist(ctx.match[1]);
     await ctx.answerCbQuery('✅ Removed');
     await renderMaintenancePanel(ctx);
+});
+
+// --- MEGA Upload Destination (admin-only, isolated from other channel pickers) ---
+async function renderMegaUploadPanel(ctx) {
+    const config = loadConfig();
+    const channelLabel = config.megaUploadChannelId
+        ? (getKnownChats().find(c => String(c.id) === String(config.megaUploadChannelId))?.title || config.megaUploadChannelId)
+        : 'Not set';
+    const text = '📦 *MEGA Upload Destination* (admin-only)\n\n' +
+        `Mode: ${config.megaUploadMode === 'channel' ? '📤 Channel' : '👤 Personal (chat)'}\n` +
+        (config.megaUploadMode === 'channel' ? `Channel: ${channelLabel}\n` : '') +
+        '\nApplies only when *you* (admin) send a MEGA link — regular users always get files in their own chat. ' +
+        'Once set, it goes straight there, no asking each time. The progress bar always stays in this chat; ' +
+        'only the clean file (no link, no caption) reaches the channel.';
+    const keyboard = {
+        inline_keyboard: [
+            [
+                { text: `${config.megaUploadMode === 'personal' ? '✅ ' : ''}👤 Personal`, callback_data: 'mud_mode:personal' },
+                { text: `${config.megaUploadMode === 'channel' ? '✅ ' : ''}📤 Channel`, callback_data: 'mud_mode:channel' }
+            ],
+            [{ text: '🎯 Set Channel', callback_data: 'mud_setchannel_menu' }],
+            [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
+        ]
+    };
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.action('mud_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    await renderMegaUploadPanel(ctx);
+});
+
+bot.action(/^mud_mode:(personal|channel)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const mode = ctx.match[1];
+    const config = loadConfig();
+    if (mode === 'channel' && !config.megaUploadChannelId) {
+        await ctx.answerCbQuery('⚠️ Set a channel first.');
+        await renderMegaUploadPanel(ctx);
+        return;
+    }
+    config.megaUploadMode = mode;
+    saveConfig(config);
+    await ctx.answerCbQuery(mode === 'channel' ? '📤 Channel mode' : '👤 Personal mode');
+    await renderMegaUploadPanel(ctx);
+});
+
+bot.action('mud_setchannel_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const { rows, truncated, total } = knownChatPickerKeyboard([], 'mud_setchannel', 'mud_menu');
+    const note = total === 0
+        ? '_I haven\'t seen any channels yet — add me to yours as admin first, or type an ID/@username._'
+        : truncated ? `_Showing 20 of ${total} known chats._` : '';
+    await ctx.editMessageText(`🎯 *Set MEGA Upload Channel*\n\n${note}`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^mud_setchannel:(-?\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
+    const config = loadConfig();
+    config.megaUploadChannelId = chatId;
+    config.megaUploadMode = 'channel';
+    saveConfig(config);
+    const chat = getKnownChats().find(c => String(c.id) === String(chatId));
+    await ctx.answerCbQuery('✅ Channel set');
+    await ctx.editMessageText(`✅ MEGA uploads (yours) will now go to "${chat ? chat.title : chatId}".`, {
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'mud_menu' }]] }
+    });
+});
+
+bot.action('mud_setchannel_manual', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'mud_setchannel_manual' };
+    await ctx.editMessageText('⌨️ Send the channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mud_menu' }]] }
+    });
 });
 
 // Renders a list of known groups/channels (auto-tracked from any update the
@@ -2618,6 +2715,36 @@ async function handlePendingAction(ctx, text) {
         }
         addMaintenanceWhitelist(idText);
         await ctx.reply(`✅ User \`${idText}\` can now use the bot during maintenance.`, { parse_mode: 'Markdown' });
+        return;
+    }
+
+    if (action.type === 'mud_setchannel_manual') {
+        const identifier = text.trim();
+        if (!identifier) {
+            await ctx.reply('⚠️ Send a chat ID (e.g. -1001234567890) or @username, or /cancel.');
+            return;
+        }
+        let chat;
+        try {
+            const target = identifier.startsWith('@') || isNaN(identifier) ? identifier : Number(identifier);
+            chat = await ctx.telegram.getChat(target);
+        } catch (error) {
+            await ctx.reply(`❌ Couldn't find that chat (${error.message}). Make sure I'm added there, then try again, or /cancel.`);
+            return;
+        }
+        try {
+            await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
+        } catch (error) {
+            await ctx.reply(`⚠️ Found "${chat.title}" but I don't seem to be a member/admin there. Add me first, then try again, or /cancel.`);
+            return;
+        }
+        recordKnownChat(chat.id, chat.title, chat.type);
+        const config = loadConfig();
+        config.megaUploadChannelId = chat.id;
+        config.megaUploadMode = 'channel';
+        saveConfig(config);
+        delete pendingAction[userId];
+        await ctx.reply(`✅ MEGA uploads (yours) will now go to "${chat.title}".`);
         return;
     }
 

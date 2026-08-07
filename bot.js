@@ -1057,6 +1057,7 @@ async function sendRandomFiles(ctx) {
 // --- User-facing: My Stats & Referrals ---
 const MY_STATS_KEYBOARD = {
     inline_keyboard: [
+        [{ text: '🎬 Free Video', callback_data: 'user_random' }],
         [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
         [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }]
     ]
@@ -1452,9 +1453,10 @@ function checkRandomAllowed(userId, config) {
     return check;
 }
 
-bot.command('random', async (ctx) => {
-    if (ctx.chat.type !== 'private') return;
-
+// Core logic behind /random — also reused by the "🎬 ഫ്രീ വീഡിയോ" button so
+// both entry points behave identically (force-sub check, cooldown/daily
+// limit, then send).
+async function handleRandomRequest(ctx) {
     const config = loadConfig();
     if (config.forceSubGroupIds.length === 0) {
         await ctx.reply('⚠️ Force-sub group is not configured yet. Please ask the admin.');
@@ -1481,6 +1483,17 @@ bot.command('random', async (ctx) => {
     }
 
     await sendRandomFiles(ctx);
+}
+
+bot.command('random', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+    await handleRandomRequest(ctx);
+});
+
+// "🎬 ഫ്രീ വീഡിയോ" button on MY_STATS_KEYBOARD — does exactly what /random does.
+bot.action('user_random', async (ctx) => {
+    await ctx.answerCbQuery();
+    await handleRandomRequest(ctx);
 });
 
 bot.action('recheck_sub', async (ctx) => {

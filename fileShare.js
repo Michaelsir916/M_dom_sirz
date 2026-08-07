@@ -25,7 +25,9 @@ const DEFAULT_CONFIG = {
     broadcastBatchSize: 25,      // messages sent per second-ish batch (stay under Telegram's ~30/sec cap)
     protectContent: false,       // true = files sent to users can't be forwarded/saved
     maintenanceMode: false,      // true = bot only responds to admins + whitelisted users
-    maintenanceWhitelist: []     // user ids (strings) allowed through during maintenance
+    maintenanceWhitelist: [],    // user ids (strings) allowed through during maintenance
+    megaUploadMode: 'personal',  // 'personal' = files go to whichever chat sent the link, 'channel' = always to megaUploadChannelId
+    megaUploadChannelId: null    // destination channel for admin's MEGA links when megaUploadMode is 'channel'
 };
 
 function atomicWrite(filePath, data) {

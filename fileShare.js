@@ -23,7 +23,9 @@ const DEFAULT_CONFIG = {
     forceSubInviteLinks: {}, // groupId -> cached "request to join" invite link
     broadcastForwardMode: false, // false = copyMessage (no tag), true = forwardMessage (tag)
     broadcastBatchSize: 25,      // messages sent per second-ish batch (stay under Telegram's ~30/sec cap)
-    protectContent: false        // true = files sent to users can't be forwarded/saved
+    protectContent: false,       // true = files sent to users can't be forwarded/saved
+    maintenanceMode: false,      // true = bot only responds to admins + whitelisted users
+    maintenanceWhitelist: []     // user ids (strings) allowed through during maintenance
 };
 
 function atomicWrite(filePath, data) {
@@ -525,6 +527,37 @@ function isAdmin(userId) {
     return adminIds.includes(String(userId));
 }
 
+// ===== Maintenance mode =====
+// During maintenance, only admins and whitelisted users get normal bot
+// behavior — everyone else sees a plain "under maintenance" notice.
+function isMaintenanceAllowed(userId) {
+    if (isAdmin(userId)) return true;
+    const config = loadConfig();
+    return (config.maintenanceWhitelist || []).includes(String(userId));
+}
+
+function addMaintenanceWhitelist(userId) {
+    const config = loadConfig();
+    const key = String(userId);
+    if (!config.maintenanceWhitelist.includes(key)) {
+        config.maintenanceWhitelist.push(key);
+        saveConfig(config);
+    }
+    return config.maintenanceWhitelist;
+}
+
+function removeMaintenanceWhitelist(userId) {
+    const config = loadConfig();
+    const key = String(userId);
+    config.maintenanceWhitelist = config.maintenanceWhitelist.filter(id => id !== key);
+    saveConfig(config);
+    return config.maintenanceWhitelist;
+}
+
+function getMaintenanceWhitelist() {
+    return loadConfig().maintenanceWhitelist || [];
+}
+
 module.exports = {
     loadConfig,
     saveConfig,
@@ -563,5 +596,9 @@ module.exports = {
     recordJoinRequest,
     hasJoinRequest,
     markJoinRequestApproved,
-    getDueJoinRequestsForApproval
+    getDueJoinRequestsForApproval,
+    isMaintenanceAllowed,
+    addMaintenanceWhitelist,
+    removeMaintenanceWhitelist,
+    getMaintenanceWhitelist
 };

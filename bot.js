@@ -2167,11 +2167,35 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
     return { posted: true, tag };
 }
 
+// e.g. 90 -> "1h 30m", 60 -> "1h", 45 -> "45m", 0 -> "Not set"
+function formatIntervalMinutes(min) {
+    if (!min) return 'Not set';
+    const h = Math.floor(min / 60);
+    const m = min % 60;
+    if (h && m) return `${h}h ${m}m`;
+    if (h) return `${h}h`;
+    return `${m}m`;
+}
+
+// Accepts "45m", "2h", "1h30m", "1h 30m", or a plain number (treated as minutes).
+// Returns whole minutes, or null if the input couldn't be parsed.
+function parseIntervalToMinutes(input) {
+    const text = String(input).trim().toLowerCase().replace(/\s+/g, '');
+    if (/^\d+$/.test(text)) return parseInt(text, 10);
+    const match = text.match(/^(?:(\d+)h)?(?:(\d+)m)?$/);
+    if (match && (match[1] || match[2])) {
+        const h = parseInt(match[1] || '0', 10);
+        const m = parseInt(match[2] || '0', 10);
+        return h * 60 + m;
+    }
+    return null;
+}
+
 // Checked every minute — fires any admin's auto-post whose interval has elapsed.
 async function processAutopostTicks() {
     for (const cfg of getAllAutopostConfigs()) {
-        if (!cfg.enabled || !cfg.channelId || !cfg.intervalHours) continue;
-        const dueAt = (cfg.lastPostAt || 0) + cfg.intervalHours * 3600 * 1000;
+        if (!cfg.enabled || !cfg.channelId || !cfg.intervalMinutes) continue;
+        const dueAt = (cfg.lastPostAt || 0) + cfg.intervalMinutes * 60 * 1000;
         if (Date.now() < dueAt) continue;
         try {
             const result = await runAutopostForAdmin(cfg.adminId, { preview: false });
@@ -2190,7 +2214,7 @@ async function renderAutopostPanel(ctx) {
         : 'Not set';
     const text = '🖼 *Auto-Post* (only visible/controllable by you)\n\n' +
         `Channel: ${channelLabel}\n` +
-        `Interval: ${cfg.intervalHours === 0 ? 'Not set' : 'Every ' + cfg.intervalHours + 'h'}\n` +
+        `Interval: ${cfg.intervalMinutes === 0 ? 'Not set' : 'Every ' + formatIntervalMinutes(cfg.intervalMinutes)}\n` +
         `Caption: "${cfg.caption}"\n` +
         `Thumbnail: ${cfg.thumbnailMode === 'custom' ? (cfg.customThumbnailFileId ? 'Custom (uploaded)' : 'Custom (not uploaded yet!)') : "Video's own"}\n` +
         `Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}${sharp ? '' : ' (⚠️ sharp not installed — run npm install)'}\n` +
@@ -2200,7 +2224,7 @@ async function renderAutopostPanel(ctx) {
     const keyboard = {
         inline_keyboard: [
             [{ text: '🎯 Set Channel', callback_data: 'ap_setchannel_menu' }],
-            [{ text: `⏱ Interval: ${cfg.intervalHours === 0 ? 'Not set' : cfg.intervalHours + 'h'}`, callback_data: 'ap_interval_menu' }],
+            [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }],
             [{ text: '✏️ Set Caption', callback_data: 'ap_caption' }],
             [{ text: `🖼 Thumbnail Source: ${cfg.thumbnailMode === 'custom' ? 'Custom' : 'Video'}`, callback_data: 'ap_thumb_toggle' }],
             [{ text: '📤 Upload Custom Thumbnail', callback_data: 'ap_thumb_upload' }],
@@ -2257,17 +2281,19 @@ bot.action('ap_interval_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     const cfg = getAutopostConfig(ctx.from.id);
-    await ctx.editMessageText(`⏱ *Auto-Post Interval*\n\nCurrent: ${cfg.intervalHours === 0 ? 'Not set' : cfg.intervalHours + 'h'}`, {
+    const minuteRow = [15, 30, 45].map(m => ({ text: `${m}m`, callback_data: `ap_interval:${m}` }));
+    const hourRow = [1, 3, 6, 12, 24].map(h => ({ text: `${h}h`, callback_data: `ap_interval:${h * 60}` }));
+    await ctx.editMessageText(`⏱ *Auto-Post Interval*\n\nCurrent: ${formatIntervalMinutes(cfg.intervalMinutes)}`, {
         parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [presetRow([1, 3, 6, 12, 24], 'ap_interval', 'h'), [{ text: '✏️ Custom', callback_data: 'ap_interval_custom' }], [{ text: '🔙 Back', callback_data: 'ap_menu' }]] }
+        reply_markup: { inline_keyboard: [minuteRow, hourRow, [{ text: '✏️ Custom', callback_data: 'ap_interval_custom' }], [{ text: '🔙 Back', callback_data: 'ap_menu' }]] }
     });
 });
 
 bot.action(/^ap_interval:(\d+)$/, async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     const n = parseInt(ctx.match[1], 10);
-    setAutopostConfig(ctx.from.id, { intervalHours: n });
-    await ctx.answerCbQuery(`✅ Every ${n}h`);
+    setAutopostConfig(ctx.from.id, { intervalMinutes: n });
+    await ctx.answerCbQuery(`✅ Every ${formatIntervalMinutes(n)}`);
     await renderAutopostPanel(ctx);
 });
 
@@ -2275,7 +2301,8 @@ bot.action('ap_interval_custom', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'autopost_interval_custom' };
-    await ctx.editMessageText('✏️ Send the interval in whole hours (1+), or /cancel.', {
+    await ctx.editMessageText('✏️ Send the interval — e.g. `45m`, `2h`, `1h30m`, or just a number for minutes, or /cancel.', {
+        parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_interval_menu' }]] }
     });
 });
@@ -2324,7 +2351,7 @@ bot.action('ap_toggle_enabled', async (ctx) => {
     const cfg = getAutopostConfig(ctx.from.id);
     if (!cfg.enabled) {
         if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a channel first.'); return; }
-        if (!cfg.intervalHours) { await ctx.answerCbQuery('⚠️ Set an interval first.'); return; }
+        if (!cfg.intervalMinutes) { await ctx.answerCbQuery('⚠️ Set an interval first.'); return; }
     }
     setAutopostConfig(ctx.from.id, { enabled: !cfg.enabled });
     await ctx.answerCbQuery(!cfg.enabled ? '▶️ Enabled' : '⏸ Paused');
@@ -2825,13 +2852,13 @@ async function handlePendingAction(ctx, text) {
 
     if (action.type === 'autopost_interval_custom') {
         delete pendingAction[userId];
-        const n = parseInt(text.trim(), 10);
-        if (isNaN(n) || n < 1) {
-            await ctx.reply('⚠️ Send a whole number of hours (1+), or /cancel.');
+        const minutes = parseIntervalToMinutes(text);
+        if (!minutes || minutes < 1) {
+            await ctx.reply('⚠️ Couldn\'t read that. Send e.g. `45m`, `2h`, `1h30m`, or a plain number of minutes, or /cancel.', { parse_mode: 'Markdown' });
             return;
         }
-        setAutopostConfig(userId, { intervalHours: n });
-        await ctx.reply(`✅ Auto-post interval set to every ${n}h.`);
+        setAutopostConfig(userId, { intervalMinutes: minutes });
+        await ctx.reply(`✅ Auto-post interval set to every ${formatIntervalMinutes(minutes)}.`);
         return;
     }
 

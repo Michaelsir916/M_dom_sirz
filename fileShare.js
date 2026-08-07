@@ -8,9 +8,11 @@ const KNOWN_CHATS_PATH = path.join(__dirname, 'known_chats.json');
 const BROADCAST_HISTORY_PATH = path.join(__dirname, 'broadcast_history.json');
 const SCHEDULED_BROADCASTS_PATH = path.join(__dirname, 'scheduled_broadcasts.json');
 const AUTOPOST_PATH = path.join(__dirname, 'autopost_configs.json');
+const PENDING_JOIN_REQUESTS_PATH = path.join(__dirname, 'pending_join_requests.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
+    forceSubSettings: {},   // groupId -> { mode: 'auto'|'pending', delayHours: number }
     sourceGroupId: null,
     shareCount: 1,
     autoDeleteMinutes: 0,   // 0 = disabled
@@ -447,6 +449,73 @@ function markAutopostTagPosted(adminId, tag) {
     saveAutopostConfigs(configs);
 }
 
+// ===== Force-Sub per-group mode (auto-approve vs pending+delay) =====
+const DEFAULT_FORCESUB_SETTINGS = { mode: 'auto', delayHours: 24 };
+
+function getForceSubSettings(groupId) {
+    const config = loadConfig();
+    const key = String(groupId);
+    return { ...DEFAULT_FORCESUB_SETTINGS, ...(config.forceSubSettings[key] || {}) };
+}
+
+function setForceSubSettings(groupId, patch) {
+    const config = loadConfig();
+    const key = String(groupId);
+    config.forceSubSettings[key] = { ...DEFAULT_FORCESUB_SETTINGS, ...(config.forceSubSettings[key] || {}), ...patch };
+    saveConfig(config);
+    return config.forceSubSettings[key];
+}
+
+// ===== Pending join requests (for "pending" mode force-sub groups) =====
+// A user who has sent a join request to a "pending" group is treated as
+// force-sub-verified immediately (they get files right away), even though
+// the request itself is only actually approved into the group later —
+// either automatically after delayHours, or never if delayHours is 0.
+function loadPendingJoinRequests() {
+    return safeReadJson(PENDING_JOIN_REQUESTS_PATH, []);
+}
+
+function savePendingJoinRequests(list) {
+    atomicWrite(PENDING_JOIN_REQUESTS_PATH, list);
+}
+
+// Records that a join request arrived. Idempotent — re-requesting doesn't
+// reset the original requestedAt (so a delay countdown can't be stalled).
+function recordJoinRequest(chatId, userId) {
+    const list = loadPendingJoinRequests();
+    const exists = list.find(r => String(r.chatId) === String(chatId) && String(r.userId) === String(userId));
+    if (exists) return exists;
+    const record = { chatId, userId, requestedAt: Date.now(), approved: false };
+    list.push(record);
+    savePendingJoinRequests(list);
+    return record;
+}
+
+function hasJoinRequest(chatId, userId) {
+    return loadPendingJoinRequests().some(r => String(r.chatId) === String(chatId) && String(r.userId) === String(userId));
+}
+
+function markJoinRequestApproved(chatId, userId) {
+    const list = loadPendingJoinRequests();
+    const rec = list.find(r => String(r.chatId) === String(chatId) && String(r.userId) === String(userId));
+    if (rec) {
+        rec.approved = true;
+        savePendingJoinRequests(list);
+    }
+}
+
+// Due = not yet approved, and the group's configured delay has elapsed.
+// Groups with delayHours=0 never show up here (manual-only approval).
+function getDueJoinRequestsForApproval() {
+    const now = Date.now();
+    return loadPendingJoinRequests().filter(r => {
+        if (r.approved) return false;
+        const settings = getForceSubSettings(r.chatId);
+        if (settings.mode !== 'pending' || !settings.delayHours) return false;
+        return now - r.requestedAt >= settings.delayHours * 3600 * 1000;
+    });
+}
+
 // ===== Admin check =====
 function isAdmin(userId) {
     const adminIds = (process.env.ADMIN_IDS || '')
@@ -488,5 +557,11 @@ module.exports = {
     getAutopostConfig,
     setAutopostConfig,
     getAllAutopostConfigs,
-    markAutopostTagPosted
+    markAutopostTagPosted,
+    getForceSubSettings,
+    setForceSubSettings,
+    recordJoinRequest,
+    hasJoinRequest,
+    markJoinRequestApproved,
+    getDueJoinRequestsForApproval
 };

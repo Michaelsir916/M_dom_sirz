@@ -139,6 +139,22 @@ function trackKnownChat(ctx) {
     recordKnownChat(ctx.chat.id, ctx.chat.title, ctx.chat.type);
 }
 
+// Fires whenever the bot's own membership status changes in a chat (added,
+// promoted to admin, kicked, etc). This is the ONLY reliable place Telegram
+// tells us WHO performed the action — ctx.myChatMember.from — so it's what
+// we use to attribute "which admin added this group/channel", regardless of
+// who actually owns the chat. Every other known-chat picker filters on this.
+bot.on('my_chat_member', async (ctx) => {
+    const update = ctx.myChatMember;
+    if (!update || !update.chat || update.chat.type === 'private') return;
+    const newStatus = update.new_chat_member?.status;
+    // Only (re)attribute on actual "added/promoted" transitions, not on every
+    // status ping — being left/kicked shouldn't overwrite who originally added it.
+    if (!['member', 'administrator'].includes(newStatus)) return;
+    const actorId = update.from?.id;
+    recordKnownChat(update.chat.id, update.chat.title, update.chat.type, actorId);
+});
+
 // ===== Broadcast tag helpers (encode a chat_id:message_id pair into a
 // Telegram /start deep-link payload, which only allows [A-Za-z0-9_-]) =====
 function encodeFileTag(chatId, messageId) {
@@ -1734,7 +1750,7 @@ bot.action(/^mud_mode:(personal|channel)$/, async (ctx) => {
 bot.action('mud_setchannel_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
-    const { rows, truncated, total } = knownChatPickerKeyboard([], 'mud_setchannel', 'mud_menu');
+    const { rows, truncated, total } = knownChatPickerKeyboard([], 'mud_setchannel', 'mud_menu', ctx.from.id);
     const note = total === 0
         ? '_I haven\'t seen any channels yet — add me to yours as admin first, or type an ID/@username._'
         : truncated ? `_Showing 20 of ${total} known chats._` : '';
@@ -1770,9 +1786,11 @@ bot.action('mud_setchannel_manual', async (ctx) => {
 
 // Renders a list of known groups/channels (auto-tracked from any update the
 // bot has seen from them) as tappable buttons, excluding already-picked ones.
-function knownChatPickerKeyboard(excludeIds, prefix, backCallback) {
+// adminId scopes the list to chats that admin personally added the bot to
+// (plus any not-yet-attributed legacy chats) — other admins' chats stay hidden.
+function knownChatPickerKeyboard(excludeIds, prefix, backCallback, adminId) {
     const exclude = new Set(excludeIds.map(String));
-    const chats = getKnownChats().filter(c => !exclude.has(String(c.id)));
+    const chats = getKnownChats(adminId).filter(c => !exclude.has(String(c.id)));
     const rows = chats.slice(0, 20).map(c => [{ text: `${chatTypeIcon(c.type)} ${c.title}`, callback_data: `${prefix}:${c.id}` }]);
     rows.push([{ text: '⌨️ Type ID / @username instead', callback_data: `${prefix}_manual` }]);
     rows.push([{ text: '🔙 Back', callback_data: backCallback }]);
@@ -1933,7 +1951,7 @@ bot.action('fs_addfs_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     const config = loadConfig();
-    const { rows, truncated, total } = knownChatPickerKeyboard(config.forceSubGroupIds, 'fs_addfs', 'menu_fileshare');
+    const { rows, truncated, total } = knownChatPickerKeyboard(config.forceSubGroupIds, 'fs_addfs', 'menu_fileshare', ctx.from.id);
     const note = total === 0
         ? '_I haven\'t seen any groups/channels yet — add me to one first, or type an ID/@username._'
         : truncated ? `_Showing 20 of ${total} known chats._` : '';
@@ -1969,7 +1987,7 @@ bot.action('fs_addfs_manual', async (ctx) => {
 bot.action('fs_setsrc_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
-    const { rows, truncated, total } = knownChatPickerKeyboard([], 'fs_setsrc', 'menu_fileshare');
+    const { rows, truncated, total } = knownChatPickerKeyboard([], 'fs_setsrc', 'menu_fileshare', ctx.from.id);
     const note = total === 0
         ? '_I haven\'t seen any groups/channels yet — add me to one first, or type an ID/@username._'
         : truncated ? `_Showing 20 of ${total} known chats._` : '';
@@ -2191,7 +2209,7 @@ bot.action('ap_menu', async (ctx) => {
 bot.action('ap_setchannel_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
-    const { rows, truncated, total } = knownChatPickerKeyboard([], 'ap_setchannel', 'ap_menu');
+    const { rows, truncated, total } = knownChatPickerKeyboard([], 'ap_setchannel', 'ap_menu', ctx.from.id);
     const note = total === 0
         ? '_I haven\'t seen any channels yet — add me to yours as admin first, or type an ID/@username._'
         : truncated ? `_Showing 20 of ${total} known chats._` : '';

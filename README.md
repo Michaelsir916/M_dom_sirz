@@ -57,3 +57,17 @@ Fully isolated per admin — each admin configures and sees only their own:
 - 🔐 toggle in the admin panel — when ON, files the bot sends to users
   (via `/random`, auto-post deep-links, etc.) can't be forwarded or saved
   by the recipient (Telegram's `protect_content`).
+
+### Force-Sub: per-group Pending mode
+- In the admin panel → File Share → 📋 Force-Sub List, each group now has
+  its own mode button:
+  - **🔓 Auto-Approve** (previous behavior) — join requests are approved
+    instantly.
+  - **⏳ Pending** — join requests are *not* approved. The user still gets
+    files right away (the request itself counts as verified), but they
+    aren't actually let into the group unless/until it auto-approves.
+- When a group is in Pending mode, an **⏱ Delay** button appears to choose
+  how long until Telegram auto-approves the request in the background:
+  Never (manual only) / 1h / 6h / 24h / 72h.
+- Mixed setups are fine — some groups Auto, others Pending, each with their
+  own delay.

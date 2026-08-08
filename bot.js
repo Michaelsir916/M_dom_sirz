@@ -42,6 +42,7 @@ const {
     setAutopostConfig,
     getAllAutopostConfigs,
     markAutopostTagPosted,
+    markAutopostTagSkipped,
     getForceSubSettings,
     setForceSubSettings,
     recordJoinRequest,
@@ -2165,9 +2166,15 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
         // not "Photo" — sendPhoto rejects it directly, so download it and
         // re-upload the raw bytes instead.
         const thumbFileId = await getVideoThumbnailFileId(adminId, file.chat_id, file.message_id);
-        if (!thumbFileId) return { error: 'no_thumbnail' };
+        if (!thumbFileId) {
+            markAutopostTagSkipped(adminId, tag);
+            return { error: 'no_thumbnail_skipped' };
+        }
         const buffer = await downloadTelegramFile(thumbFileId);
-        if (!buffer) return { error: 'no_thumbnail' };
+        if (!buffer) {
+            markAutopostTagSkipped(adminId, tag);
+            return { error: 'no_thumbnail_skipped' };
+        }
         thumbSource = { source: buffer };
     }
 
@@ -2193,9 +2200,17 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
         return { previewed: true };
     }
 
-    await bot.telegram.sendPhoto(cfg.channelId, thumbSource, { caption: cfg.caption, reply_markup: keyboard });
-    markAutopostTagPosted(adminId, tag);
-    return { posted: true, tag };
+    try {
+        await bot.telegram.sendPhoto(cfg.channelId, thumbSource, { caption: cfg.caption, reply_markup: keyboard });
+        markAutopostTagPosted(adminId, tag);
+        return { posted: true, tag };
+    } catch (err) {
+        if (err.description && (err.description.includes('file') || err.description.includes('photo'))) {
+            markAutopostTagSkipped(adminId, tag);
+            return { error: 'bad_thumbnail_skipped' };
+        }
+        throw err;
+    }
 }
 
 // e.g. 90 -> "1h 30m", 60 -> "1h", 45 -> "45m", 0 -> "Not set"

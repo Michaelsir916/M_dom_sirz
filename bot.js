@@ -107,7 +107,15 @@ async function logError(label, error) {
         const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
         const text = `🚨 *Bot Error*\n\n*When:* ${timestamp} IST\n*Where:* ${label}\n*Error:* \`${message}\`` +
             (stack ? `\n\n\`\`\`\n${stack}\n\`\`\`` : '');
-        await bot.telegram.sendMessage(config.errorLogChatId, text, { parse_mode: 'Markdown' });
+        try {
+            await bot.telegram.sendMessage(config.errorLogChatId, text, { parse_mode: 'Markdown' });
+        } catch (parseErr) {
+            // Error text itself sometimes contains unbalanced Markdown
+            // entities (backticks/underscores/asterisks) — fall back to
+            // plain text so the log message still gets through.
+            const plain = `🚨 Bot Error\n\nWhen: ${timestamp} IST\nWhere: ${label}\nError: ${message}` + (stack ? `\n\n${stack}` : '');
+            await bot.telegram.sendMessage(config.errorLogChatId, plain);
+        }
     } catch (logSendError) {
         console.error('Cannot send to error log channel:', logSendError.message);
     }
@@ -2107,15 +2115,28 @@ async function getVideoThumbnailFileId(adminId, chatId, messageId) {
     }
 }
 
-async function blurThumbnail(fileId) {
+async function blurBuffer(buffer) {
     if (!sharp) return null;
+    try {
+        return await sharp(buffer).blur(25).toBuffer();
+    } catch (error) {
+        console.error('blurBuffer failed:', error.message);
+        return null;
+    }
+}
+
+// Downloads a Telegram file (by file_id) into a Buffer. Needed because a
+// video's own thumbnail file_id is tagged internally as "Thumbnail" type by
+// Telegram and gets rejected with "can't use file of type Thumbnail as
+// Photo" if passed straight to sendPhoto — it has to be fetched and
+// re-uploaded as raw bytes instead.
+async function downloadTelegramFile(fileId) {
     try {
         const link = await bot.telegram.getFileLink(fileId);
         const res = await fetch(link.href || link.toString());
-        const buffer = Buffer.from(await res.arrayBuffer());
-        return await sharp(buffer).blur(25).toBuffer();
+        return Buffer.from(await res.arrayBuffer());
     } catch (error) {
-        console.error('blurThumbnail failed:', error.message);
+        console.error('downloadTelegramFile failed:', error.message);
         return null;
     }
 }
@@ -2136,16 +2157,26 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
 
     let thumbSource;
     if (cfg.thumbnailMode === 'custom' && cfg.customThumbnailFileId) {
+        // A photo the admin uploaded themselves — this file_id is already a
+        // real Photo, safe to pass to sendPhoto directly.
         thumbSource = cfg.customThumbnailFileId;
     } else {
+        // A video's own thumbnail is tagged as "Thumbnail" type by Telegram,
+        // not "Photo" — sendPhoto rejects it directly, so download it and
+        // re-upload the raw bytes instead.
         const thumbFileId = await getVideoThumbnailFileId(adminId, file.chat_id, file.message_id);
         if (!thumbFileId) return { error: 'no_thumbnail' };
-        thumbSource = thumbFileId;
+        const buffer = await downloadTelegramFile(thumbFileId);
+        if (!buffer) return { error: 'no_thumbnail' };
+        thumbSource = { source: buffer };
     }
 
     if (cfg.blurEnabled) {
-        const blurred = await blurThumbnail(thumbSource);
-        if (blurred) thumbSource = { source: blurred };
+        const buf = typeof thumbSource === 'string' ? await downloadTelegramFile(thumbSource) : thumbSource.source;
+        if (buf) {
+            const blurred = await blurBuffer(buf);
+            if (blurred) thumbSource = { source: blurred };
+        }
     }
 
     const deepLink = `https://t.me/${botUsername}?start=${encodeFileTag(file.chat_id, file.message_id)}`;

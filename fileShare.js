@@ -483,6 +483,15 @@ function markAutopostTagPosted(adminId, tag) {
     saveAutopostConfigs(configs);
 }
 
+function markAutopostTagSkipped(adminId, tag) {
+    const configs = loadAutopostConfigs();
+    const key = String(adminId);
+    const cfg = { ...DEFAULT_AUTOPOST, ...(configs[key] || {}) };
+    if (!cfg.postedTags.includes(tag)) cfg.postedTags.push(tag);
+    configs[key] = cfg;
+    saveAutopostConfigs(configs);
+}
+
 // ===== Force-Sub per-group mode (auto-approve vs pending+delay) =====
 const DEFAULT_FORCESUB_SETTINGS = { mode: 'auto', delayHours: 24 };
 
@@ -623,6 +632,7 @@ module.exports = {
     setAutopostConfig,
     getAllAutopostConfigs,
     markAutopostTagPosted,
+    markAutopostTagSkipped,
     getForceSubSettings,
     setForceSubSettings,
     recordJoinRequest,

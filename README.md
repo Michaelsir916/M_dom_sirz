@@ -39,8 +39,12 @@ runs fine — the blur toggle just stays unavailable until it's installed.
 
 ### Auto-Post (🖼 Auto-Post button in the admin panel)
 Fully isolated per admin — each admin configures and sees only their own:
-- **Channel** — pick from known chats or type an ID/@username. I must
-  already be a member/admin there.
+- **Source Channel** — pick from known chats or type an ID/@username. I
+  must already be a member/admin there. Videos posted here **from now on**
+  are the pool Auto-Post pulls from (old history can't be fetched via the
+  Bot API — only new posts are tracked). Must be different from your
+  destination channel.
+- **Destination Channel** — where the auto-posts themselves get sent.
 - **Interval** — every X hours, a new (never-repeated) video's thumbnail
   gets auto-posted.
 - **Caption** — one fixed caption used for every auto-post.
@@ -52,6 +56,13 @@ Fully isolated per admin — each admin configures and sees only their own:
   posts automatically every interval with no confirmation step.
 - Every post includes a "🎬 Get Full Video" button — a deep link that
   delivers that exact video via the bot when tapped.
+- **Retry/skip:** if a video's thumbnail can't be read/posted, it's retried
+  on the next tick (max 2 attempts total); after that it's permanently
+  skipped and never retried again.
+- **Log channel reporting:** every retry, permanent skip, empty-queue tick,
+  and unexpected error is reported to your `/setlogchannel` chat. The exact
+  same message is only sent once per 5 minutes, so a stuck video won't
+  flood the channel.
 
 ### Forward Protection
 - 🔐 toggle in the admin panel — when ON, files the bot sends to users

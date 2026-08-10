@@ -43,6 +43,8 @@ const {
     getAllAutopostConfigs,
     markAutopostTagPosted,
     markAutopostTagSkipped,
+    incrementAutopostRetry,
+    clearAutopostRetry,
     getForceSubSettings,
     setForceSubSettings,
     recordJoinRequest,
@@ -95,31 +97,70 @@ async function startMtproto() {
 let botUsername = '';
 
 // --- Error log channel ---
-// Sends bot errors to an admin-configured Telegram chat (set via /setlogchannel)
-// so crashes/bugs can be spotted without SSH-ing into Termux to read logs.
-async function logError(label, error) {
-    const message = (error && error.message) ? error.message : String(error);
-    const stack = (error && error.stack) ? error.stack.split('\n').slice(0, 4).join('\n') : '';
-    console.error(`❌ ${label}:`, message);
+// Sends bot errors/events to an admin-configured Telegram chat (set via
+// /setlogchannel) so crashes/bugs and auto-post issues can be spotted
+// without SSH-ing into Termux to read logs.
+//
+// Dedup: if the exact same message (same dedupeKey) was already sent within
+// the last 5 minutes, it's suppressed — one repeated bug/error only shows up
+// once per 5-minute window instead of flooding the log channel every tick.
+const recentLogEntries = new Map(); // dedupeKey -> last-sent timestamp (ms)
+const LOG_DEDUPE_WINDOW_MS = 5 * 60 * 1000;
 
+function shouldSendLog(dedupeKey) {
+    if (!dedupeKey) return true;
+    const now = Date.now();
+    const last = recentLogEntries.get(dedupeKey);
+    if (last && (now - last) < LOG_DEDUPE_WINDOW_MS) return false;
+    recentLogEntries.set(dedupeKey, now);
+    // Occasional cleanup so this map doesn't grow forever on a long-running process.
+    if (recentLogEntries.size > 500) {
+        for (const [k, t] of recentLogEntries) {
+            if (now - t > LOG_DEDUPE_WINDOW_MS) recentLogEntries.delete(k);
+        }
+    }
+    return true;
+}
+
+// Low-level sender shared by logError() and logAutopostEvent(). dedupeKey is
+// optional — omit it to always send (used for one-off admin-triggered stuff).
+async function sendToLogChannel(text, dedupeKey) {
     try {
         const config = loadConfig();
         if (!config.errorLogChatId) return;
-        const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-        const text = `🚨 *Bot Error*\n\n*When:* ${timestamp} IST\n*Where:* ${label}\n*Error:* \`${message}\`` +
-            (stack ? `\n\n\`\`\`\n${stack}\n\`\`\`` : '');
+        if (!shouldSendLog(dedupeKey)) return;
+
         try {
             await bot.telegram.sendMessage(config.errorLogChatId, text, { parse_mode: 'Markdown' });
         } catch (parseErr) {
-            // Error text itself sometimes contains unbalanced Markdown
-            // entities (backticks/underscores/asterisks) — fall back to
-            // plain text so the log message still gets through.
-            const plain = `🚨 Bot Error\n\nWhen: ${timestamp} IST\nWhere: ${label}\nError: ${message}` + (stack ? `\n\n${stack}` : '');
+            // Text sometimes contains unbalanced Markdown entities
+            // (backticks/underscores/asterisks) — fall back to plain text
+            // so the log message still gets through.
+            const plain = text.replace(/[*`_]/g, '');
             await bot.telegram.sendMessage(config.errorLogChatId, plain);
         }
     } catch (logSendError) {
         console.error('Cannot send to error log channel:', logSendError.message);
     }
+}
+
+async function logError(label, error) {
+    const message = (error && error.message) ? error.message : String(error);
+    const stack = (error && error.stack) ? error.stack.split('\n').slice(0, 4).join('\n') : '';
+    console.error(`❌ ${label}:`, message);
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const text = `🚨 *Bot Error*\n\n*When:* ${timestamp} IST\n*Where:* ${label}\n*Error:* \`${message}\`` +
+        (stack ? `\n\n\`\`\`\n${stack}\n\`\`\`` : '');
+    // Dedup key: same label + same error message within 5 min = one log entry only.
+    await sendToLogChannel(text, `err:${label}:${message}`);
+}
+
+// Non-crash auto-post events (skips, retries, empty queue, etc). Always
+// routed through the same dedup-aware sender so a stuck/broken video
+// doesn't spam the log channel every minute.
+async function logAutopostEvent(text, dedupeKey) {
+    console.log(`ℹ️ Auto-post event: ${text.replace(/\n/g, ' ').slice(0, 120)}`);
+    await sendToLogChannel(text, dedupeKey);
 }
 
 // In-memory "what is this admin currently typing for" state, keyed by admin
@@ -2142,17 +2183,72 @@ async function downloadTelegramFile(fileId) {
     }
 }
 
+// A single video is retried at most this many times (across ticks) before
+// it's permanently given up on and marked skipped.
+const MAX_AUTOPOST_RETRIES = 2;
+
+// Records one failed attempt at posting `tag`. Below the cap, the tag is
+// left as "unposted" so the next tick tries it again, and a short retry
+// notice goes to the log channel. At the cap, the tag is permanently marked
+// skipped (won't be tried again) and a detailed give-up notice is logged.
+// Returns 'retry' or 'skipped'.
+async function handleAutopostFailure(adminId, tag, reason) {
+    const attempts = incrementAutopostRetry(adminId, tag);
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    if (attempts >= MAX_AUTOPOST_RETRIES) {
+        clearAutopostRetry(adminId, tag);
+        markAutopostTagSkipped(adminId, tag);
+        await logAutopostEvent(
+            `⛔ *Auto-Post: Video Permanently Skipped*\n\n` +
+            `*When:* ${timestamp} IST\n` +
+            `*Admin:* \`${adminId}\`\n` +
+            `*Video tag:* \`${tag}\`\n` +
+            `*Reason:* ${reason}\n` +
+            `*Attempts:* ${attempts}/${MAX_AUTOPOST_RETRIES} — giving up, will not be retried again.`,
+            `ap-giveup:${adminId}:${tag}`
+        );
+        return 'skipped';
+    }
+    await logAutopostEvent(
+        `⚠️ *Auto-Post: Attempt Failed*\n\n` +
+        `*When:* ${timestamp} IST\n` +
+        `*Admin:* \`${adminId}\`\n` +
+        `*Video tag:* \`${tag}\`\n` +
+        `*Reason:* ${reason}\n` +
+        `*Attempt:* ${attempts}/${MAX_AUTOPOST_RETRIES} — will retry next tick.`,
+        `ap-retry:${adminId}:${tag}:${reason}`
+    );
+    return 'retry';
+}
+
 // Core auto-post engine, shared by the "🧪 Test Preview" setup flow and the
 // automatic interval-based scheduler. preview=true sends the candidate post
 // to the admin's own DM with Confirm/Skip instead of posting to the channel
 // — setup-time only. Scheduled runs (preview=false) post directly, no confirm.
+//
+// Videos are pulled from the admin's own configured **Source Channel**
+// (cfg.sourceChannelId) — isolated per admin, distinct from the destination
+// Channel that receives the post itself.
 async function runAutopostForAdmin(adminId, { preview = false } = {}) {
     const cfg = getAutopostConfig(adminId);
     if (!cfg.channelId) return { error: 'no_channel' };
+    if (!cfg.sourceChannelId) {
+        await logAutopostEvent(
+            `⚠️ *Auto-Post: No Source Channel*\n\n*Admin:* \`${adminId}\`\nSet a Source Channel in the Auto-Post menu first.`,
+            `ap-nosource:${adminId}`
+        );
+        return { error: 'no_source' };
+    }
 
-    const files = loadSharedFiles().filter(f => f.type === 'video');
+    const files = loadSharedFiles().filter(f => f.type === 'video' && String(f.chat_id) === String(cfg.sourceChannelId));
     const unposted = files.filter(f => !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`));
-    if (unposted.length === 0) return { error: 'no_files' };
+    if (unposted.length === 0) {
+        await logAutopostEvent(
+            `ℹ️ *Auto-Post: Nothing To Post*\n\n*Admin:* \`${adminId}\`\nNo new (unposted) videos in the source channel yet.`,
+            `ap-empty:${adminId}`
+        );
+        return { error: 'no_files' };
+    }
     const file = unposted[0];
     const tag = `${file.chat_id}:${file.message_id}`;
 
@@ -2167,13 +2263,13 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
         // re-upload the raw bytes instead.
         const thumbFileId = await getVideoThumbnailFileId(adminId, file.chat_id, file.message_id);
         if (!thumbFileId) {
-            markAutopostTagSkipped(adminId, tag);
-            return { error: 'no_thumbnail_skipped' };
+            const outcome = await handleAutopostFailure(adminId, tag, 'Could not read a thumbnail file_id from the video.');
+            return { error: outcome === 'skipped' ? 'no_thumbnail_skipped' : 'no_thumbnail_retry' };
         }
         const buffer = await downloadTelegramFile(thumbFileId);
         if (!buffer) {
-            markAutopostTagSkipped(adminId, tag);
-            return { error: 'no_thumbnail_skipped' };
+            const outcome = await handleAutopostFailure(adminId, tag, 'Thumbnail file_id found but download failed.');
+            return { error: outcome === 'skipped' ? 'no_thumbnail_skipped' : 'no_thumbnail_retry' };
         }
         thumbSource = { source: buffer };
     }
@@ -2206,9 +2302,10 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
         return { posted: true, tag };
     } catch (err) {
         if (err.description && (err.description.includes('file') || err.description.includes('photo'))) {
-            markAutopostTagSkipped(adminId, tag);
-            return { error: 'bad_thumbnail_skipped' };
+            const outcome = await handleAutopostFailure(adminId, tag, `Telegram rejected the post: ${err.description}`);
+            return { error: outcome === 'skipped' ? 'bad_thumbnail_skipped' : 'bad_thumbnail_retry' };
         }
+        await logError(`Auto-post send (admin ${adminId}, tag ${tag})`, err);
         throw err;
     }
 }
@@ -2240,7 +2337,7 @@ function parseIntervalToMinutes(input) {
 // Checked every minute — fires any admin's auto-post whose interval has elapsed.
 async function processAutopostTicks() {
     for (const cfg of getAllAutopostConfigs()) {
-        if (!cfg.enabled || !cfg.channelId || !cfg.intervalMinutes) continue;
+        if (!cfg.enabled || !cfg.channelId || !cfg.sourceChannelId || !cfg.intervalMinutes) continue;
         const dueAt = (cfg.lastPostAt || 0) + cfg.intervalMinutes * 60 * 1000;
         if (Date.now() < dueAt) continue;
         try {
@@ -2258,8 +2355,16 @@ async function renderAutopostPanel(ctx) {
     const channelLabel = cfg.channelId
         ? (getKnownChats().find(c => String(c.id) === String(cfg.channelId))?.title || cfg.channelId)
         : 'Not set';
+    const sourceLabel = cfg.sourceChannelId
+        ? (getKnownChats().find(c => String(c.id) === String(cfg.sourceChannelId))?.title || cfg.sourceChannelId)
+        : 'Not set';
+    const queueCount = cfg.sourceChannelId
+        ? loadSharedFiles().filter(f => f.type === 'video' && String(f.chat_id) === String(cfg.sourceChannelId) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
+        : 0;
     const text = '🖼 *Auto-Post* (only visible/controllable by you)\n\n' +
-        `Channel: ${channelLabel}\n` +
+        `Source Channel: ${sourceLabel} (videos are pulled from here)\n` +
+        `Destination Channel: ${channelLabel} (posts go here)\n` +
+        `Queue: ${queueCount} unposted video(s) waiting\n` +
         `Interval: ${cfg.intervalMinutes === 0 ? 'Not set' : 'Every ' + formatIntervalMinutes(cfg.intervalMinutes)}\n` +
         `Caption: "${cfg.caption}"\n` +
         `Thumbnail: ${cfg.thumbnailMode === 'custom' ? (cfg.customThumbnailFileId ? 'Custom (uploaded)' : 'Custom (not uploaded yet!)') : "Video's own"}\n` +
@@ -2269,7 +2374,8 @@ async function renderAutopostPanel(ctx) {
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '🎯 Set Channel', callback_data: 'ap_setchannel_menu' }],
+            [{ text: '📥 Set Source Channel', callback_data: 'ap_setsource_menu' }],
+            [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }],
             [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }],
             [{ text: '✏️ Set Caption', callback_data: 'ap_caption' }],
             [{ text: `🖼 Thumbnail Source: ${cfg.thumbnailMode === 'custom' ? 'Custom' : 'Video'}`, callback_data: 'ap_thumb_toggle' }],
@@ -2296,7 +2402,7 @@ bot.action('ap_setchannel_menu', async (ctx) => {
     const note = total === 0
         ? '_I haven\'t seen any channels yet — add me to yours as admin first, or type an ID/@username._'
         : truncated ? `_Showing 20 of ${total} known chats._` : '';
-    await ctx.editMessageText(`🎯 *Set Your Auto-Post Channel*\n\nOnly you post here — pick your own channel.\n\n${note}`, {
+    await ctx.editMessageText(`📤 *Set Your Auto-Post Destination Channel*\n\nOnly you post here — this is where the posts go.\n\n${note}`, {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: rows }
     });
@@ -2307,8 +2413,8 @@ bot.action(/^ap_setchannel:(-?\d+)$/, async (ctx) => {
     const chatId = Number(ctx.match[1]);
     setAutopostConfig(ctx.from.id, { channelId: chatId });
     const chat = getKnownChats().find(c => String(c.id) === String(chatId));
-    await ctx.answerCbQuery('✅ Channel set');
-    await ctx.editMessageText(`✅ Auto-post channel set to "${chat ? chat.title : chatId}".`, {
+    await ctx.answerCbQuery('✅ Destination channel set');
+    await ctx.editMessageText(`✅ Auto-post destination channel set to "${chat ? chat.title : chatId}".`, {
         reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'ap_menu' }]] }
     });
 });
@@ -2317,7 +2423,46 @@ bot.action('ap_setchannel_manual', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'ap_setchannel_manual' };
-    await ctx.editMessageText('⌨️ Send the channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
+    await ctx.editMessageText('⌨️ Send the destination channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
+    });
+});
+
+// --- Source channel (where videos are pulled FROM, distinct from the
+// destination channel above). Picking it also enables silent tracking of
+// that channel's future video posts into the shared file pool — see the
+// `isAutopostSourceChannel()` check used by the message/channel_post
+// handlers further down.
+bot.action('ap_setsource_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const { rows, truncated, total } = knownChatPickerKeyboard([], 'ap_setsource', 'ap_menu', ctx.from.id);
+    const note = total === 0
+        ? '_I haven\'t seen any channels yet — add me to yours as admin first, or type an ID/@username._'
+        : truncated ? `_Showing 20 of ${total} known chats._` : '';
+    await ctx.editMessageText(`📥 *Set Your Auto-Post Source Channel*\n\nI'll pull videos from here (new posts only). Must be different from your destination channel.\n\n${note}`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^ap_setsource:(-?\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
+    setAutopostConfig(ctx.from.id, { sourceChannelId: chatId });
+    const chat = getKnownChats().find(c => String(c.id) === String(chatId));
+    await ctx.answerCbQuery('✅ Source channel set');
+    await ctx.editMessageText(`✅ Auto-post source channel set to "${chat ? chat.title : chatId}".\n\nNew videos posted there from now on will be picked up automatically.`, {
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'ap_menu' }]] }
+    });
+});
+
+bot.action('ap_setsource_manual', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'ap_setsource_manual' };
+    await ctx.editMessageText('⌨️ Send the source channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
     });
@@ -2396,7 +2541,8 @@ bot.action('ap_toggle_enabled', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     const cfg = getAutopostConfig(ctx.from.id);
     if (!cfg.enabled) {
-        if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a channel first.'); return; }
+        if (!cfg.sourceChannelId) { await ctx.answerCbQuery('⚠️ Set a source channel first.'); return; }
+        if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a destination channel first.'); return; }
         if (!cfg.intervalMinutes) { await ctx.answerCbQuery('⚠️ Set an interval first.'); return; }
     }
     setAutopostConfig(ctx.from.id, { enabled: !cfg.enabled });
@@ -2407,11 +2553,14 @@ bot.action('ap_toggle_enabled', async (ctx) => {
 bot.action('ap_test', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     const cfg = getAutopostConfig(ctx.from.id);
-    if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a channel first.'); return; }
+    if (!cfg.sourceChannelId) { await ctx.answerCbQuery('⚠️ Set a source channel first.'); return; }
+    if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a destination channel first.'); return; }
     await ctx.answerCbQuery('🧪 Generating preview...');
     const result = await runAutopostForAdmin(ctx.from.id, { preview: true });
-    if (result.error === 'no_files') await ctx.reply('⚠️ No unposted videos in the source pool yet.');
-    else if (result.error === 'no_thumbnail') await ctx.reply('⚠️ Could not read a thumbnail from that video — try uploading a custom thumbnail instead (🖼 Thumbnail Source → Custom).');
+    if (result.error === 'no_files') await ctx.reply('⚠️ No unposted videos in the source channel yet.');
+    else if (result.error === 'no_source') await ctx.reply('⚠️ Set a source channel first (🖼 Auto-Post → 📥 Set Source Channel).');
+    else if (result.error === 'no_thumbnail_retry') await ctx.reply('⚠️ Could not read a thumbnail from that video — will retry automatically. Try again, or upload a custom thumbnail instead (🖼 Thumbnail Source → Custom).');
+    else if (result.error === 'no_thumbnail_skipped') await ctx.reply('⚠️ Could not read a thumbnail after 2 attempts — that video was permanently skipped (see log channel). Try uploading a custom thumbnail instead (🖼 Thumbnail Source → Custom).');
 });
 
 bot.action('ap_confirm', async (ctx) => {
@@ -2557,6 +2706,17 @@ bot.action('menu_back', async (ctx) => {
 // Private chat + admin: (a) 📢 Broadcast button flow — admin sends media+caption,
 // (b) caption-prefixed `/broadcast ...` on any media, (c) uploading a custom
 // thumbnail for the auto-post feature.
+// True if `chatId` should have its photo/video posts tracked into the
+// shared file pool — either the bot-wide legacy Source Group/Channel
+// (config.sourceGroupId, feeds /random etc.), or any admin's per-admin
+// Auto-Post Source Channel (cfg.sourceChannelId). Storage stays a single
+// shared pool either way; each admin's auto-post just filters it down to
+// their own sourceChannelId later (see runAutopostForAdmin).
+function isTrackedSourceChat(chatId, config) {
+    if (config.sourceGroupId && String(chatId) === String(config.sourceGroupId)) return true;
+    return getAllAutopostConfigs().some(c => c.sourceChannelId && String(c.sourceChannelId) === String(chatId));
+}
+
 // Group/channel chat: tracks photo/video files posted in the configured
 // source group into the share pool (unchanged from before).
 bot.on(['photo', 'video', 'animation'], async (ctx) => {
@@ -2599,7 +2759,7 @@ bot.on(['photo', 'video', 'animation'], async (ctx) => {
     trackKnownChat(ctx);
 
     const config = loadConfig();
-    if (!config.sourceGroupId || String(ctx.chat.id) !== String(config.sourceGroupId)) return;
+    if (!isTrackedSourceChat(ctx.chat.id, config)) return;
     if (!ctx.from || !isAdmin(ctx.from.id)) return;
     if (!ctx.message.photo && !ctx.message.video) return; // ignore animations for the source pool
 
@@ -2698,10 +2858,10 @@ bot.on('channel_post', async (ctx) => {
     console.log(`📨 channel_post received in ${ctx.chat.id}: "${(post.text || '[non-text]').slice(0, 50)}"`);
     trackKnownChat(ctx);
 
-    // File tracking: only for the already-configured source channel
+    // File tracking: legacy source group, or any admin's auto-post source channel
     if (post.photo || post.video) {
         const config = loadConfig();
-        if (config.sourceGroupId && String(ctx.chat.id) === String(config.sourceGroupId)) {
+        if (isTrackedSourceChat(ctx.chat.id, config)) {
             const type = post.photo ? 'photo' : 'video';
             const added = addSharedFile(ctx.chat.id, post.message_id, type);
             if (added) {
@@ -2876,6 +3036,33 @@ async function handlePendingAction(ctx, text) {
         setAutopostConfig(userId, { channelId: chat.id });
         delete pendingAction[userId];
         await ctx.reply(`✅ Auto-post destination set to "${chat.title}". This channel is used only for your auto-posts.`);
+        return;
+    }
+
+    if (action.type === 'ap_setsource_manual') {
+        const identifier = text.trim();
+        if (!identifier) {
+            await ctx.reply('⚠️ Send a chat ID (e.g. -1001234567890) or @username, or /cancel.');
+            return;
+        }
+        let chat;
+        try {
+            const target = identifier.startsWith('@') || isNaN(identifier) ? identifier : Number(identifier);
+            chat = await ctx.telegram.getChat(target);
+        } catch (error) {
+            await ctx.reply(`❌ Couldn't find that chat (${error.message}). Make sure I'm added there, then try again, or /cancel.`);
+            return;
+        }
+        try {
+            await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
+        } catch (error) {
+            await ctx.reply(`⚠️ Found "${chat.title}" but I don't seem to be a member/admin there. Add me first, then try again, or /cancel.`);
+            return;
+        }
+        recordKnownChat(chat.id, chat.title, chat.type);
+        setAutopostConfig(userId, { sourceChannelId: chat.id });
+        delete pendingAction[userId];
+        await ctx.reply(`✅ Auto-post source set to "${chat.title}". New videos posted there will be picked up automatically.`);
         return;
     }
 

@@ -433,20 +433,32 @@ function saveAutopostConfigs(configs) {
 
 const DEFAULT_AUTOPOST = {
     channelId: null,
+    sourceChannelId: null,  // where videos are pulled FROM (must differ from channelId, the post destination)
     intervalMinutes: 0,    // 0 = disabled; stored in minutes so hours+minutes are both supported
     caption: 'New Post 🎬',
     thumbnailMode: 'video', // 'video' = use the video's own thumbnail, 'custom' = admin-uploaded
     customThumbnailFileId: null,
     blurEnabled: false,
     enabled: false,
-    postedTags: [],         // "chatId:messageId" tags already posted, never repeats
+    postedTags: [],         // "chatId:messageId" tags already posted/permanently skipped, never repeats
+    retryCounts: {},        // "chatId:messageId" -> number of failed attempts so far (cleared on success/give-up)
     lastPostAt: 0
 };
+
+// Returns a fresh default object every call — DEFAULT_AUTOPOST.postedTags/
+// retryCounts must never be spread directly, since `{ ...DEFAULT_AUTOPOST }`
+// only copies the *reference* to those arrays/objects. Every brand-new admin
+// config would then share (and mutate) the very same array/object, silently
+// leaking postedTags/retryCounts across admins. Cloning here keeps each
+// config's mutable fields independent.
+function freshDefaultAutopost() {
+    return { ...DEFAULT_AUTOPOST, postedTags: [], retryCounts: {} };
+}
 
 // Old configs stored `intervalHours` (whole hours only). Migrate them to
 // `intervalMinutes` on read so existing setups keep working unchanged.
 function normalizeAutopostConfig(raw) {
-    const cfg = { ...DEFAULT_AUTOPOST, ...raw };
+    const cfg = { ...freshDefaultAutopost(), ...raw };
     if (!cfg.intervalMinutes && raw && raw.intervalHours) {
         cfg.intervalMinutes = raw.intervalHours * 60;
     }
@@ -476,8 +488,12 @@ function getAllAutopostConfigs() {
 function markAutopostTagPosted(adminId, tag) {
     const configs = loadAutopostConfigs();
     const key = String(adminId);
-    const cfg = { ...DEFAULT_AUTOPOST, ...(configs[key] || {}) };
+    const cfg = { ...freshDefaultAutopost(), ...(configs[key] || {}) };
     if (!cfg.postedTags.includes(tag)) cfg.postedTags.push(tag);
+    if (cfg.retryCounts && cfg.retryCounts[tag] != null) {
+        cfg.retryCounts = { ...cfg.retryCounts };
+        delete cfg.retryCounts[tag];
+    }
     cfg.lastPostAt = Date.now();
     configs[key] = cfg;
     saveAutopostConfigs(configs);
@@ -486,10 +502,42 @@ function markAutopostTagPosted(adminId, tag) {
 function markAutopostTagSkipped(adminId, tag) {
     const configs = loadAutopostConfigs();
     const key = String(adminId);
-    const cfg = { ...DEFAULT_AUTOPOST, ...(configs[key] || {}) };
+    const cfg = { ...freshDefaultAutopost(), ...(configs[key] || {}) };
     if (!cfg.postedTags.includes(tag)) cfg.postedTags.push(tag);
+    if (cfg.retryCounts && cfg.retryCounts[tag] != null) {
+        cfg.retryCounts = { ...cfg.retryCounts };
+        delete cfg.retryCounts[tag];
+    }
     configs[key] = cfg;
     saveAutopostConfigs(configs);
+}
+
+// Records one failed attempt at posting `tag` and returns the new attempt
+// count. Used to cap retries (see MAX_AUTOPOST_RETRIES in bot.js) so a
+// permanently-broken video doesn't get retried forever.
+function incrementAutopostRetry(adminId, tag) {
+    const configs = loadAutopostConfigs();
+    const key = String(adminId);
+    const cfg = { ...freshDefaultAutopost(), ...(configs[key] || {}) };
+    cfg.retryCounts = { ...cfg.retryCounts };
+    cfg.retryCounts[tag] = (cfg.retryCounts[tag] || 0) + 1;
+    configs[key] = cfg;
+    saveAutopostConfigs(configs);
+    return cfg.retryCounts[tag];
+}
+
+// Clears the retry counter for a tag (called after it's finally posted, or
+// once it's been given up on and marked permanently skipped).
+function clearAutopostRetry(adminId, tag) {
+    const configs = loadAutopostConfigs();
+    const key = String(adminId);
+    const cfg = { ...freshDefaultAutopost(), ...(configs[key] || {}) };
+    if (cfg.retryCounts && cfg.retryCounts[tag] != null) {
+        cfg.retryCounts = { ...cfg.retryCounts };
+        delete cfg.retryCounts[tag];
+        configs[key] = cfg;
+        saveAutopostConfigs(configs);
+    }
 }
 
 // ===== Force-Sub per-group mode (auto-approve vs pending+delay) =====
@@ -633,6 +681,8 @@ module.exports = {
     getAllAutopostConfigs,
     markAutopostTagPosted,
     markAutopostTagSkipped,
+    incrementAutopostRetry,
+    clearAutopostRetry,
     getForceSubSettings,
     setForceSubSettings,
     recordJoinRequest,

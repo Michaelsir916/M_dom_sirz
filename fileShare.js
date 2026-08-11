@@ -65,14 +65,20 @@ function saveSharedFiles(files) {
     atomicWrite(FILES_PATH, files);
 }
 
-// Adds a file reference. Dedupes on (chat_id, message_id).
-function addSharedFile(chatId, messageId, type) {
+// Adds a file reference. Dedupes on (chat_id, message_id), and — when a
+// fileUniqueId is supplied — also on the underlying file itself, so the
+// exact same video re-forwarded/re-posted under a different message_id
+// (e.g. someone reposts the same clip into the source channel again)
+// doesn't get queued and auto-posted twice.
+function addSharedFile(chatId, messageId, type, fileUniqueId) {
     const files = loadSharedFiles();
     if (files.some(f => f.chat_id === chatId && f.message_id === messageId)) return false;
+    if (fileUniqueId && files.some(f => f.file_unique_id === fileUniqueId)) return false;
     files.push({
         chat_id: chatId,
         message_id: messageId,
         type,
+        file_unique_id: fileUniqueId || null,
         added_at: new Date().toISOString()
     });
     saveSharedFiles(files);
@@ -433,7 +439,8 @@ function saveAutopostConfigs(configs) {
 
 const DEFAULT_AUTOPOST = {
     channelId: null,
-    sourceChannelId: null,  // where videos are pulled FROM (must differ from channelId, the post destination)
+    sourceChannelId: null,   // deprecated single-source field, kept for migration only — see sourceChannelIds
+    sourceChannelIds: [],    // where videos are pulled FROM (one or more channels), must not include channelId
     intervalMinutes: 0,    // 0 = disabled; stored in minutes so hours+minutes are both supported
     caption: 'New Post 🎬',
     thumbnailMode: 'video', // 'video' = use the video's own thumbnail, 'custom' = admin-uploaded
@@ -442,8 +449,20 @@ const DEFAULT_AUTOPOST = {
     enabled: false,
     postedTags: [],         // "chatId:messageId" tags already posted/permanently skipped, never repeats
     retryCounts: {},        // "chatId:messageId" -> number of failed attempts so far (cleared on success/give-up)
+    postTimestamps: [],     // ms epoch of every successful post, for daily/weekly stats (pruned to last 90 days)
+    lowQueueWarned: false,  // true while queue is below threshold, so the warning fires once per low period
     lastPostAt: 0
 };
+
+// Old configs stored a single `sourceChannelId`. Migrate it into the new
+// `sourceChannelIds` array (once) so multi-source support doesn't lose
+// anyone's existing setup.
+function migrateSourceChannels(cfg, raw) {
+    if ((!cfg.sourceChannelIds || cfg.sourceChannelIds.length === 0) && raw && raw.sourceChannelId) {
+        cfg.sourceChannelIds = [raw.sourceChannelId];
+    }
+    return cfg;
+}
 
 // Returns a fresh default object every call — DEFAULT_AUTOPOST.postedTags/
 // retryCounts must never be spread directly, since `{ ...DEFAULT_AUTOPOST }`
@@ -452,7 +471,7 @@ const DEFAULT_AUTOPOST = {
 // leaking postedTags/retryCounts across admins. Cloning here keeps each
 // config's mutable fields independent.
 function freshDefaultAutopost() {
-    return { ...DEFAULT_AUTOPOST, postedTags: [], retryCounts: {} };
+    return { ...DEFAULT_AUTOPOST, postedTags: [], retryCounts: {}, sourceChannelIds: [], postTimestamps: [] };
 }
 
 // Old configs stored `intervalHours` (whole hours only). Migrate them to
@@ -463,6 +482,7 @@ function normalizeAutopostConfig(raw) {
         cfg.intervalMinutes = raw.intervalHours * 60;
     }
     delete cfg.intervalHours;
+    migrateSourceChannels(cfg, raw);
     return cfg;
 }
 
@@ -485,6 +505,8 @@ function getAllAutopostConfigs() {
     return Object.keys(configs).map(adminId => ({ adminId, ...normalizeAutopostConfig(configs[adminId]) }));
 }
 
+const POST_STATS_RETENTION_MS = 90 * 24 * 60 * 60 * 1000; // keep 90 days of post timestamps for stats
+
 function markAutopostTagPosted(adminId, tag) {
     const configs = loadAutopostConfigs();
     const key = String(adminId);
@@ -494,9 +516,31 @@ function markAutopostTagPosted(adminId, tag) {
         cfg.retryCounts = { ...cfg.retryCounts };
         delete cfg.retryCounts[tag];
     }
-    cfg.lastPostAt = Date.now();
+    const now = Date.now();
+    cfg.postTimestamps = [...(cfg.postTimestamps || []), now].filter(t => now - t < POST_STATS_RETENTION_MS);
+    cfg.lastPostAt = now;
     configs[key] = cfg;
     saveAutopostConfigs(configs);
+}
+
+// Auto-post stats for the panel/"📊 Stats" view: how many posts today, this
+// week, and all-time (all-time = postedTags.length, which never shrinks).
+// Uses IST calendar days regardless of the server's own system timezone.
+function istDateString(ms) {
+    return new Date(ms).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // "YYYY-MM-DD"
+}
+
+function getAutopostStats(adminId) {
+    const cfg = getAutopostConfig(adminId);
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const todayStr = istDateString(now);
+    const timestamps = cfg.postTimestamps || [];
+    return {
+        today: timestamps.filter(t => istDateString(t) === todayStr).length,
+        week: timestamps.filter(t => now - t < 7 * DAY_MS).length,
+        allTime: cfg.postedTags.length
+    };
 }
 
 function markAutopostTagSkipped(adminId, tag) {
@@ -683,6 +727,7 @@ module.exports = {
     markAutopostTagSkipped,
     incrementAutopostRetry,
     clearAutopostRetry,
+    getAutopostStats,
     getForceSubSettings,
     setForceSubSettings,
     recordJoinRequest,

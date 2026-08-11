@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const fetch = require('node-fetch');
+const archiver = require('archiver');
 let sharp;
 try { sharp = require('sharp'); } catch (e) { sharp = null; } // blur feature degrades gracefully if not installed
 require('dotenv').config();
@@ -51,11 +52,13 @@ const {
     recordJoinRequest,
     hasJoinRequest,
     markJoinRequestApproved,
+    isJoinRequestApproved,
     getDueJoinRequestsForApproval,
     isMaintenanceAllowed,
     addMaintenanceWhitelist,
     removeMaintenanceWhitelist,
-    getMaintenanceWhitelist
+    getMaintenanceWhitelist,
+    getConfigBackupFiles
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -172,6 +175,36 @@ async function logError(label, error) {
 async function logAutopostEvent(text, dedupeKey) {
     console.log(`ℹ️ Auto-post event: ${text.replace(/\n/g, ' ').slice(0, 120)}`);
     await sendToLogChannel(text, dedupeKey);
+}
+
+// --- Unauthorized access attempt logging ---
+// Fires whenever a non-admin tries an admin-only command/button, so the
+// admin can see who's probing the bot. Dedup: same user + same thing they
+// tried, within 5 min, only logs once (a curious/spammy user tapping the
+// same button repeatedly shouldn't flood the log channel).
+async function logUnauthorizedAccess(ctx, attempted) {
+    const userId = (ctx.from && ctx.from.id) || 'unknown';
+    const username = ctx.from && ctx.from.username ? `@${ctx.from.username}` : ((ctx.from && ctx.from.first_name) || 'unknown');
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const text = `🚫 *Unauthorized Access Attempt*\n\n*When:* ${timestamp} IST\n*User:* ${username} (\`${userId}\`)\n*Tried:* \`${attempted}\``;
+    console.log(`🚫 Unauthorized attempt: user ${userId} (${username}) tried "${attempted}"`);
+    await sendToLogChannel(text, `unauth:${userId}:${attempted}`);
+}
+
+// Central admin gate. Returns true if the caller is an admin. Otherwise
+// logs the attempt and (for button taps) acknowledges the callback so
+// Telegram doesn't show a spinning loading state, then returns false so
+// the handler can bail out with `if (!(await requireAdmin(ctx))) return;`.
+async function requireAdmin(ctx, viaAction = false) {
+    if (isAdmin(ctx.from && ctx.from.id)) return true;
+    const attempted = viaAction
+        ? ((ctx.callbackQuery && ctx.callbackQuery.data) || 'unknown_action')
+        : ((ctx.message && ctx.message.text) || 'unknown_command');
+    await logUnauthorizedAccess(ctx, attempted);
+    if (viaAction) {
+        try { await ctx.answerCbQuery(); } catch (e) { /* ignore */ }
+    }
+    return false;
 }
 
 // In-memory "what is this admin currently typing for" state, keyed by admin
@@ -995,8 +1028,23 @@ async function checkMembership(ctx, groupId, userId) {
     const settings = getForceSubSettings(groupId);
     if (settings.mode === 'pending') {
         // "Pending" groups never actually let the user in (or only after a
-        // delay) — sending the join request itself is treated as proof.
-        return hasJoinRequest(groupId, userId);
+        // delay) — sending the join request itself is treated as proof,
+        // UNLESS Telegram has since actually approved them into the group
+        // (delayHours elapsed, or an admin approved manually). Once that
+        // happens, a stale "requested once" record shouldn't grant access
+        // forever — re-verify live so a quick join-then-leave doesn't keep
+        // unlocking files after they've left.
+        if (!hasJoinRequest(groupId, userId)) return false;
+        if (isJoinRequestApproved(groupId, userId)) {
+            try {
+                const member = await ctx.telegram.getChatMember(groupId, userId);
+                return ['member', 'administrator', 'creator'].includes(member.status);
+            } catch (error) {
+                console.error('Membership recheck failed:', error.message);
+                return false; // fail closed — don't trust a stale request over a failed live check
+            }
+        }
+        return true;
     }
     try {
         const member = await ctx.telegram.getChatMember(groupId, userId);
@@ -1120,9 +1168,49 @@ const MY_STATS_KEYBOARD = {
     inline_keyboard: [
         [{ text: '🎬 Free Video', callback_data: 'user_random' }],
         [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
-        [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }]
+        [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
+        [{ text: 'ℹ️ About', callback_data: 'user_about' }]
     ]
 };
+
+// Minimal HTML-escaping for admin-supplied text/URLs dropped into an
+// HTML-parse-mode message (About panel link text, join-group link, etc).
+function escapeHtml(str) {
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+// Public-facing "About" panel — shown to any regular user who taps ℹ️ About
+// on /start. Creator credit + tech stack are fixed; the join-group button
+// and the clickable hyperlink (text + url) are admin-configurable via the
+// File Sharing → About/Start Message panel.
+bot.action('user_about', async (ctx) => {
+    await ctx.answerCbQuery();
+    const config = loadConfig();
+
+    let text = '🤖 <b>About This Bot</b>\n\n' +
+        '👤 Creator: @mr_boomsir\n' +
+        '⚙️ Built with: Node.js, Telegraf, GramJS (MTProto), MEGA API';
+
+    if (config.aboutLinkUrl) {
+        const linkText = escapeHtml(config.aboutLinkText || 'Click Here');
+        text += `\n\n<a href="${escapeHtml(config.aboutLinkUrl)}">${linkText}</a>`;
+    }
+
+    const keyboard = { inline_keyboard: [] };
+    if (config.aboutJoinGroupLink) {
+        keyboard.inline_keyboard.push([{ text: '👥 Join Group', url: config.aboutJoinGroupLink }]);
+    }
+
+    await ctx.reply(text, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        ...(keyboard.inline_keyboard.length ? { reply_markup: keyboard } : {})
+    });
+});
 
 function formatMyStats(userId) {
     const config = loadConfig();
@@ -1190,7 +1278,7 @@ bot.action('user_referral', async (ctx) => {
 
 // --- Admin: force-sub group management ---
 bot.command('setforcesub', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     if (ctx.chat.type === 'private') {
         await ctx.reply('⚠️ Run this command inside the group you want to use for force-sub.');
         return;
@@ -1204,7 +1292,7 @@ bot.command('setforcesub', async (ctx) => {
 });
 
 bot.command('unsetforcesub', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     if (ctx.chat.type === 'private') {
         await ctx.reply('⚠️ Run this command inside the group you want to remove.');
         return;
@@ -1217,7 +1305,7 @@ bot.command('unsetforcesub', async (ctx) => {
 });
 
 bot.command('listforcesub', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const config = loadConfig();
     if (config.forceSubGroupIds.length === 0) {
         await ctx.reply('No force-sub groups set yet.');
@@ -1235,7 +1323,7 @@ bot.command('listforcesub', async (ctx) => {
 });
 
 bot.command('setsource', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     if (ctx.chat.type === 'private') {
         await ctx.reply('⚠️ Run this command inside the source group.');
         return;
@@ -1247,7 +1335,7 @@ bot.command('setsource', async (ctx) => {
 });
 
 bot.command('setlogchannel', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     if (ctx.chat.type === 'private') {
         await ctx.reply('⚠️ Run this command inside the group/channel you want errors sent to.\n\nAdd the bot there as admin first.');
         return;
@@ -1259,16 +1347,62 @@ bot.command('setlogchannel', async (ctx) => {
 });
 
 bot.command('unsetlogchannel', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const config = loadConfig();
     config.errorLogChatId = null;
     saveConfig(config);
     await ctx.reply('✅ Error log channel removed. Errors will only go to console now.');
 });
 
+// --- Admin: config backup ---
+// Zips every persisted JSON data file and sends it to the admin, so a
+// corrupted file / bad Termux kill / accidental delete can be restored
+// from a known-good snapshot instead of starting over from defaults.
+bot.command('backupconfig', async (ctx) => {
+    if (!(await requireAdmin(ctx))) return;
+
+    const files = getConfigBackupFiles();
+    if (files.length === 0) {
+        await ctx.reply('⚠️ No config files found to back up yet.');
+        return;
+    }
+
+    const backupDir = path.join(os.tmpdir(), 'mega-bot-backups');
+    if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const zipPath = path.join(backupDir, `config-backup-${timestamp}.zip`);
+
+    await ctx.reply(`📦 Backing up ${files.length} config file(s)...`);
+
+    try {
+        await new Promise((resolve, reject) => {
+            const output = fs.createWriteStream(zipPath);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+            output.on('close', resolve);
+            archive.on('error', reject);
+            archive.pipe(output);
+            for (const file of files) {
+                archive.file(file.path, { name: file.name });
+            }
+            archive.finalize();
+        });
+
+        await ctx.replyWithDocument(
+            { source: zipPath, filename: `config-backup-${timestamp}.zip` },
+            { caption: `✅ ${files.length} file(s): ${files.map(f => f.name).join(', ')}` }
+        );
+    } catch (error) {
+        console.error('Backup failed:', error.message);
+        await ctx.reply(`❌ Backup failed: ${error.message}`);
+        await logError('backupconfig', error);
+    } finally {
+        try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) { /* ignore */ }
+    }
+});
+
 // --- Admin: settings ---
 bot.command('setcount', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const n = parseInt(ctx.message.text.split(' ')[1], 10);
     if (!n || n < 1) {
         await ctx.reply('Usage: `/setcount 3`', { parse_mode: 'Markdown' });
@@ -1281,7 +1415,7 @@ bot.command('setcount', async (ctx) => {
 });
 
 bot.command('setcooldown', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const n = parseInt(ctx.message.text.split(' ')[1], 10);
     if (isNaN(n) || n < 0) {
         await ctx.reply('Usage: `/setcooldown 15` (seconds, 0 = no cooldown)', { parse_mode: 'Markdown' });
@@ -1294,7 +1428,7 @@ bot.command('setcooldown', async (ctx) => {
 });
 
 bot.command('setreferralbonus', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const n = parseInt(ctx.message.text.split(' ')[1], 10);
     if (isNaN(n) || n < 0) {
         await ctx.reply('Usage: `/setreferralbonus 3` (bonus credits per referral, 0 = disable)', { parse_mode: 'Markdown' });
@@ -1307,7 +1441,7 @@ bot.command('setreferralbonus', async (ctx) => {
 });
 
 bot.command('setdailylimit', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const n = parseInt(ctx.message.text.split(' ')[1], 10);
     if (isNaN(n) || n < 0) {
         await ctx.reply('Usage: `/setdailylimit 10` (0 = unlimited)', { parse_mode: 'Markdown' });
@@ -1320,7 +1454,7 @@ bot.command('setdailylimit', async (ctx) => {
 });
 
 bot.command('setautodelete', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const n = parseInt(ctx.message.text.split(' ')[1], 10);
     if (isNaN(n) || n < 0) {
         await ctx.reply('Usage: `/setautodelete 30` (minutes, 0 = disabled)', { parse_mode: 'Markdown' });
@@ -1334,7 +1468,7 @@ bot.command('setautodelete', async (ctx) => {
 
 // --- Admin: file pool management ---
 bot.command('listfiles', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const files = loadSharedFiles();
     if (files.length === 0) {
         await ctx.reply('No files in the pool yet.');
@@ -1347,7 +1481,7 @@ bot.command('listfiles', async (ctx) => {
 });
 
 bot.command('delfile', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const idx = parseInt(ctx.message.text.split(' ')[1], 10);
     if (isNaN(idx)) {
         await ctx.reply('Usage: `/delfile 3` (index from /listfiles)', { parse_mode: 'Markdown' });
@@ -1363,7 +1497,7 @@ bot.command('delfile', async (ctx) => {
 
 // --- Admin: stats & broadcast ---
 bot.command('stats', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const s = getStats();
     await ctx.reply(
         `📊 *Stats*\n\n` +
@@ -1375,7 +1509,7 @@ bot.command('stats', async (ctx) => {
 });
 
 bot.command('broadcast', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     if (ctx.chat.type !== 'private') return;
     const msg = ctx.message.text.split(' ').slice(1).join(' ');
     if (!msg) {
@@ -1420,7 +1554,7 @@ async function runMediaBroadcast(ctx, kind, fileId, caption) {
 }
 
 bot.command('broadcasthistory', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const history = getBroadcastHistory(10);
     if (history.length === 0) {
         await ctx.reply('No broadcasts sent yet.');
@@ -1435,7 +1569,7 @@ bot.command('broadcasthistory', async (ctx) => {
 
 // /schedulebroadcast 2026-08-07 09:00 Your message here
 bot.command('schedulebroadcast', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     if (ctx.chat.type !== 'private') return;
     const parts = ctx.message.text.split(' ');
     const dateStr = parts[1];
@@ -1457,7 +1591,7 @@ bot.command('schedulebroadcast', async (ctx) => {
 });
 
 bot.command('listscheduled', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const pending = getPendingScheduledBroadcasts();
     if (pending.length === 0) {
         await ctx.reply('No scheduled broadcasts pending.');
@@ -1468,7 +1602,7 @@ bot.command('listscheduled', async (ctx) => {
 });
 
 bot.command('cancelbroadcast', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return;
+    if (!(await requireAdmin(ctx))) return;
     const id = ctx.message.text.split(' ')[1];
     if (!id) {
         await ctx.reply('Usage: `/cancelbroadcast <id>` (see `/listscheduled`)', { parse_mode: 'Markdown' });
@@ -1632,7 +1766,8 @@ async function setupCommandMenus() {
         { command: 'broadcasthistory', description: 'Last 10 broadcasts' },
         { command: 'schedulebroadcast', description: 'Schedule a text broadcast' },
         { command: 'listscheduled', description: 'List pending scheduled broadcasts' },
-        { command: 'cancelbroadcast', description: 'Cancel a scheduled broadcast' }
+        { command: 'cancelbroadcast', description: 'Cancel a scheduled broadcast' },
+        { command: 'backupconfig', description: 'Download a zip of all config files' }
     ];
 
     const adminIds = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
@@ -1648,7 +1783,7 @@ async function setupCommandMenus() {
 }
 
 bot.action('menu_mega', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     await ctx.editMessageText(
         '📦 *Mega Management*\n\n' +
@@ -1688,6 +1823,7 @@ async function renderFileSharePanel(ctx) {
             [{ text: '🖼 Auto-Post', callback_data: 'ap_menu' }],
             [{ text: '🛠 Maintenance Mode', callback_data: 'mm_menu' }],
             [{ text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
+            [{ text: '👤 About/Start Message', callback_data: 'about_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
@@ -1696,12 +1832,67 @@ async function renderFileSharePanel(ctx) {
 }
 
 bot.action('fs_toggle_protect', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const config = loadConfig();
     config.protectContent = !config.protectContent;
     saveConfig(config);
     await ctx.answerCbQuery(`Forward protection ${config.protectContent ? 'ON' : 'OFF'}`);
     await renderFileSharePanel(ctx);
+});
+
+// --- About/Start Message (admin config for the non-admin ℹ️ About panel) ---
+async function renderAboutPanel(ctx) {
+    const config = loadConfig();
+    const text = '👤 *About / Start Message*\n\n' +
+        `Join Group Link: ${config.aboutJoinGroupLink || '_Not set_'}\n` +
+        `Link Text: ${config.aboutLinkText || '_Not set_'}\n` +
+        `Link URL: ${config.aboutLinkUrl || '_Not set_'}\n\n` +
+        '_Shown to regular users when they tap ℹ️ About on /start. Creator credit and tech stack are fixed._';
+
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: '👥 Set Join Group Link', callback_data: 'about_setjoin' }],
+            [{ text: '✏️ Set Link Text', callback_data: 'about_settext' }],
+            [{ text: '🔗 Set Link URL', callback_data: 'about_seturl' }],
+            [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
+        ]
+    };
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.action('about_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderAboutPanel(ctx);
+});
+
+bot.action('about_setjoin', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'about_join_link' };
+    await ctx.editMessageText('👥 Send the Join Group link (e.g. `https://t.me/yourgroup`), or /cancel.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'about_menu' }]] }
+    });
+});
+
+bot.action('about_settext', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'about_link_text' };
+    await ctx.editMessageText('✏️ Send the clickable text (e.g. `Hello`), or /cancel.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'about_menu' }]] }
+    });
+});
+
+bot.action('about_seturl', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'about_link_url' };
+    await ctx.editMessageText('🔗 Send the URL the text should link to, or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'about_menu' }]] }
+    });
 });
 
 // --- Maintenance mode ---
@@ -1726,13 +1917,13 @@ async function renderMaintenancePanel(ctx) {
 }
 
 bot.action('mm_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     await renderMaintenancePanel(ctx);
 });
 
 bot.action('mm_toggle', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const config = loadConfig();
     config.maintenanceMode = !config.maintenanceMode;
     saveConfig(config);
@@ -1741,7 +1932,7 @@ bot.action('mm_toggle', async (ctx) => {
 });
 
 bot.action('mm_add_user', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'mm_add_user' };
     await ctx.editMessageText('⌨️ Send the Telegram user ID to allow during maintenance, or /cancel.\n\n_Tip: ask them to send /start to any bot that shows their ID, e.g. @userinfobot._', {
@@ -1751,7 +1942,7 @@ bot.action('mm_add_user', async (ctx) => {
 });
 
 bot.action('mm_remove_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const whitelist = getMaintenanceWhitelist();
     if (whitelist.length === 0) {
@@ -1769,7 +1960,7 @@ bot.action('mm_remove_menu', async (ctx) => {
 });
 
 bot.action(/^mm_remove:(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     removeMaintenanceWhitelist(ctx.match[1]);
     await ctx.answerCbQuery('✅ Removed');
     await renderMaintenancePanel(ctx);
@@ -1801,13 +1992,13 @@ async function renderMegaUploadPanel(ctx) {
 }
 
 bot.action('mud_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     await renderMegaUploadPanel(ctx);
 });
 
 bot.action(/^mud_mode:(personal|channel)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const mode = ctx.match[1];
     const config = loadConfig();
     if (mode === 'channel' && !config.megaUploadChannelId) {
@@ -1822,7 +2013,7 @@ bot.action(/^mud_mode:(personal|channel)$/, async (ctx) => {
 });
 
 bot.action('mud_setchannel_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const { rows, truncated, total } = knownChatPickerKeyboard([], 'mud_setchannel', 'mud_menu', ctx.from.id);
     const note = total === 0
@@ -1835,7 +2026,7 @@ bot.action('mud_setchannel_menu', async (ctx) => {
 });
 
 bot.action(/^mud_setchannel:(-?\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     const config = loadConfig();
     config.megaUploadChannelId = chatId;
@@ -1849,7 +2040,7 @@ bot.action(/^mud_setchannel:(-?\d+)$/, async (ctx) => {
 });
 
 bot.action('mud_setchannel_manual', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'mud_setchannel_manual' };
     await ctx.editMessageText('⌨️ Send the channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
@@ -1882,14 +2073,14 @@ function knownChatPickerKeyboard(excludeIds, prefix, backCallback, adminId) {
 }
 
 bot.action('menu_fileshare', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     await renderFileSharePanel(ctx);
 });
 
 // --- Read-only panels ---
 bot.action('fs_listfiles', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const files = loadSharedFiles();
     if (files.length === 0) {
@@ -1907,7 +2098,7 @@ bot.action('fs_listfiles', async (ctx) => {
 });
 
 bot.action(/^fs_delfile:(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const idx = parseInt(ctx.match[1], 10);
     const removed = deleteFileByIndex(idx);
     await ctx.answerCbQuery(removed ? `✅ Removed ${removed.type}` : '❌ Not found (list may have shifted)');
@@ -1927,7 +2118,7 @@ bot.action(/^fs_delfile:(\d+)$/, async (ctx) => {
 });
 
 bot.action('fs_stats', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const s = getStats();
     const text = `📊 *Stats*\n\nTotal files: ${s.totalFiles}\nTotal users: ${s.totalUsers}\nRequests today: ${s.requestsToday}`;
@@ -1977,7 +2168,7 @@ async function renderForceSubList(ctx) {
 }
 
 bot.action(/^fs_fsmode:(-?\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     const settings = getForceSubSettings(chatId);
     const next = settings.mode === 'pending' ? 'auto' : 'pending';
@@ -1987,7 +2178,7 @@ bot.action(/^fs_fsmode:(-?\d+)$/, async (ctx) => {
 });
 
 bot.action(/^fs_fsdelay_menu:(-?\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     await ctx.answerCbQuery();
     const settings = getForceSubSettings(chatId);
@@ -2004,7 +2195,7 @@ bot.action(/^fs_fsdelay_menu:(-?\d+)$/, async (ctx) => {
 });
 
 bot.action(/^fs_fsdelay:(-?\d+):(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     const hours = Number(ctx.match[2]);
     setForceSubSettings(chatId, { delayHours: hours });
@@ -2013,7 +2204,7 @@ bot.action(/^fs_fsdelay:(-?\d+):(\d+)$/, async (ctx) => {
 });
 
 bot.action('fs_listforcesub', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     await renderForceSubList(ctx);
 });
@@ -2021,7 +2212,7 @@ bot.action('fs_listforcesub', async (ctx) => {
 bot.action('noop', async (ctx) => ctx.answerCbQuery());
 
 bot.action(/^fs_rmfs:(-?\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     const config = loadConfig();
     config.forceSubGroupIds = config.forceSubGroupIds.filter(id => id !== chatId);
@@ -2032,7 +2223,7 @@ bot.action(/^fs_rmfs:(-?\d+)$/, async (ctx) => {
 
 // --- Add Force-Sub (button-driven, no need to enter the target chat) ---
 bot.action('fs_addfs_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const config = loadConfig();
     const { rows, truncated, total } = knownChatPickerKeyboard(config.forceSubGroupIds, 'fs_addfs', 'menu_fileshare', ctx.from.id);
@@ -2046,7 +2237,7 @@ bot.action('fs_addfs_menu', async (ctx) => {
 });
 
 bot.action(/^fs_addfs:(-?\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     const config = loadConfig();
     if (!config.forceSubGroupIds.includes(chatId)) {
@@ -2058,7 +2249,7 @@ bot.action(/^fs_addfs:(-?\d+)$/, async (ctx) => {
 });
 
 bot.action('fs_addfs_manual', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'add_forcesub_manual' };
     await ctx.editMessageText('⌨️ Send the group/channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be a member/admin there. Send /cancel to abort.', {
@@ -2069,7 +2260,7 @@ bot.action('fs_addfs_manual', async (ctx) => {
 
 // --- Set Source (button-driven) ---
 bot.action('fs_setsrc_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const { rows, truncated, total } = knownChatPickerKeyboard([], 'fs_setsrc', 'menu_fileshare', ctx.from.id);
     const note = total === 0
@@ -2082,7 +2273,7 @@ bot.action('fs_setsrc_menu', async (ctx) => {
 });
 
 bot.action(/^fs_setsrc:(-?\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     const config = loadConfig();
     config.sourceGroupId = chatId;
@@ -2095,7 +2286,7 @@ bot.action(/^fs_setsrc:(-?\d+)$/, async (ctx) => {
 });
 
 bot.action('fs_setsrc_manual', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'set_source_manual' };
     await ctx.editMessageText('⌨️ Send the source group/channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be a member/admin there. Send /cancel to abort.', {
@@ -2125,13 +2316,13 @@ async function renderBroadcastMenu(ctx) {
 }
 
 bot.action('fs_broadcast_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     await renderBroadcastMenu(ctx);
 });
 
 bot.action('fs_toggle_forward', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const config = loadConfig();
     config.broadcastForwardMode = !config.broadcastForwardMode;
     saveConfig(config);
@@ -2140,7 +2331,7 @@ bot.action('fs_toggle_forward', async (ctx) => {
 });
 
 bot.action('fs_broadcast_history', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const history = getBroadcastHistory(10);
     const text = history.length === 0
@@ -2153,7 +2344,7 @@ bot.action('fs_broadcast_history', async (ctx) => {
 });
 
 bot.action('fs_broadcast_send', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'broadcast' };
     await ctx.editMessageText('📢 Send the text message to broadcast now — or send a photo/video/GIF with a caption — or /cancel.', {
@@ -2497,13 +2688,13 @@ async function renderAutopostPanel(ctx) {
 }
 
 bot.action('ap_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     await renderAutopostPanel(ctx);
 });
 
 bot.action('ap_setchannel_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const { rows, truncated, total } = knownChatPickerKeyboard([], 'ap_setchannel', 'ap_menu', ctx.from.id);
     const note = total === 0
@@ -2516,7 +2707,7 @@ bot.action('ap_setchannel_menu', async (ctx) => {
 });
 
 bot.action(/^ap_setchannel:(-?\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     setAutopostConfig(ctx.from.id, { channelId: chatId });
     const chat = getKnownChats().find(c => String(c.id) === String(chatId));
@@ -2527,7 +2718,7 @@ bot.action(/^ap_setchannel:(-?\d+)$/, async (ctx) => {
 });
 
 bot.action('ap_setchannel_manual', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'ap_setchannel_manual' };
     await ctx.editMessageText('⌨️ Send the destination channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
@@ -2541,7 +2732,7 @@ bot.action('ap_setchannel_manual', async (ctx) => {
 // doesn't show up in the channel the admin is watching, the configured ID
 // simply isn't that channel (wrong pick, stale entry, duplicate title, etc).
 bot.action('ap_verify_dest', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const cfg = getAutopostConfig(ctx.from.id);
     if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a destination channel first.'); return; }
     await ctx.answerCbQuery('🔍 Sending test message...');
@@ -2569,7 +2760,7 @@ bot.action('ap_verify_dest', async (ctx) => {
 // `isAutopostSourceChannel()` check used by the message/channel_post
 // handlers further down.
 bot.action('ap_setsource_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const cfg = getAutopostConfig(ctx.from.id);
     const exclude = [...(cfg.sourceChannelIds || []), ...(cfg.channelId ? [cfg.channelId] : [])];
@@ -2584,7 +2775,7 @@ bot.action('ap_setsource_menu', async (ctx) => {
 });
 
 bot.action(/^ap_setsource:(-?\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     const cfg = getAutopostConfig(ctx.from.id);
     if (cfg.channelId && String(chatId) === String(cfg.channelId)) {
@@ -2602,7 +2793,7 @@ bot.action(/^ap_setsource:(-?\d+)$/, async (ctx) => {
 });
 
 bot.action('ap_setsource_manual', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'ap_setsource_manual' };
     await ctx.editMessageText('⌨️ Send the source channel ID (e.g. `-1001234567890`) or `@username` to add.\n\nI must already be admin there. Send /cancel to abort.', {
@@ -2613,7 +2804,7 @@ bot.action('ap_setsource_manual', async (ctx) => {
 
 // --- Remove a source channel ---
 bot.action('ap_removesource_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const cfg = getAutopostConfig(ctx.from.id);
     if (!cfg.sourceChannelIds || cfg.sourceChannelIds.length === 0) {
@@ -2632,7 +2823,7 @@ bot.action('ap_removesource_menu', async (ctx) => {
 });
 
 bot.action(/^ap_removesource:(-?\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const chatId = Number(ctx.match[1]);
     const cfg = getAutopostConfig(ctx.from.id);
     const remaining = (cfg.sourceChannelIds || []).filter(id => String(id) !== String(chatId));
@@ -2644,7 +2835,7 @@ bot.action(/^ap_removesource:(-?\d+)$/, async (ctx) => {
 });
 
 bot.action('ap_interval_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const cfg = getAutopostConfig(ctx.from.id);
     const minuteRow = [1, 15, 30, 45].map(m => ({ text: `${m}m`, callback_data: `ap_interval:${m}` }));
@@ -2656,7 +2847,7 @@ bot.action('ap_interval_menu', async (ctx) => {
 });
 
 bot.action(/^ap_interval:(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const n = parseInt(ctx.match[1], 10);
     setAutopostConfig(ctx.from.id, { intervalMinutes: n });
     await ctx.answerCbQuery(`✅ Every ${formatIntervalMinutes(n)}`);
@@ -2664,7 +2855,7 @@ bot.action(/^ap_interval:(\d+)$/, async (ctx) => {
 });
 
 bot.action('ap_interval_custom', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'autopost_interval_custom' };
     await ctx.editMessageText('✏️ Send the interval — e.g. `45m`, `2h`, `1h30m`, or just a number for minutes, or /cancel.', {
@@ -2674,7 +2865,7 @@ bot.action('ap_interval_custom', async (ctx) => {
 });
 
 bot.action('ap_caption', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'autopost_caption' };
     await ctx.editMessageText('✏️ Send the caption to use for every auto-post, or /cancel.', {
@@ -2683,7 +2874,7 @@ bot.action('ap_caption', async (ctx) => {
 });
 
 bot.action('ap_thumb_toggle', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const cfg = getAutopostConfig(ctx.from.id);
     const next = cfg.thumbnailMode === 'custom' ? 'video' : 'custom';
     setAutopostConfig(ctx.from.id, { thumbnailMode: next });
@@ -2692,7 +2883,7 @@ bot.action('ap_thumb_toggle', async (ctx) => {
 });
 
 bot.action('ap_thumb_upload', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'autopost_thumbnail' };
     await ctx.editMessageText('📤 Send the photo to use as the thumbnail for every auto-post, or /cancel.', {
@@ -2701,7 +2892,7 @@ bot.action('ap_thumb_upload', async (ctx) => {
 });
 
 bot.action('ap_blur_toggle', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     if (!sharp) {
         await ctx.answerCbQuery('⚠️ Install the "sharp" package on the server first (npm install sharp).');
         return;
@@ -2713,7 +2904,7 @@ bot.action('ap_blur_toggle', async (ctx) => {
 });
 
 bot.action('ap_toggle_enabled', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const cfg = getAutopostConfig(ctx.from.id);
     if (!cfg.enabled) {
         if (!cfg.sourceChannelIds || cfg.sourceChannelIds.length === 0) { await ctx.answerCbQuery('⚠️ Set a source channel first.'); return; }
@@ -2726,7 +2917,7 @@ bot.action('ap_toggle_enabled', async (ctx) => {
 });
 
 bot.action('ap_stats', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const stats = getAutopostStats(ctx.from.id);
     await ctx.reply(
@@ -2739,7 +2930,7 @@ bot.action('ap_stats', async (ctx) => {
 });
 
 bot.action('ap_test', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const cfg = getAutopostConfig(ctx.from.id);
     if (!cfg.sourceChannelIds || cfg.sourceChannelIds.length === 0) { await ctx.answerCbQuery('⚠️ Set a source channel first.'); return; }
     if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a destination channel first.'); return; }
@@ -2752,7 +2943,7 @@ bot.action('ap_test', async (ctx) => {
 });
 
 bot.action('ap_confirm', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const pending = pendingAutopostPreview[ctx.from.id];
     if (!pending) { await ctx.answerCbQuery('⚠️ Preview expired — run Test Preview again.'); return; }
     const cfg = getAutopostConfig(ctx.from.id);
@@ -2776,7 +2967,7 @@ bot.action('ap_confirm', async (ctx) => {
 });
 
 bot.action('ap_cancel', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     delete pendingAutopostPreview[ctx.from.id];
     await ctx.answerCbQuery('Skipped');
     await ctx.editMessageCaption('❌ Skipped — not posted.').catch(() => {});
@@ -2788,7 +2979,7 @@ function presetRow(values, prefix, suffix = '') {
 }
 
 bot.action('fs_count_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const config = loadConfig();
     await ctx.editMessageText(`🔢 *Files per Request*\n\nCurrent: ${config.shareCount}`, {
@@ -2798,7 +2989,7 @@ bot.action('fs_count_menu', async (ctx) => {
 });
 
 bot.action('fs_cooldown_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const config = loadConfig();
     await ctx.editMessageText(`⏱ *Cooldown*\n\nCurrent: ${config.cooldownSeconds}s`, {
@@ -2808,7 +2999,7 @@ bot.action('fs_cooldown_menu', async (ctx) => {
 });
 
 bot.action('fs_dailylimit_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const config = loadConfig();
     await ctx.editMessageText(`📆 *Daily Limit*\n\nCurrent: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}`, {
@@ -2818,7 +3009,7 @@ bot.action('fs_dailylimit_menu', async (ctx) => {
 });
 
 bot.action('fs_autodelete_menu', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const config = loadConfig();
     await ctx.editMessageText(`🗑 *Auto-Delete*\n\nCurrent: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + ' min'}`, {
@@ -2835,7 +3026,7 @@ const CUSTOM_FIELD_MAP = {
 };
 
 bot.action(/^fs_custom_(count|cooldown|dailylimit|autodelete)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     const type = `custom_${ctx.match[1]}`;
     const field = CUSTOM_FIELD_MAP[type];
@@ -2847,7 +3038,7 @@ bot.action(/^fs_custom_(count|cooldown|dailylimit|autodelete)$/, async (ctx) => 
 });
 
 bot.action(/^fs_count:(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const n = parseInt(ctx.match[1], 10);
     const config = loadConfig();
     config.shareCount = n;
@@ -2857,7 +3048,7 @@ bot.action(/^fs_count:(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^fs_cooldown:(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const n = parseInt(ctx.match[1], 10);
     const config = loadConfig();
     config.cooldownSeconds = n;
@@ -2867,7 +3058,7 @@ bot.action(/^fs_cooldown:(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^fs_dailylimit:(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const n = parseInt(ctx.match[1], 10);
     const config = loadConfig();
     config.dailyLimit = n;
@@ -2877,7 +3068,7 @@ bot.action(/^fs_dailylimit:(\d+)$/, async (ctx) => {
 });
 
 bot.action(/^fs_autodelete:(\d+)$/, async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     const n = parseInt(ctx.match[1], 10);
     const config = loadConfig();
     config.autoDeleteMinutes = n;
@@ -2887,7 +3078,7 @@ bot.action(/^fs_autodelete:(\d+)$/, async (ctx) => {
 });
 
 bot.action('menu_back', async (ctx) => {
-    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
     await ctx.editMessageText(ADMIN_START_TEXT, { reply_markup: ADMIN_START_KEYBOARD });
 });
@@ -2915,7 +3106,7 @@ function isTrackedSourceChat(chatId, config) {
 // source group into the share pool (unchanged from before).
 bot.on(['photo', 'video', 'animation'], async (ctx) => {
     if (ctx.chat.type === 'private') {
-        if (!isAdmin(ctx.from.id)) return;
+        if (!(await requireAdmin(ctx))) return;
 
         const kind = ctx.message.animation ? 'animation' : (ctx.message.video ? 'video' : 'photo');
         const fileId = ctx.message.animation ? ctx.message.animation.file_id
@@ -3302,6 +3493,48 @@ async function handlePendingAction(ctx, text) {
         return;
     }
 
+    if (action.type === 'about_join_link') {
+        const url = text.trim();
+        if (!/^https?:\/\//i.test(url)) {
+            await ctx.reply('⚠️ Please send a valid URL starting with http:// or https://, or /cancel.');
+            return;
+        }
+        const config = loadConfig();
+        config.aboutJoinGroupLink = url;
+        saveConfig(config);
+        delete pendingAction[userId];
+        await ctx.reply('✅ Join Group link saved.');
+        return;
+    }
+
+    if (action.type === 'about_link_text') {
+        const t = text.trim();
+        if (!t) {
+            await ctx.reply('⚠️ Send some text, or /cancel.');
+            return;
+        }
+        const config = loadConfig();
+        config.aboutLinkText = t;
+        saveConfig(config);
+        delete pendingAction[userId];
+        await ctx.reply('✅ Link text saved.');
+        return;
+    }
+
+    if (action.type === 'about_link_url') {
+        const url = text.trim();
+        if (!/^https?:\/\//i.test(url)) {
+            await ctx.reply('⚠️ Please send a valid URL starting with http:// or https://, or /cancel.');
+            return;
+        }
+        const config = loadConfig();
+        config.aboutLinkUrl = url;
+        saveConfig(config);
+        delete pendingAction[userId];
+        await ctx.reply('✅ Link URL saved.');
+        return;
+    }
+
     if (CUSTOM_FIELD_MAP[action.type]) {
         const { key, label, min } = CUSTOM_FIELD_MAP[action.type];
         const n = parseInt(text.trim(), 10);
@@ -3351,6 +3584,7 @@ bot.on('message', async (ctx) => {
 
     if (!isAdmin(ctx.from.id)) {
         if (ctx.chat.type === 'private') {
+            await logUnauthorizedAccess(ctx, 'mega_link_download');
             await ctx.reply('❌ This feature is available to admins only.');
         }
         return;

@@ -1854,7 +1854,17 @@ bot.action('mud_setchannel_manual', async (ctx) => {
 function knownChatPickerKeyboard(excludeIds, prefix, backCallback, adminId) {
     const exclude = new Set(excludeIds.map(String));
     const chats = getKnownChats(adminId).filter(c => !exclude.has(String(c.id)));
-    const rows = chats.slice(0, 20).map(c => [{ text: `${chatTypeIcon(c.type)} ${c.title}`, callback_data: `${prefix}:${c.id}` }]);
+    const shown = chats.slice(0, 20);
+    // If two or more shown chats share the same title, append a short ID
+    // suffix to every one of them so they're distinguishable in the list —
+    // otherwise picking between e.g. two channels both named "My Channel"
+    // is a guess, and the wrong one silently gets configured.
+    const titleCounts = {};
+    shown.forEach(c => { titleCounts[c.title] = (titleCounts[c.title] || 0) + 1; });
+    const rows = shown.map(c => {
+        const label = titleCounts[c.title] > 1 ? `${chatTypeIcon(c.type)} ${c.title} (…${String(c.id).slice(-6)})` : `${chatTypeIcon(c.type)} ${c.title}`;
+        return [{ text: label, callback_data: `${prefix}:${c.id}` }];
+    });
     rows.push([{ text: '⌨️ Type ID / @username instead', callback_data: `${prefix}_manual` }]);
     rows.push([{ text: '🔙 Back', callback_data: backCallback }]);
     return { rows, truncated: chats.length > 20, total: chats.length };
@@ -2382,10 +2392,10 @@ async function renderAutopostPanel(ctx) {
     const adminId = ctx.from.id;
     const cfg = getAutopostConfig(adminId);
     const channelLabel = cfg.channelId
-        ? (getKnownChats().find(c => String(c.id) === String(cfg.channelId))?.title || cfg.channelId)
+        ? `${getKnownChats().find(c => String(c.id) === String(cfg.channelId))?.title || '?'} (\`${cfg.channelId}\`)`
         : 'Not set';
     const sourceLabel = cfg.sourceChannelId
-        ? (getKnownChats().find(c => String(c.id) === String(cfg.sourceChannelId))?.title || cfg.sourceChannelId)
+        ? `${getKnownChats().find(c => String(c.id) === String(cfg.sourceChannelId))?.title || '?'} (\`${cfg.sourceChannelId}\`)`
         : 'Not set';
     const queueCount = cfg.sourceChannelId
         ? loadSharedFiles().filter(f => f.type === 'video' && String(f.chat_id) === String(cfg.sourceChannelId) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
@@ -2405,6 +2415,7 @@ async function renderAutopostPanel(ctx) {
         inline_keyboard: [
             [{ text: '📥 Set Source Channel', callback_data: 'ap_setsource_menu' }],
             [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }],
+            [{ text: '🔍 Verify Destination (sends a test message)', callback_data: 'ap_verify_dest' }],
             [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }],
             [{ text: '✏️ Set Caption', callback_data: 'ap_caption' }],
             [{ text: `🖼 Thumbnail Source: ${cfg.thumbnailMode === 'custom' ? 'Custom' : 'Video'}`, callback_data: 'ap_thumb_toggle' }],
@@ -2456,6 +2467,33 @@ bot.action('ap_setchannel_manual', async (ctx) => {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
     });
+});
+
+// Proves — rather than just claims — where auto-posts are actually landing.
+// Sends a real, visible test message to cfg.channelId right now: if it
+// doesn't show up in the channel the admin is watching, the configured ID
+// simply isn't that channel (wrong pick, stale entry, duplicate title, etc).
+bot.action('ap_verify_dest', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const cfg = getAutopostConfig(ctx.from.id);
+    if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a destination channel first.'); return; }
+    await ctx.answerCbQuery('🔍 Sending test message...');
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    try {
+        const chat = await ctx.telegram.getChat(cfg.channelId);
+        await ctx.telegram.sendMessage(cfg.channelId, `🔍 Auto-Post verification — ${timestamp} IST\n\nIf you can see this message in your channel, the destination is correct.`);
+        await ctx.reply(
+            `✅ Message sent successfully.\n\n` +
+            `*Chat reached:* ${chat.title || chat.username || chat.id}\n` +
+            `*ID:* \`${chat.id}\`\n` +
+            `*Type:* ${chat.type}\n\n` +
+            `Now go check that exact channel — if the test message with the timestamp above isn't there, this ID does *not* point to the channel you're watching. Common cause: an older/duplicate entry with the same name was picked from the list. Re-run 📤 Set Destination Channel and pick carefully, or type the @username/ID manually to be sure.`,
+            { parse_mode: 'Markdown' }
+        );
+    } catch (error) {
+        await logDestinationUnreachable(ctx.from.id, cfg.channelId, error);
+        await ctx.reply(`❌ Could not reach \`${cfg.channelId}\`: ${error.description || error.message}\n\nRe-set it via 📤 Set Destination Channel.`, { parse_mode: 'Markdown' });
+    }
 });
 
 // --- Source channel (where videos are pulled FROM, distinct from the

@@ -2324,20 +2324,23 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
 
     const deepLink = `https://t.me/${botUsername}?start=${encodeFileTag(file.chat_id, file.message_id)}`;
     const keyboard = { inline_keyboard: [[{ text: '🎬 Get Full Video', url: deepLink }]] };
+    // The button alone isn't copy/forward-friendly on every client, so the
+    // same link is also included as plain text in the caption.
+    const captionWithLink = `${cfg.caption}\n\n🔗 ${deepLink}`;
 
     if (preview) {
         const msg = await bot.telegram.sendPhoto(adminId, thumbSource, {
-            caption: `🧪 Preview\n\n${cfg.caption}`,
+            caption: `🧪 Preview\n\n${captionWithLink}`,
             reply_markup: { inline_keyboard: [
                 [{ text: '✅ Post to Channel', callback_data: 'ap_confirm' }, { text: '❌ Skip', callback_data: 'ap_cancel' }]
             ] }
         });
-        pendingAutopostPreview[adminId] = { tag, caption: cfg.caption, thumbSource, keyboard };
+        pendingAutopostPreview[adminId] = { tag, caption: captionWithLink, thumbSource, keyboard };
         return { previewed: true };
     }
 
     try {
-        await bot.telegram.sendPhoto(cfg.channelId, thumbSource, { caption: cfg.caption, reply_markup: keyboard });
+        await bot.telegram.sendPhoto(cfg.channelId, thumbSource, { caption: captionWithLink, reply_markup: keyboard });
         markAutopostTagPosted(adminId, tag);
         return { posted: true, tag };
     } catch (err) {
@@ -2552,7 +2555,7 @@ bot.action('ap_interval_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     const cfg = getAutopostConfig(ctx.from.id);
-    const minuteRow = [15, 30, 45].map(m => ({ text: `${m}m`, callback_data: `ap_interval:${m}` }));
+    const minuteRow = [1, 15, 30, 45].map(m => ({ text: `${m}m`, callback_data: `ap_interval:${m}` }));
     const hourRow = [1, 3, 6, 12, 24].map(h => ({ text: `${h}h`, callback_data: `ap_interval:${h * 60}` }));
     await ctx.editMessageText(`⏱ *Auto-Post Interval*\n\nCurrent: ${formatIntervalMinutes(cfg.intervalMinutes)}`, {
         parse_mode: 'Markdown',
@@ -3319,7 +3322,7 @@ process.on('uncaughtException', (error) => {
     logError('Uncaught exception', error);
 });
 
-bot.telegram.getMe().then(botInfo => {
+bot.telegram.getMe().then(async botInfo => {
     botUsername = botInfo.username;
     console.log(`🤖 Bot username: @${botUsername}`);
 
@@ -3328,37 +3331,48 @@ bot.telegram.getMe().then(botInfo => {
     console.log('📁 Temp directory:', os.tmpdir());
     console.log('🔗 Bot invite link: https://t.me/' + botUsername);
 
-    bot.launch()
-        .then(async () => {
-            console.log('✅ Bot started successfully!');
-            console.log('🔗 Ready to process MEGA links in all chat types...');
-            console.log('\n=== IMPORTANT FOR GROUPS/CHANNELS ===');
-            console.log('1. Add bot to group/channel as ADMIN');
-            console.log('2. Enable these permissions:');
-            console.log('   • Read messages (IMPORTANT!)');
-            console.log('   • Send messages');
-            console.log('   • Send media');
-            console.log('   • Send documents');
-            console.log('3. Users can then just send MEGA links');
-            console.log('====================================');
-            await setupCommandMenus();
+    // IMPORTANT: bot.launch() in long-polling mode returns a Promise that
+    // only resolves once the bot is *stopped* — it never resolves during
+    // normal operation. Anything placed in a `.then()` after it therefore
+    // never runs while the bot is up. So all one-time startup work AND the
+    // background schedulers (scheduled broadcasts, auto-post ticks, delayed
+    // join approvals) are set up here, before launch() is called — not
+    // chained after it.
+    await setupCommandMenus();
 
-            // Background schedulers: scheduled broadcasts + per-admin auto-posts.
-            // Checked every 60s — cheap and frequent enough for hour-scale intervals.
-            setInterval(() => {
-                processDueScheduledBroadcasts().catch(err => logError('Scheduled broadcast tick', err));
-            }, 60 * 1000);
-            setInterval(() => {
-                processAutopostTicks().catch(err => logError('Auto-post tick', err));
-            }, 60 * 1000);
-            setInterval(() => {
-                processDelayedJoinApprovals().catch(err => logError('Delayed join approval tick', err));
-            }, 60 * 1000);
-        })
+    // Background schedulers: scheduled broadcasts + per-admin auto-posts +
+    // delayed join approvals. Checked every 60s — cheap and frequent enough
+    // for hour-scale intervals.
+    setInterval(() => {
+        processDueScheduledBroadcasts().catch(err => logError('Scheduled broadcast tick', err));
+    }, 60 * 1000);
+    setInterval(() => {
+        processAutopostTicks().catch(err => logError('Auto-post tick', err));
+    }, 60 * 1000);
+    setInterval(() => {
+        processDelayedJoinApprovals().catch(err => logError('Delayed join approval tick', err));
+    }, 60 * 1000);
+
+    bot.launch()
         .catch(err => {
             console.error('❌ Failed to start bot:', err);
+            logError('Bot launch', err);
             process.exit(1);
         });
+
+    // launch() won't resolve while running (see note above), so log
+    // "started" right after kicking it off rather than waiting on it.
+    console.log('✅ Bot started successfully!');
+    console.log('🔗 Ready to process MEGA links in all chat types...');
+    console.log('\n=== IMPORTANT FOR GROUPS/CHANNELS ===');
+    console.log('1. Add bot to group/channel as ADMIN');
+    console.log('2. Enable these permissions:');
+    console.log('   • Read messages (IMPORTANT!)');
+    console.log('   • Send messages');
+    console.log('   • Send media');
+    console.log('   • Send documents');
+    console.log('3. Users can then just send MEGA links');
+    console.log('====================================');
 }).catch(err => {
     console.error('❌ Failed to get bot info:', err);
     process.exit(1);

@@ -96,6 +96,15 @@ async function startMtproto() {
 }
 let botUsername = '';
 
+// Telegram throws this whenever editMessageText/editMessageCaption is called
+// with content+markup identical to what's already displayed (e.g. pressing
+// "Back" into a panel that hasn't changed since it was last drawn). It's
+// not a bug — nothing needs to change — so it's treated as a harmless no-op
+// everywhere rather than logged as an error.
+function isMessageNotModifiedError(error) {
+    return !!(error && error.description && error.description.includes('message is not modified'));
+}
+
 // --- Error log channel ---
 // Sends bot errors/events to an admin-configured Telegram chat (set via
 // /setlogchannel) so crashes/bugs and auto-post issues can be spotted
@@ -2426,7 +2435,11 @@ async function renderAutopostPanel(ctx) {
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
-    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+    try {
+        await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+    } catch (error) {
+        if (!isMessageNotModifiedError(error)) throw error;
+    }
 }
 
 bot.action('ap_menu', async (ctx) => {
@@ -3294,6 +3307,7 @@ bot.catch((err, ctx) => {
 // already try/caught locally, so a single bad update can't crash the bot
 // silently — it gets logged (and sent to the error log channel if set).
 bot.catch((error, ctx) => {
+    if (isMessageNotModifiedError(error)) return; // harmless no-op, nothing to fix or log
     logError(`Handler error (${ctx.updateType})`, error);
 });
 

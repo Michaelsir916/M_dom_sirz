@@ -27,8 +27,32 @@ const DEFAULT_CONFIG = {
     maintenanceMode: false,      // true = bot only responds to admins + whitelisted users
     maintenanceWhitelist: [],    // user ids (strings) allowed through during maintenance
     megaUploadMode: 'personal',  // 'personal' = files go to whichever chat sent the link, 'channel' = always to megaUploadChannelId
-    megaUploadChannelId: null    // destination channel for admin's MEGA links when megaUploadMode is 'channel'
+    megaUploadChannelId: null,   // destination channel for admin's MEGA links when megaUploadMode is 'channel'
+    aboutJoinGroupLink: null,    // url shown on the "👥 Join Group" button in the non-admin About panel
+    aboutLinkText: 'Click Here', // custom clickable hyperlink text shown in the non-admin About panel
+    aboutLinkUrl: null           // url that aboutLinkText links to
 };
+
+// ===== Config backup (used by /backupconfig) =====
+// Every JSON data file the bot persists, so a single zip captures everything
+// needed to restore state after a "config reset" (corrupted file, bad
+// Termux kill mid-write, accidental delete, etc).
+const CONFIG_BACKUP_FILES = [
+    { path: CONFIG_PATH, name: 'config.json' },
+    { path: FILES_PATH, name: 'shared_files.json' },
+    { path: USERS_PATH, name: 'share_users.json' },
+    { path: KNOWN_CHATS_PATH, name: 'known_chats.json' },
+    { path: BROADCAST_HISTORY_PATH, name: 'broadcast_history.json' },
+    { path: SCHEDULED_BROADCASTS_PATH, name: 'scheduled_broadcasts.json' },
+    { path: AUTOPOST_PATH, name: 'autopost_configs.json' },
+    { path: PENDING_JOIN_REQUESTS_PATH, name: 'pending_join_requests.json' }
+];
+
+// Only returns files that actually exist yet (a fresh install may not have
+// created shared_files.json, autopost_configs.json, etc.).
+function getConfigBackupFiles() {
+    return CONFIG_BACKUP_FILES.filter(f => fs.existsSync(f.path));
+}
 
 function atomicWrite(filePath, data) {
     const tmpPath = filePath + '.tmp';
@@ -639,6 +663,16 @@ function markJoinRequestApproved(chatId, userId) {
     }
 }
 
+// True once this user's "pending" mode join request has actually been
+// approved (auto-approved after delayHours, or approved manually) — i.e.
+// they were genuinely added to the group, not just that they once tapped
+// the request-to-join link. Used to decide whether a live re-check against
+// the group is warranted (see checkMembership's join→leave→rejoin guard).
+function isJoinRequestApproved(chatId, userId) {
+    const rec = loadPendingJoinRequests().find(r => String(r.chatId) === String(chatId) && String(r.userId) === String(userId));
+    return !!(rec && rec.approved);
+}
+
 // Due = not yet approved, and the group's configured delay has elapsed.
 // Groups with delayHours=0 never show up here (manual-only approval).
 function getDueJoinRequestsForApproval() {
@@ -733,9 +767,11 @@ module.exports = {
     recordJoinRequest,
     hasJoinRequest,
     markJoinRequestApproved,
+    isJoinRequestApproved,
     getDueJoinRequestsForApproval,
     isMaintenanceAllowed,
     addMaintenanceWhitelist,
     removeMaintenanceWhitelist,
-    getMaintenanceWhitelist
+    getMaintenanceWhitelist,
+    getConfigBackupFiles
 };

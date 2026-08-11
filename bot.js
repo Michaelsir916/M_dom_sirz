@@ -45,6 +45,7 @@ const {
     markAutopostTagSkipped,
     incrementAutopostRetry,
     clearAutopostRetry,
+    getAutopostStats,
     getForceSubSettings,
     setForceSubSettings,
     recordJoinRequest,
@@ -95,6 +96,7 @@ async function startMtproto() {
     }
 }
 let botUsername = '';
+const botStartedAt = Date.now();
 
 // Telegram throws this whenever editMessageText/editMessageCaption is called
 // with content+markup identical to what's already displayed (e.g. pressing
@@ -2267,12 +2269,16 @@ async function handleAutopostFailure(adminId, tag, reason) {
 // — setup-time only. Scheduled runs (preview=false) post directly, no confirm.
 //
 // Videos are pulled from the admin's own configured **Source Channel**
-// (cfg.sourceChannelId) — isolated per admin, distinct from the destination
+// (cfg.sourceChannelIds) — isolated per admin, distinct from the destination
 // Channel that receives the post itself.
+// Queue is considered "low" once fewer than this many unposted videos
+// remain — triggers one warning (not a repeat every tick) until restocked.
+const LOW_QUEUE_THRESHOLD = 3;
+
 async function runAutopostForAdmin(adminId, { preview = false } = {}) {
     const cfg = getAutopostConfig(adminId);
     if (!cfg.channelId) return { error: 'no_channel' };
-    if (!cfg.sourceChannelId) {
+    if (!cfg.sourceChannelIds || cfg.sourceChannelIds.length === 0) {
         await logAutopostEvent(
             `⚠️ *Auto-Post: No Source Channel*\n\n*Admin:* \`${adminId}\`\nSet a Source Channel in the Auto-Post menu first.`,
             `ap-nosource:${adminId}`
@@ -2280,11 +2286,26 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
         return { error: 'no_source' };
     }
 
-    const files = loadSharedFiles().filter(f => f.type === 'video' && String(f.chat_id) === String(cfg.sourceChannelId));
+    const sourceIds = cfg.sourceChannelIds.map(String);
+    const files = loadSharedFiles().filter(f => f.type === 'video' && sourceIds.includes(String(f.chat_id)));
     const unposted = files.filter(f => !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`));
+
+    // Low-queue warning: fires once when the queue drops below the
+    // threshold, and resets (so it can fire again later) once restocked —
+    // avoids both silence and every-tick spam.
+    if (unposted.length < LOW_QUEUE_THRESHOLD && !cfg.lowQueueWarned) {
+        setAutopostConfig(adminId, { lowQueueWarned: true });
+        await logAutopostEvent(
+            `⚠️ *Auto-Post: Queue Running Low*\n\n*Admin:* \`${adminId}\`\n*Remaining:* ${unposted.length} unposted video(s)\n\nAdd more videos to your source channel(s) soon.`,
+            `ap-lowqueue:${adminId}`
+        );
+    } else if (unposted.length >= LOW_QUEUE_THRESHOLD && cfg.lowQueueWarned) {
+        setAutopostConfig(adminId, { lowQueueWarned: false });
+    }
+
     if (unposted.length === 0) {
         await logAutopostEvent(
-            `ℹ️ *Auto-Post: Nothing To Post*\n\n*Admin:* \`${adminId}\`\nNo new (unposted) videos in the source channel yet.`,
+            `ℹ️ *Auto-Post: Nothing To Post*\n\n*Admin:* \`${adminId}\`\nNo new (unposted) videos in the source channel(s) yet.`,
             `ap-empty:${adminId}`
         );
         return { error: 'no_files' };
@@ -2388,7 +2409,7 @@ function parseIntervalToMinutes(input) {
 // Checked every minute — fires any admin's auto-post whose interval has elapsed.
 async function processAutopostTicks() {
     for (const cfg of getAllAutopostConfigs()) {
-        if (!cfg.enabled || !cfg.channelId || !cfg.sourceChannelId || !cfg.intervalMinutes) continue;
+        if (!cfg.enabled || !cfg.channelId || !cfg.sourceChannelIds || cfg.sourceChannelIds.length === 0 || !cfg.intervalMinutes) continue;
         const dueAt = (cfg.lastPostAt || 0) + cfg.intervalMinutes * 60 * 1000;
         if (Date.now() < dueAt) continue;
         try {
@@ -2400,32 +2421,62 @@ async function processAutopostTicks() {
     }
 }
 
+// Sends one summary to the log channel per calendar day (IST), covering
+// every admin who has any auto-post config at all — running or paused —
+// so "no news" doesn't get mistaken for "nothing is happening". Silence
+// elsewhere (retries, skips, chat-not-found, etc.) is otherwise the only
+// signal something's wrong; this gives a positive "still alive" signal too.
+let lastHealthReportDate = null;
+async function checkDailyHealthReport() {
+    const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // "YYYY-MM-DD" in IST
+    if (lastHealthReportDate === todayStr) return; // already sent today
+    lastHealthReportDate = todayStr;
+
+    const configs = getAllAutopostConfigs().filter(c => c.channelId || (c.sourceChannelIds && c.sourceChannelIds.length > 0));
+    const uptimeHrs = ((Date.now() - botStartedAt) / (1000 * 60 * 60)).toFixed(1);
+
+    const lines = [`🩺 *Daily Health Check* — ${todayStr}`, '', `Uptime: ${uptimeHrs}h`, `Auto-Post admins configured: ${configs.length}`];
+    for (const cfg of configs) {
+        const stats = getAutopostStats(cfg.adminId);
+        const sourceIds = (cfg.sourceChannelIds || []).map(String);
+        const queueCount = sourceIds.length > 0
+            ? loadSharedFiles().filter(f => f.type === 'video' && sourceIds.includes(String(f.chat_id)) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
+            : 0;
+        lines.push(`• Admin \`${cfg.adminId}\`: ${cfg.enabled ? '✅ Running' : '⏸ Paused'} | Queue: ${queueCount}${queueCount < LOW_QUEUE_THRESHOLD ? ' ⚠️' : ''} | Posted today: ${stats.today}`);
+    }
+    if (configs.length === 0) lines.push('_No admin has configured Auto-Post yet._');
+
+    await sendToLogChannel(lines.join('\n'));
+}
+
 async function renderAutopostPanel(ctx) {
     const adminId = ctx.from.id;
     const cfg = getAutopostConfig(adminId);
     const channelLabel = cfg.channelId
         ? `${getKnownChats().find(c => String(c.id) === String(cfg.channelId))?.title || '?'} (\`${cfg.channelId}\`)`
         : 'Not set';
-    const sourceLabel = cfg.sourceChannelId
-        ? `${getKnownChats().find(c => String(c.id) === String(cfg.sourceChannelId))?.title || '?'} (\`${cfg.sourceChannelId}\`)`
+    const sourceIds = cfg.sourceChannelIds || [];
+    const sourceLabel = sourceIds.length > 0
+        ? sourceIds.map(id => getKnownChats().find(c => String(c.id) === String(id))?.title || id).join(', ')
         : 'Not set';
-    const queueCount = cfg.sourceChannelId
-        ? loadSharedFiles().filter(f => f.type === 'video' && String(f.chat_id) === String(cfg.sourceChannelId) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
+    const queueCount = sourceIds.length > 0
+        ? loadSharedFiles().filter(f => f.type === 'video' && sourceIds.map(String).includes(String(f.chat_id)) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
         : 0;
+    const stats = getAutopostStats(adminId);
     const text = '🖼 *Auto-Post* (only visible/controllable by you)\n\n' +
-        `Source Channel: ${sourceLabel} (videos are pulled from here)\n` +
+        `Source Channels (${sourceIds.length}): ${sourceLabel} (videos are pulled from here)\n` +
         `Destination Channel: ${channelLabel} (posts go here)\n` +
-        `Queue: ${queueCount} unposted video(s) waiting\n` +
+        `Queue: ${queueCount} unposted video(s) waiting${queueCount < LOW_QUEUE_THRESHOLD ? ' ⚠️ low' : ''}\n` +
         `Interval: ${cfg.intervalMinutes === 0 ? 'Not set' : 'Every ' + formatIntervalMinutes(cfg.intervalMinutes)}\n` +
         `Caption: "${cfg.caption}"\n` +
         `Thumbnail: ${cfg.thumbnailMode === 'custom' ? (cfg.customThumbnailFileId ? 'Custom (uploaded)' : 'Custom (not uploaded yet!)') : "Video's own"}\n` +
         `Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}${sharp ? '' : ' (⚠️ sharp not installed — run npm install)'}\n` +
         `Status: ${cfg.enabled ? '✅ Running' : '⏸ Paused'}\n` +
-        `Posted so far: ${cfg.postedTags.length}`;
+        `Posted: ${stats.today} today, ${stats.week} this week, ${stats.allTime} all-time`;
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '📥 Set Source Channel', callback_data: 'ap_setsource_menu' }],
+            [{ text: '➕ Add Source Channel', callback_data: 'ap_setsource_menu' }, { text: '➖ Remove Source Channel', callback_data: 'ap_removesource_menu' }],
             [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }],
             [{ text: '🔍 Verify Destination (sends a test message)', callback_data: 'ap_verify_dest' }],
             [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }],
@@ -2434,7 +2485,7 @@ async function renderAutopostPanel(ctx) {
             [{ text: '📤 Upload Custom Thumbnail', callback_data: 'ap_thumb_upload' }],
             [{ text: `🔵 Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}`, callback_data: 'ap_blur_toggle' }],
             [{ text: cfg.enabled ? '⏸ Pause' : '▶️ Enable', callback_data: 'ap_toggle_enabled' }],
-            [{ text: '🧪 Test Preview', callback_data: 'ap_test' }],
+            [{ text: '🧪 Test Preview', callback_data: 'ap_test' }, { text: '📊 Stats', callback_data: 'ap_stats' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
@@ -2520,11 +2571,13 @@ bot.action('ap_verify_dest', async (ctx) => {
 bot.action('ap_setsource_menu', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
-    const { rows, truncated, total } = knownChatPickerKeyboard([], 'ap_setsource', 'ap_menu', ctx.from.id);
+    const cfg = getAutopostConfig(ctx.from.id);
+    const exclude = [...(cfg.sourceChannelIds || []), ...(cfg.channelId ? [cfg.channelId] : [])];
+    const { rows, truncated, total } = knownChatPickerKeyboard(exclude, 'ap_setsource', 'ap_menu', ctx.from.id);
     const note = total === 0
-        ? '_I haven\'t seen any channels yet — add me to yours as admin first, or type an ID/@username._'
+        ? '_No more known channels to add — add me to a new one as admin first, or type an ID/@username._'
         : truncated ? `_Showing 20 of ${total} known chats._` : '';
-    await ctx.editMessageText(`📥 *Set Your Auto-Post Source Channel*\n\nI'll pull videos from here (new posts only). Must be different from your destination channel.\n\n${note}`, {
+    await ctx.editMessageText(`➕ *Add Auto-Post Source Channel*\n\nI'll pull videos from here (new posts only). You can add more than one — currently ${(cfg.sourceChannelIds || []).length} source channel(s) set. Must be different from your destination channel.\n\n${note}`, {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: rows }
     });
@@ -2533,11 +2586,18 @@ bot.action('ap_setsource_menu', async (ctx) => {
 bot.action(/^ap_setsource:(-?\d+)$/, async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     const chatId = Number(ctx.match[1]);
-    setAutopostConfig(ctx.from.id, { sourceChannelId: chatId });
+    const cfg = getAutopostConfig(ctx.from.id);
+    if (cfg.channelId && String(chatId) === String(cfg.channelId)) {
+        await ctx.answerCbQuery('⚠️ That\'s your destination channel — pick a different one.');
+        return;
+    }
+    const ids = new Set((cfg.sourceChannelIds || []).map(String));
+    ids.add(String(chatId));
+    setAutopostConfig(ctx.from.id, { sourceChannelIds: Array.from(ids).map(Number) });
     const chat = getKnownChats().find(c => String(c.id) === String(chatId));
-    await ctx.answerCbQuery('✅ Source channel set');
-    await ctx.editMessageText(`✅ Auto-post source channel set to "${chat ? chat.title : chatId}".\n\nNew videos posted there from now on will be picked up automatically.`, {
-        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'ap_menu' }]] }
+    await ctx.answerCbQuery('✅ Source channel added');
+    await ctx.editMessageText(`✅ Added "${chat ? chat.title : chatId}" as a source channel.\n\nNew videos posted there from now on will be picked up automatically.`, {
+        reply_markup: { inline_keyboard: [[{ text: '➕ Add Another', callback_data: 'ap_setsource_menu' }], [{ text: '🔙 Back', callback_data: 'ap_menu' }]] }
     });
 });
 
@@ -2545,9 +2605,41 @@ bot.action('ap_setsource_manual', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'ap_setsource_manual' };
-    await ctx.editMessageText('⌨️ Send the source channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
+    await ctx.editMessageText('⌨️ Send the source channel ID (e.g. `-1001234567890`) or `@username` to add.\n\nI must already be admin there. Send /cancel to abort.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
+    });
+});
+
+// --- Remove a source channel ---
+bot.action('ap_removesource_menu', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const cfg = getAutopostConfig(ctx.from.id);
+    if (!cfg.sourceChannelIds || cfg.sourceChannelIds.length === 0) {
+        await ctx.editMessageText('No source channels set yet.', { reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'ap_menu' }]] } });
+        return;
+    }
+    const rows = cfg.sourceChannelIds.map(id => {
+        const chat = getKnownChats().find(c => String(c.id) === String(id));
+        return [{ text: `❌ ${chat ? chat.title : id}`, callback_data: `ap_removesource:${id}` }];
+    });
+    rows.push([{ text: '🔙 Back', callback_data: 'ap_menu' }]);
+    await ctx.editMessageText('➖ *Remove a Source Channel*\n\nTap one to remove it (videos already tracked from it stay in the queue).', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^ap_removesource:(-?\d+)$/, async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    const chatId = Number(ctx.match[1]);
+    const cfg = getAutopostConfig(ctx.from.id);
+    const remaining = (cfg.sourceChannelIds || []).filter(id => String(id) !== String(chatId));
+    setAutopostConfig(ctx.from.id, { sourceChannelIds: remaining });
+    await ctx.answerCbQuery('✅ Removed');
+    await ctx.editMessageText(`✅ Removed. ${remaining.length} source channel(s) remaining.`, {
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'ap_menu' }]] }
     });
 });
 
@@ -2624,7 +2716,7 @@ bot.action('ap_toggle_enabled', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     const cfg = getAutopostConfig(ctx.from.id);
     if (!cfg.enabled) {
-        if (!cfg.sourceChannelId) { await ctx.answerCbQuery('⚠️ Set a source channel first.'); return; }
+        if (!cfg.sourceChannelIds || cfg.sourceChannelIds.length === 0) { await ctx.answerCbQuery('⚠️ Set a source channel first.'); return; }
         if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a destination channel first.'); return; }
         if (!cfg.intervalMinutes) { await ctx.answerCbQuery('⚠️ Set an interval first.'); return; }
     }
@@ -2633,15 +2725,28 @@ bot.action('ap_toggle_enabled', async (ctx) => {
     await renderAutopostPanel(ctx);
 });
 
+bot.action('ap_stats', async (ctx) => {
+    if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    const stats = getAutopostStats(ctx.from.id);
+    await ctx.reply(
+        `📊 *Auto-Post Stats*\n\n` +
+        `Today: ${stats.today}\n` +
+        `This week: ${stats.week}\n` +
+        `All-time: ${stats.allTime}`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
 bot.action('ap_test', async (ctx) => {
     if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery();
     const cfg = getAutopostConfig(ctx.from.id);
-    if (!cfg.sourceChannelId) { await ctx.answerCbQuery('⚠️ Set a source channel first.'); return; }
+    if (!cfg.sourceChannelIds || cfg.sourceChannelIds.length === 0) { await ctx.answerCbQuery('⚠️ Set a source channel first.'); return; }
     if (!cfg.channelId) { await ctx.answerCbQuery('⚠️ Set a destination channel first.'); return; }
     await ctx.answerCbQuery('🧪 Generating preview...');
     const result = await runAutopostForAdmin(ctx.from.id, { preview: true });
-    if (result.error === 'no_files') await ctx.reply('⚠️ No unposted videos in the source channel yet.');
-    else if (result.error === 'no_source') await ctx.reply('⚠️ Set a source channel first (🖼 Auto-Post → 📥 Set Source Channel).');
+    if (result.error === 'no_files') await ctx.reply('⚠️ No unposted videos in the source channel(s) yet.');
+    else if (result.error === 'no_source') await ctx.reply('⚠️ Set a source channel first (🖼 Auto-Post → ➕ Add Source Channel).');
     else if (result.error === 'no_thumbnail_retry') await ctx.reply('⚠️ Could not read a thumbnail from that video — will retry automatically. Try again, or upload a custom thumbnail instead (🖼 Thumbnail Source → Custom).');
     else if (result.error === 'no_thumbnail_skipped') await ctx.reply('⚠️ Could not read a thumbnail after 2 attempts — that video was permanently skipped (see log channel). Try uploading a custom thumbnail instead (🖼 Thumbnail Source → Custom).');
 });
@@ -2798,12 +2903,12 @@ bot.action('menu_back', async (ctx) => {
 // True if `chatId` should have its photo/video posts tracked into the
 // shared file pool — either the bot-wide legacy Source Group/Channel
 // (config.sourceGroupId, feeds /random etc.), or any admin's per-admin
-// Auto-Post Source Channel (cfg.sourceChannelId). Storage stays a single
+// Auto-Post Source Channels (cfg.sourceChannelIds). Storage stays a single
 // shared pool either way; each admin's auto-post just filters it down to
 // their own sourceChannelId later (see runAutopostForAdmin).
 function isTrackedSourceChat(chatId, config) {
     if (config.sourceGroupId && String(chatId) === String(config.sourceGroupId)) return true;
-    return getAllAutopostConfigs().some(c => c.sourceChannelId && String(c.sourceChannelId) === String(chatId));
+    return getAllAutopostConfigs().some(c => (c.sourceChannelIds || []).some(id => String(id) === String(chatId)));
 }
 
 // Group/channel chat: tracks photo/video files posted in the configured
@@ -2853,9 +2958,12 @@ bot.on(['photo', 'video', 'animation'], async (ctx) => {
     if (!ctx.message.photo && !ctx.message.video) return; // ignore animations for the source pool
 
     const type = Array.isArray(ctx.message.photo) ? 'photo' : 'video';
-    const added = addSharedFile(ctx.chat.id, ctx.message.message_id, type);
+    const fileUniqueId = type === 'video' ? ctx.message.video.file_unique_id : ctx.message.photo[ctx.message.photo.length - 1].file_unique_id;
+    const added = addSharedFile(ctx.chat.id, ctx.message.message_id, type, fileUniqueId);
     if (added) {
         console.log(`Tracked ${type} msg #${ctx.message.message_id} in share pool`);
+    } else {
+        console.log(`Duplicate ${type} msg #${ctx.message.message_id} — already in share pool, skipped`);
     }
 });
 
@@ -2952,9 +3060,12 @@ bot.on('channel_post', async (ctx) => {
         const config = loadConfig();
         if (isTrackedSourceChat(ctx.chat.id, config)) {
             const type = post.photo ? 'photo' : 'video';
-            const added = addSharedFile(ctx.chat.id, post.message_id, type);
+            const fileUniqueId = type === 'video' ? post.video.file_unique_id : post.photo[post.photo.length - 1].file_unique_id;
+            const added = addSharedFile(ctx.chat.id, post.message_id, type, fileUniqueId);
             if (added) {
                 console.log(`Tracked ${type} msg #${post.message_id} in share pool (channel)`);
+            } else {
+                console.log(`Duplicate ${type} msg #${post.message_id} — already in share pool, skipped (channel)`);
             }
         }
         return;
@@ -3149,9 +3260,16 @@ async function handlePendingAction(ctx, text) {
             return;
         }
         recordKnownChat(chat.id, chat.title, chat.type);
-        setAutopostConfig(userId, { sourceChannelId: chat.id });
+        const cfg = getAutopostConfig(userId);
+        if (cfg.channelId && String(cfg.channelId) === String(chat.id)) {
+            await ctx.reply(`⚠️ "${chat.title}" is already your destination channel — pick a different one, or /cancel.`);
+            return;
+        }
+        const ids = new Set((cfg.sourceChannelIds || []).map(String));
+        ids.add(String(chat.id));
+        setAutopostConfig(userId, { sourceChannelIds: Array.from(ids).map(Number) });
         delete pendingAction[userId];
-        await ctx.reply(`✅ Auto-post source set to "${chat.title}". New videos posted there will be picked up automatically.`);
+        await ctx.reply(`✅ Added "${chat.title}" as a source channel. New videos posted there will be picked up automatically.`);
         return;
     }
 
@@ -3348,6 +3466,9 @@ bot.telegram.getMe().then(async botInfo => {
     }, 60 * 1000);
     setInterval(() => {
         processAutopostTicks().catch(err => logError('Auto-post tick', err));
+    }, 60 * 1000);
+    setInterval(() => {
+        checkDailyHealthReport().catch(err => logError('Daily health check', err));
     }, 60 * 1000);
     setInterval(() => {
         processDelayedJoinApprovals().catch(err => logError('Delayed join approval tick', err));

@@ -2183,6 +2183,27 @@ async function downloadTelegramFile(fileId) {
     }
 }
 
+// The destination channel itself is unreachable (bot removed as admin,
+// channel deleted, wrong/stale ID). This is a config problem, not a video
+// problem — reported distinctly from per-video retry/skip so admins get a
+// clear "go fix your channel setting" pointer instead of a confusing video
+// error. Deduped per admin+channel so a broken channel doesn't spam every
+// tick.
+async function logDestinationUnreachable(adminId, channelId, err) {
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    await logAutopostEvent(
+        `🚫 *Auto-Post: Destination Channel Unreachable*\n\n` +
+        `*When:* ${timestamp} IST\n` +
+        `*Admin:* \`${adminId}\`\n` +
+        `*Channel ID:* \`${channelId}\`\n` +
+        `*Error:* ${err.description || err.message}\n\n` +
+        `This isn't a video problem — the destination channel can't be reached ` +
+        `(I may have been removed as admin, the channel may have been deleted, ` +
+        `or the ID is wrong). Re-set it via 🖼 Auto-Post → 📤 Set Destination Channel.`,
+        `ap-nodest:${adminId}:${channelId}`
+    );
+}
+
 // A single video is retried at most this many times (across ticks) before
 // it's permanently given up on and marked skipped.
 const MAX_AUTOPOST_RETRIES = 2;
@@ -2304,6 +2325,14 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
         if (err.description && (err.description.includes('file') || err.description.includes('photo'))) {
             const outcome = await handleAutopostFailure(adminId, tag, `Telegram rejected the post: ${err.description}`);
             return { error: outcome === 'skipped' ? 'bad_thumbnail_skipped' : 'bad_thumbnail_retry' };
+        }
+        if (err.description && err.description.toLowerCase().includes('chat not found')) {
+            // Not a video problem — the destination channel itself can't be
+            // reached (bot removed as admin, channel deleted, wrong ID,
+            // etc). Don't count this against the video's retry budget —
+            // it'll be the very next video posted once the channel is fixed.
+            await logDestinationUnreachable(adminId, cfg.channelId, err);
+            return { error: 'destination_unreachable' };
         }
         await logError(`Auto-post send (admin ${adminId}, tag ${tag})`, err);
         throw err;
@@ -2575,8 +2604,14 @@ bot.action('ap_confirm', async (ctx) => {
         await ctx.answerCbQuery('✅ Posted!');
         await ctx.editMessageCaption('✅ Posted to channel.').catch(() => {});
     } catch (error) {
-        await ctx.answerCbQuery('❌ Failed to post.');
-        logError('Auto-post confirm', error);
+        if (error.description && error.description.toLowerCase().includes('chat not found')) {
+            await logDestinationUnreachable(ctx.from.id, cfg.channelId, error);
+            await ctx.answerCbQuery('❌ Destination channel unreachable.');
+            await ctx.editMessageCaption('🚫 Failed — destination channel not found. I may have been removed as admin there, or the channel was deleted/ID is wrong. Re-set it via 📤 Set Destination Channel.').catch(() => {});
+        } else {
+            await ctx.answerCbQuery('❌ Failed to post.');
+            logError('Auto-post confirm', error);
+        }
     }
     delete pendingAutopostPreview[ctx.from.id];
 });

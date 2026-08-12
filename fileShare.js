@@ -9,6 +9,7 @@ const BROADCAST_HISTORY_PATH = path.join(__dirname, 'broadcast_history.json');
 const SCHEDULED_BROADCASTS_PATH = path.join(__dirname, 'scheduled_broadcasts.json');
 const AUTOPOST_PATH = path.join(__dirname, 'autopost_configs.json');
 const PENDING_JOIN_REQUESTS_PATH = path.join(__dirname, 'pending_join_requests.json');
+const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -30,7 +31,9 @@ const DEFAULT_CONFIG = {
     megaUploadChannelId: null,   // destination channel for admin's MEGA links when megaUploadMode is 'channel'
     aboutJoinGroupLink: null,    // url shown on the "👥 Join Group" button in the non-admin About panel
     aboutLinkText: 'Click Here', // custom clickable hyperlink text shown in the non-admin About panel
-    aboutLinkUrl: null           // url that aboutLinkText links to
+    aboutLinkUrl: null,          // url that aboutLinkText links to
+    vipChannelLink: null,        // url the "💎 Buy VIP" button sends users to
+    vipPromoText: null           // optional promo copy shown above the Join button
 };
 
 // ===== Config backup (used by /backupconfig) =====
@@ -45,7 +48,8 @@ const CONFIG_BACKUP_FILES = [
     { path: BROADCAST_HISTORY_PATH, name: 'broadcast_history.json' },
     { path: SCHEDULED_BROADCASTS_PATH, name: 'scheduled_broadcasts.json' },
     { path: AUTOPOST_PATH, name: 'autopost_configs.json' },
-    { path: PENDING_JOIN_REQUESTS_PATH, name: 'pending_join_requests.json' }
+    { path: PENDING_JOIN_REQUESTS_PATH, name: 'pending_join_requests.json' },
+    { path: VIP_CLICKS_PATH, name: 'vip_clicks.json' }
 ];
 
 // Only returns files that actually exist yet (a fresh install may not have
@@ -138,13 +142,16 @@ function getUser(users, userId) {
     if (!users[key]) {
         users[key] = {
             lastRequestAt: 0, dailyDate: '', dailyCount: 0, totalRequests: 0, seen: [],
-            referrals: [], referredBy: null, bonusCredits: 0
+            referrals: [], referredBy: null, bonusCredits: 0, joinedAt: new Date().toISOString()
         };
     }
     // Backfill fields for users created before the referral system existed
     if (users[key].referrals === undefined) users[key].referrals = [];
     if (users[key].referredBy === undefined) users[key].referredBy = null;
     if (users[key].bonusCredits === undefined) users[key].bonusCredits = 0;
+    // Not backfilled with a fake date — left undefined so "new this week"
+    // calculations only count users who actually joined after this field
+    // was introduced, instead of falsely counting old users as brand new.
     return users[key];
 }
 
@@ -324,6 +331,32 @@ function getStats() {
         totalUsers: Object.keys(users).length,
         requestsToday
     };
+}
+
+// ===== Weekly summary helpers =====
+// Counts users whose `joinedAt` (added once the field existed — see getUser)
+// falls on/after the given cutoff. Users created before this field existed
+// are simply excluded, not miscounted as new.
+function getUsersJoinedSince(sinceMs) {
+    const users = loadUsers();
+    return Object.values(users).filter(u => u.joinedAt && new Date(u.joinedAt).getTime() >= sinceMs).length;
+}
+
+// Counts pool files added on/after the given cutoff, using each file's
+// existing `added_at` timestamp (set when addSharedFile() first tracks it).
+function getFilesAddedSince(sinceMs) {
+    return loadSharedFiles().filter(f => f.added_at && new Date(f.added_at).getTime() >= sinceMs).length;
+}
+
+// Top N referrers all-time, by referral count. Used for a leaderboard
+// spotlight in the weekly summary.
+function getTopReferrers(limit = 3) {
+    const users = loadUsers();
+    return Object.entries(users)
+        .map(([id, u]) => ({ id, count: (u.referrals || []).length }))
+        .filter(r => r.count > 0)
+        .sort((a, b) => b.count - a.count)
+        .slice(0, limit);
 }
 
 // ===== Known Chats (groups/channels the bot has seen) =====
@@ -725,6 +758,32 @@ function getMaintenanceWhitelist() {
     return loadConfig().maintenanceWhitelist || [];
 }
 
+// ===== VIP promotion button click tracking =====
+// Keyed by userId -> { count, lastClickedAt }. Lets the admin see total
+// clicks and unique interested users in the VIP Promotion panel.
+function loadVipClicks() {
+    return safeReadJson(VIP_CLICKS_PATH, {});
+}
+
+function saveVipClicks(clicks) {
+    atomicWrite(VIP_CLICKS_PATH, clicks);
+}
+
+function recordVipClick(userId) {
+    const clicks = loadVipClicks();
+    const key = String(userId);
+    const existing = clicks[key] || { count: 0 };
+    clicks[key] = { count: existing.count + 1, lastClickedAt: new Date().toISOString() };
+    saveVipClicks(clicks);
+}
+
+function getVipStats() {
+    const clicks = loadVipClicks();
+    const users = Object.keys(clicks);
+    const totalClicks = users.reduce((sum, id) => sum + (clicks[id].count || 0), 0);
+    return { totalClicks, uniqueUsers: users.length };
+}
+
 module.exports = {
     loadConfig,
     saveConfig,
@@ -737,6 +796,9 @@ module.exports = {
     recordRequest,
     getAllUserIds,
     getStats,
+    getUsersJoinedSince,
+    getFilesAddedSince,
+    getTopReferrers,
     getUserStats,
     isNewUser,
     registerReferral,
@@ -773,5 +835,7 @@ module.exports = {
     addMaintenanceWhitelist,
     removeMaintenanceWhitelist,
     getMaintenanceWhitelist,
-    getConfigBackupFiles
+    getConfigBackupFiles,
+    recordVipClick,
+    getVipStats
 };

@@ -22,6 +22,9 @@ const {
     recordRequest,
     getAllUserIds,
     getStats,
+    getUsersJoinedSince,
+    getFilesAddedSince,
+    getTopReferrers,
     getUserStats,
     isNewUser,
     registerReferral,
@@ -58,7 +61,9 @@ const {
     addMaintenanceWhitelist,
     removeMaintenanceWhitelist,
     getMaintenanceWhitelist,
-    getConfigBackupFiles
+    getConfigBackupFiles,
+    recordVipClick,
+    getVipStats
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -1107,6 +1112,10 @@ async function sendJoinPrompt(ctx, groupIds) {
         return;
     }
 
+    const config = loadConfig();
+    if (config.vipChannelLink) {
+        buttons.push([{ text: '💎 Skip — Get VIP Instead', callback_data: 'vip_info' }]);
+    }
     buttons.push([{ text: '✅ I\'ve Joined — Verify', callback_data: 'recheck_sub' }]);
 
     await ctx.reply('🔒 *Tap below to request access — then tap Verify*', {
@@ -1166,6 +1175,7 @@ async function sendRandomFiles(ctx) {
 // --- User-facing: My Stats & Referrals ---
 const MY_STATS_KEYBOARD = {
     inline_keyboard: [
+        [{ text: '💎 Buy VIP', callback_data: 'vip_info' }],
         [{ text: '🎬 Free Video', callback_data: 'user_random' }],
         [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
         [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
@@ -1174,7 +1184,8 @@ const MY_STATS_KEYBOARD = {
 };
 
 // Minimal HTML-escaping for admin-supplied text/URLs dropped into an
-// HTML-parse-mode message (About panel link text, join-group link, etc).
+// HTML-parse-mode message (About panel link text, join-group link, VIP
+// promo text, etc).
 function escapeHtml(str) {
     return String(str)
         .replace(/&/g, '&amp;')
@@ -1182,6 +1193,32 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
 }
+
+// "💎 Buy VIP" — the main promo entry point. Shown on /start, the About
+// panel, and at the two moments a free user actually hits friction (daily
+// limit reached, force-sub gate) rather than on every single file delivery,
+// so it reads as a helpful upsell instead of spam.
+bot.action('vip_info', async (ctx) => {
+    await ctx.answerCbQuery();
+    recordVipClick(ctx.from.id);
+    const config = loadConfig();
+
+    if (!config.vipChannelLink) {
+        await ctx.reply('⚠️ VIP is not set up yet. Please check back soon.');
+        return;
+    }
+
+    let text = '💎 <b>VIP Access</b>';
+    if (config.vipPromoText) {
+        text += `\n\n${escapeHtml(config.vipPromoText)}`;
+    }
+
+    await ctx.reply(text, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: [[{ text: '💎 Join VIP Channel', url: config.vipChannelLink }]] }
+    });
+});
 
 // Public-facing "About" panel — shown to any regular user who taps ℹ️ About
 // on /start. Creator credit + tech stack are fixed; the join-group button
@@ -1201,6 +1238,9 @@ bot.action('user_about', async (ctx) => {
     }
 
     const keyboard = { inline_keyboard: [] };
+    if (config.vipChannelLink) {
+        keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', callback_data: 'vip_info' }]);
+    }
     if (config.aboutJoinGroupLink) {
         keyboard.inline_keyboard.push([{ text: '👥 Join Group', url: config.aboutJoinGroupLink }]);
     }
@@ -1355,6 +1395,33 @@ bot.command('unsetlogchannel', async (ctx) => {
 });
 
 // --- Admin: config backup ---
+// Zips every persisted JSON data file. Shared by the /backupconfig command
+// and the daily auto-backup scheduler below. Caller owns the returned zip
+// file and must delete it once done (sent as a document, then cleaned up).
+async function buildConfigBackupZip() {
+    const files = getConfigBackupFiles();
+    if (files.length === 0) return null;
+
+    const backupDir = path.join(os.tmpdir(), 'mega-bot-backups');
+    if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const zipPath = path.join(backupDir, `config-backup-${timestamp}.zip`);
+
+    await new Promise((resolve, reject) => {
+        const output = fs.createWriteStream(zipPath);
+        const archive = archiver('zip', { zlib: { level: 9 } });
+        output.on('close', resolve);
+        archive.on('error', reject);
+        archive.pipe(output);
+        for (const file of files) {
+            archive.file(file.path, { name: file.name });
+        }
+        archive.finalize();
+    });
+
+    return { zipPath, filename: `config-backup-${timestamp}.zip`, fileCount: files.length, fileNames: files.map(f => f.name) };
+}
+
 // Zips every persisted JSON data file and sends it to the admin, so a
 // corrupted file / bad Termux kill / accidental delete can be restored
 // from a known-good snapshot instead of starting over from defaults.
@@ -1367,38 +1434,56 @@ bot.command('backupconfig', async (ctx) => {
         return;
     }
 
-    const backupDir = path.join(os.tmpdir(), 'mega-bot-backups');
-    if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const zipPath = path.join(backupDir, `config-backup-${timestamp}.zip`);
-
     await ctx.reply(`📦 Backing up ${files.length} config file(s)...`);
 
+    let backup;
     try {
-        await new Promise((resolve, reject) => {
-            const output = fs.createWriteStream(zipPath);
-            const archive = archiver('zip', { zlib: { level: 9 } });
-            output.on('close', resolve);
-            archive.on('error', reject);
-            archive.pipe(output);
-            for (const file of files) {
-                archive.file(file.path, { name: file.name });
-            }
-            archive.finalize();
-        });
-
+        backup = await buildConfigBackupZip();
         await ctx.replyWithDocument(
-            { source: zipPath, filename: `config-backup-${timestamp}.zip` },
-            { caption: `✅ ${files.length} file(s): ${files.map(f => f.name).join(', ')}` }
+            { source: backup.zipPath, filename: backup.filename },
+            { caption: `✅ ${backup.fileCount} file(s): ${backup.fileNames.join(', ')}` }
         );
     } catch (error) {
         console.error('Backup failed:', error.message);
         await ctx.reply(`❌ Backup failed: ${error.message}`);
         await logError('backupconfig', error);
     } finally {
-        try { if (fs.existsSync(zipPath)) fs.unlinkSync(zipPath); } catch (e) { /* ignore */ }
+        if (backup) {
+            try { if (fs.existsSync(backup.zipPath)) fs.unlinkSync(backup.zipPath); } catch (e) { /* ignore */ }
+        }
     }
 });
+
+// Sends a config backup to the log channel automatically once per IST
+// calendar day — so a corrupted/lost data file can be restored even if the
+// admin forgets to run /backupconfig manually. Silently no-ops until a log
+// channel is set (/setlogchannel) since there'd be nowhere to send it.
+let lastAutoBackupDate = null;
+async function checkAutoBackup() {
+    const config = loadConfig();
+    if (!config.errorLogChatId) return;
+
+    const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // "YYYY-MM-DD" in IST
+    if (lastAutoBackupDate === todayStr) return;
+    lastAutoBackupDate = todayStr;
+
+    let backup;
+    try {
+        backup = await buildConfigBackupZip();
+        if (!backup) return; // nothing to back up yet
+        await bot.telegram.sendDocument(
+            config.errorLogChatId,
+            { source: backup.zipPath, filename: backup.filename },
+            { caption: `🗄 *Daily Auto-Backup* — ${backup.fileCount} file(s), ${todayStr} IST`, parse_mode: 'Markdown' }
+        );
+    } catch (error) {
+        logError('Auto config backup', error);
+    } finally {
+        if (backup) {
+            try { if (fs.existsSync(backup.zipPath)) fs.unlinkSync(backup.zipPath); } catch (e) { /* ignore */ }
+        }
+    }
+}
 
 // --- Admin: settings ---
 bot.command('setcount', async (ctx) => {
@@ -1669,7 +1754,8 @@ async function handleRandomRequest(ctx) {
         if (check.reason === 'cooldown') {
             await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
         } else {
-            await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`);
+            await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
+                config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
         }
         return;
     }
@@ -1714,7 +1800,8 @@ bot.action('recheck_sub', async (ctx) => {
         if (check.reason === 'cooldown') {
             await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
         } else {
-            await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`);
+            await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
+                config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
         }
         return;
     }
@@ -1824,6 +1911,7 @@ async function renderFileSharePanel(ctx) {
             [{ text: '🛠 Maintenance Mode', callback_data: 'mm_menu' }],
             [{ text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
             [{ text: '👤 About/Start Message', callback_data: 'about_menu' }],
+            [{ text: '💎 VIP Promotion', callback_data: 'vip_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
@@ -1892,6 +1980,55 @@ bot.action('about_seturl', async (ctx) => {
     pendingAction[ctx.from.id] = { type: 'about_link_url' };
     await ctx.editMessageText('🔗 Send the URL the text should link to, or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'about_menu' }]] }
+    });
+});
+
+// --- VIP Promotion (admin config for the "💎 Buy VIP" button) ---
+// The button appears on /start, the About panel, the daily-limit-reached
+// message, and the force-sub join prompt — the moments a free user actually
+// hits friction, rather than on every file delivery.
+async function renderVipPanel(ctx) {
+    const config = loadConfig();
+    const stats = getVipStats();
+    const text = '💎 *VIP Promotion*\n\n' +
+        `Channel Link: ${config.vipChannelLink || '_Not set_'}\n` +
+        `Promo Text: ${config.vipPromoText || '_Not set_'}\n\n` +
+        `📊 Button taps: ${stats.totalClicks} total, ${stats.uniqueUsers} unique user(s)\n\n` +
+        '_"💎 Buy VIP" shows on /start, About, when a user hits the daily limit, and on the force-sub join prompt._' +
+        (config.vipChannelLink ? '' : '\n\n⚠️ Set a channel link below to activate the button — it stays hidden until then.');
+
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: '🔗 Set Channel Link', callback_data: 'vip_setlink' }],
+            [{ text: '✏️ Set Promo Text', callback_data: 'vip_settext' }],
+            [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
+        ]
+    };
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.action('vip_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderVipPanel(ctx);
+});
+
+bot.action('vip_setlink', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'vip_channel_link' };
+    await ctx.editMessageText('🔗 Send the VIP channel link (e.g. `https://t.me/yourvipchannel`), or /cancel.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'vip_menu' }]] }
+    });
+});
+
+bot.action('vip_settext', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'vip_promo_text' };
+    await ctx.editMessageText('✏️ Send the promo text shown above the Join button (benefits, price, etc.), or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'vip_menu' }]] }
     });
 });
 
@@ -2227,6 +2364,8 @@ bot.action('fs_addfs_menu', async (ctx) => {
     await ctx.answerCbQuery();
     const config = loadConfig();
     const { rows, truncated, total } = knownChatPickerKeyboard(config.forceSubGroupIds, 'fs_addfs', 'menu_fileshare', ctx.from.id);
+    // Bulk import goes just above the "Back" row (which knownChatPickerKeyboard always puts last).
+    rows.splice(rows.length - 1, 0, [{ text: '📥 Bulk Import (multiple at once)', callback_data: 'fs_addfs_bulk' }]);
     const note = total === 0
         ? '_I haven\'t seen any groups/channels yet — add me to one first, or type an ID/@username._'
         : truncated ? `_Showing 20 of ${total} known chats._` : '';
@@ -2256,6 +2395,21 @@ bot.action('fs_addfs_manual', async (ctx) => {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'fs_listforcesub' }]] }
     });
+});
+
+bot.action('fs_addfs_bulk', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'add_forcesub_bulk' };
+    await ctx.editMessageText(
+        '📥 Send multiple group/channel IDs or @usernames — one per line, or comma-separated.\n\n' +
+        'Example:\n`-1001234567890`\n`@somechannel`\n`-1009876543210`\n\n' +
+        'I must already be a member/admin in each one. Send /cancel to abort.',
+        {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'fs_listforcesub' }]] }
+        }
+    );
 });
 
 // --- Set Source (button-driven) ---
@@ -2636,6 +2790,57 @@ async function checkDailyHealthReport() {
         lines.push(`• Admin \`${cfg.adminId}\`: ${cfg.enabled ? '✅ Running' : '⏸ Paused'} | Queue: ${queueCount}${queueCount < LOW_QUEUE_THRESHOLD ? ' ⚠️' : ''} | Posted today: ${stats.today}`);
     }
     if (configs.length === 0) lines.push('_No admin has configured Auto-Post yet._');
+
+    await sendToLogChannel(lines.join('\n'));
+}
+
+// ISO 8601 week number (Mon-based). Used to key the weekly summary so it
+// fires once per calendar week rather than drifting based on process
+// uptime / restart timing.
+function getISOWeek(date) {
+    const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+    const dayNum = d.getUTCDay() || 7;
+    d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    return Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+}
+
+// Sends one growth-focused summary to the log channel per ISO week (IST),
+// alongside the daily health check. Covers new users/files this week, a
+// referral leaderboard, and VIP button engagement — a weekly "how's it
+// going" pulse rather than an operational alert.
+let lastWeeklySummaryKey = null;
+async function checkWeeklySummary() {
+    const config = loadConfig();
+    if (!config.errorLogChatId) return;
+
+    const nowIst = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const weekKey = `${nowIst.getFullYear()}-W${getISOWeek(nowIst)}`;
+    if (lastWeeklySummaryKey === weekKey) return; // already sent this week
+    lastWeeklySummaryKey = weekKey;
+
+    const weekAgoMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const stats = getStats();
+    const newUsers = getUsersJoinedSince(weekAgoMs);
+    const newFiles = getFilesAddedSince(weekAgoMs);
+    const topReferrers = getTopReferrers(3);
+    const vipStats = getVipStats();
+
+    const lines = [
+        `📊 *Weekly Summary* — ${weekKey}`,
+        '',
+        `👥 Users: ${stats.totalUsers} total (+${newUsers} this week)`,
+        `📁 Files: ${stats.totalFiles} total (+${newFiles} this week)`,
+        `📨 Requests today: ${stats.requestsToday}`,
+        `💎 VIP button taps: ${vipStats.totalClicks} total, ${vipStats.uniqueUsers} unique user(s)`,
+        ''
+    ];
+    if (topReferrers.length > 0) {
+        lines.push('🎁 *Top Referrers (all-time):*');
+        topReferrers.forEach((r, i) => lines.push(`${i + 1}. \`${r.id}\` — ${r.count} referral(s)`));
+    } else {
+        lines.push('_No referrals yet._');
+    }
 
     await sendToLogChannel(lines.join('\n'));
 }
@@ -3324,6 +3529,57 @@ async function handlePendingAction(ctx, text) {
         return;
     }
 
+    if (action.type === 'add_forcesub_bulk') {
+        delete pendingAction[userId];
+        const identifiers = text.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+        if (identifiers.length === 0) {
+            await ctx.reply('⚠️ No IDs/usernames found in that message.');
+            return;
+        }
+
+        const config = loadConfig();
+        const added = [];
+        const skipped = [];
+        const failed = [];
+
+        for (const identifier of identifiers) {
+            let chat;
+            try {
+                const target = identifier.startsWith('@') || isNaN(identifier) ? identifier : Number(identifier);
+                chat = await ctx.telegram.getChat(target);
+            } catch (error) {
+                failed.push(`${identifier} — not found`);
+                continue;
+            }
+            try {
+                await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
+            } catch (error) {
+                failed.push(`${chat.title || identifier} — bot not a member there`);
+                continue;
+            }
+            recordKnownChat(chat.id, chat.title, chat.type);
+            if (config.forceSubGroupIds.includes(chat.id)) {
+                skipped.push(chat.title || identifier);
+            } else {
+                config.forceSubGroupIds.push(chat.id);
+                added.push(chat.title || identifier);
+            }
+        }
+        saveConfig(config);
+
+        let summary = `📥 *Bulk Import Done* (${identifiers.length} entr${identifiers.length === 1 ? 'y' : 'ies'})\n\n`;
+        summary += `✅ Added (${added.length}): ${added.length ? added.join(', ') : '—'}\n`;
+        if (skipped.length) summary += `↔️ Already added (${skipped.length}): ${skipped.join(', ')}\n`;
+        if (failed.length) summary += `❌ Failed (${failed.length}):\n${failed.map(f => `• ${f}`).join('\n')}\n`;
+        try {
+            await ctx.reply(summary, { parse_mode: 'Markdown' });
+        } catch (e) {
+            // Group/channel titles can contain unbalanced Markdown entities — fall back to plain text.
+            await ctx.reply(summary.replace(/[*_`]/g, ''));
+        }
+        return;
+    }
+
     if (action.type === 'add_forcesub_manual' || action.type === 'set_source_manual') {
         const identifier = text.trim();
         if (!identifier) {
@@ -3535,6 +3791,34 @@ async function handlePendingAction(ctx, text) {
         return;
     }
 
+    if (action.type === 'vip_channel_link') {
+        const url = text.trim();
+        if (!/^https?:\/\//i.test(url)) {
+            await ctx.reply('⚠️ Please send a valid URL starting with http:// or https://, or /cancel.');
+            return;
+        }
+        const config = loadConfig();
+        config.vipChannelLink = url;
+        saveConfig(config);
+        delete pendingAction[userId];
+        await ctx.reply('✅ VIP channel link saved. The "💎 Buy VIP" button is now active.');
+        return;
+    }
+
+    if (action.type === 'vip_promo_text') {
+        const t = text.trim();
+        if (!t) {
+            await ctx.reply('⚠️ Send some text, or /cancel.');
+            return;
+        }
+        const config = loadConfig();
+        config.vipPromoText = t;
+        saveConfig(config);
+        delete pendingAction[userId];
+        await ctx.reply('✅ Promo text saved.');
+        return;
+    }
+
     if (CUSTOM_FIELD_MAP[action.type]) {
         const { key, label, min } = CUSTOM_FIELD_MAP[action.type];
         const n = parseInt(text.trim(), 10);
@@ -3703,6 +3987,12 @@ bot.telegram.getMe().then(async botInfo => {
     }, 60 * 1000);
     setInterval(() => {
         checkDailyHealthReport().catch(err => logError('Daily health check', err));
+    }, 60 * 1000);
+    setInterval(() => {
+        checkWeeklySummary().catch(err => logError('Weekly summary', err));
+    }, 60 * 1000);
+    setInterval(() => {
+        checkAutoBackup().catch(err => logError('Auto config backup', err));
     }, 60 * 1000);
     setInterval(() => {
         processDelayedJoinApprovals().catch(err => logError('Delayed join approval tick', err));

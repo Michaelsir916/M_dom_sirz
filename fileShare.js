@@ -10,6 +10,7 @@ const SCHEDULED_BROADCASTS_PATH = path.join(__dirname, 'scheduled_broadcasts.jso
 const AUTOPOST_PATH = path.join(__dirname, 'autopost_configs.json');
 const PENDING_JOIN_REQUESTS_PATH = path.join(__dirname, 'pending_join_requests.json');
 const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
+const MEGA_ACCOUNTS_PATH = path.join(__dirname, 'mega_accounts.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -33,7 +34,8 @@ const DEFAULT_CONFIG = {
     aboutLinkText: 'Click Here', // custom clickable hyperlink text shown in the non-admin About panel
     aboutLinkUrl: null,          // url that aboutLinkText links to
     vipChannelLink: null,        // url the "💎 Buy VIP" button sends users to
-    vipPromoText: null           // optional promo copy shown above the Join button
+    vipPromoText: null,          // optional promo copy shown above the Join button
+    activeMegaAccountId: null    // which entry in mega_accounts.json is currently in use for downloads
 };
 
 // ===== Config backup (used by /backupconfig) =====
@@ -49,7 +51,8 @@ const CONFIG_BACKUP_FILES = [
     { path: SCHEDULED_BROADCASTS_PATH, name: 'scheduled_broadcasts.json' },
     { path: AUTOPOST_PATH, name: 'autopost_configs.json' },
     { path: PENDING_JOIN_REQUESTS_PATH, name: 'pending_join_requests.json' },
-    { path: VIP_CLICKS_PATH, name: 'vip_clicks.json' }
+    { path: VIP_CLICKS_PATH, name: 'vip_clicks.json' },
+    { path: MEGA_ACCOUNTS_PATH, name: 'mega_accounts.json' }
 ];
 
 // Only returns files that actually exist yet (a fresh install may not have
@@ -784,6 +787,126 @@ function getVipStats() {
     return { totalClicks, uniqueUsers: users.length };
 }
 
+// ===== MEGA account management (multi-account bandwidth rotation) =====
+// One MEGA free account gets ~5GB/day of transfer quota. If you own several
+// accounts, the bot can rotate between them so a single busy day doesn't
+// stall every download — an account that hits its limit gets a 24h cooldown
+// and the bot picks the next ready one automatically.
+const MEGA_LIMIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+
+function loadMegaAccounts() {
+    return safeReadJson(MEGA_ACCOUNTS_PATH, []);
+}
+
+function saveMegaAccounts(accounts) {
+    atomicWrite(MEGA_ACCOUNTS_PATH, accounts);
+}
+
+function addMegaAccount(email, password, label) {
+    const accounts = loadMegaAccounts();
+    const account = {
+        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+        email,
+        password,
+        label: label || email,
+        addedAt: new Date().toISOString(),
+        limitHitAt: null
+    };
+    accounts.push(account);
+    saveMegaAccounts(accounts);
+    return account;
+}
+
+function removeMegaAccount(id) {
+    const accounts = loadMegaAccounts().filter(a => a.id !== id);
+    saveMegaAccounts(accounts);
+    const config = loadConfig();
+    if (config.activeMegaAccountId === id) {
+        config.activeMegaAccountId = null;
+        saveConfig(config);
+    }
+}
+
+// Raw list, credentials included — for internal login use only (never
+// render this straight to a chat message).
+function getMegaAccounts() {
+    return loadMegaAccounts();
+}
+
+// Safe-for-display list — no passwords, plus computed ready/cooldown state.
+function getMegaAccountsWithStatus() {
+    const accounts = loadMegaAccounts();
+    const config = loadConfig();
+    const now = Date.now();
+    return accounts.map(a => {
+        let ready = true;
+        let cooldownHoursLeft = 0;
+        if (a.limitHitAt) {
+            const elapsed = now - new Date(a.limitHitAt).getTime();
+            if (elapsed < MEGA_LIMIT_COOLDOWN_MS) {
+                ready = false;
+                cooldownHoursLeft = Math.ceil((MEGA_LIMIT_COOLDOWN_MS - elapsed) / 3600000);
+            }
+        }
+        return {
+            id: a.id,
+            label: a.label,
+            email: a.email,
+            addedAt: a.addedAt,
+            ready,
+            cooldownHoursLeft,
+            active: a.id === config.activeMegaAccountId
+        };
+    });
+}
+
+function isMegaAccountUsable(account) {
+    if (!account.limitHitAt) return true;
+    return (Date.now() - new Date(account.limitHitAt).getTime()) > MEGA_LIMIT_COOLDOWN_MS;
+}
+
+// Returns the account that should be used right now: the previously-active
+// one if it's still usable, otherwise the first ready account found.
+// Returns null if there are no accounts, or every account is on cooldown.
+function getActiveMegaAccount() {
+    const accounts = loadMegaAccounts();
+    if (accounts.length === 0) return null;
+
+    const config = loadConfig();
+    let active = accounts.find(a => a.id === config.activeMegaAccountId);
+
+    if (!active || !isMegaAccountUsable(active)) {
+        active = accounts.find(isMegaAccountUsable) || null;
+        if (active && active.id !== config.activeMegaAccountId) {
+            config.activeMegaAccountId = active.id;
+            saveConfig(config);
+        }
+    }
+    return active;
+}
+
+function setActiveMegaAccount(id) {
+    const config = loadConfig();
+    config.activeMegaAccountId = id;
+    saveConfig(config);
+}
+
+// Marks an account as bandwidth-limited (starts its 24h cooldown) and
+// immediately points the active slot at the next ready account, if any.
+function markMegaAccountLimited(id) {
+    const accounts = loadMegaAccounts();
+    const account = accounts.find(a => a.id === id);
+    if (account) {
+        account.limitHitAt = new Date().toISOString();
+        saveMegaAccounts(accounts);
+    }
+    const next = accounts.find(a => a.id !== id && isMegaAccountUsable(a));
+    const config = loadConfig();
+    config.activeMegaAccountId = next ? next.id : null;
+    saveConfig(config);
+    return next || null;
+}
+
 module.exports = {
     loadConfig,
     saveConfig,
@@ -837,5 +960,12 @@ module.exports = {
     getMaintenanceWhitelist,
     getConfigBackupFiles,
     recordVipClick,
-    getVipStats
+    getVipStats,
+    addMegaAccount,
+    removeMegaAccount,
+    getMegaAccounts,
+    getMegaAccountsWithStatus,
+    getActiveMegaAccount,
+    setActiveMegaAccount,
+    markMegaAccountLimited
 };

@@ -1,13 +1,4 @@
-# mega
 
-
-MEGA UPLOAD 
-
-MEGA TO TELEGRAM 
-
-VIDEO FILE 
-
-BY @MR_BOOMSIR
 
 ## Setup
 

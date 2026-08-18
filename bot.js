@@ -63,7 +63,15 @@ const {
     getMaintenanceWhitelist,
     getConfigBackupFiles,
     recordVipClick,
-    getVipStats
+    getVipStats,
+    grantVip,
+    revokeVip,
+    isUserVip,
+    getVipInfo,
+    createPromoCode,
+    deletePromoCode,
+    listPromoCodes,
+    redeemPromoCode
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -1179,6 +1187,7 @@ const MY_STATS_KEYBOARD = {
         [{ text: '🎬 Free Video', callback_data: 'user_random' }],
         [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
         [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
+        [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
         [{ text: 'ℹ️ About', callback_data: 'user_about' }]
     ]
 };
@@ -1255,6 +1264,7 @@ bot.action('user_about', async (ctx) => {
 function formatMyStats(userId) {
     const config = loadConfig();
     const s = getUserStats(userId, config.cooldownSeconds, config.dailyLimit);
+    const vip = getVipInfo(userId);
 
     let cooldownLine = '✅ Ready now';
     if (s.cooldownRemaining > 0) {
@@ -1266,11 +1276,17 @@ function formatMyStats(userId) {
         dailyLine = `${s.dailyRemaining} left today`;
     }
 
+    let vipLine = '❌ Not active';
+    if (vip.active) {
+        vipLine = vip.unlimited ? '✅ Active — Lifetime' : `✅ Active — ${vip.daysLeft} day(s) left`;
+    }
+
     return `📊 *Your Stats*\n\n` +
         `Files received (all-time): ${s.totalFilesReceived}\n` +
         `/random requests today: ${s.requestsToday}\n` +
         `Cooldown: ${cooldownLine}\n` +
         `Daily limit: ${dailyLine}\n\n` +
+        `💎 VIP: ${vipLine}\n` +
         `👥 Referrals: ${s.referralCount}\n` +
         `💎 Bonus credits: ${s.bonusCredits} (skip cooldown/daily-limit)`;
 }
@@ -1308,6 +1324,39 @@ bot.command('myreferral', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
     const { text, replyMarkup } = await formatMyReferral(ctx);
     await ctx.reply(text, { parse_mode: 'HTML', reply_markup: replyMarkup });
+});
+
+// --- User-facing: Redeem Promo Code ---
+async function handleRedeemCode(ctx, code) {
+    const result = redeemPromoCode(ctx.from.id, code);
+    if (!result.success) {
+        const messages = {
+            not_found: '❌ That code doesn\'t exist. Check the spelling and try again.',
+            already_used: '⚠️ You\'ve already redeemed this code.',
+            limit_reached: '⚠️ This code has reached its maximum number of uses.'
+        };
+        await ctx.reply(messages[result.reason] || '❌ Could not redeem that code.');
+        return;
+    }
+    const durationText = result.unlimited ? 'Lifetime (never expires)' : `${result.days} day(s)`;
+    await ctx.reply(`🎉 Code redeemed! You now have 💎 VIP access.\n\nDuration: ${durationText}\nEnjoy unlimited /random requests with no cooldown!`);
+}
+
+bot.command('redeem', async (ctx) => {
+    if (ctx.chat.type !== 'private') return;
+    const parts = ctx.message.text.trim().split(/\s+/);
+    if (parts.length < 2) {
+        pendingAction[ctx.from.id] = { type: 'redeem_code' };
+        await ctx.reply('🎟 Send the promo code you want to redeem, or /cancel.');
+        return;
+    }
+    await handleRedeemCode(ctx, parts[1]);
+});
+
+bot.action('user_redeem', async (ctx) => {
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'redeem_code' };
+    await ctx.reply('🎟 Send the promo code you want to redeem, or /cancel.');
 });
 
 bot.action('user_referral', async (ctx) => {
@@ -1510,6 +1559,32 @@ bot.command('setcooldown', async (ctx) => {
     config.cooldownSeconds = n;
     saveConfig(config);
     await ctx.reply(`✅ Cooldown set to ${n} second(s).`);
+});
+
+// Manually grant/revoke VIP by user ID — for when the admin wants to give
+// VIP directly without going through a redeemable promo code.
+bot.command('grantvip', async (ctx) => {
+    if (!(await requireAdmin(ctx))) return;
+    const parts = ctx.message.text.split(' ');
+    const targetId = parts[1];
+    const days = parseInt(parts[2], 10);
+    if (!targetId || isNaN(days) || days < 0) {
+        await ctx.reply('Usage: `/grantvip 123456789 30` (30 days) or `/grantvip 123456789 0` (lifetime)', { parse_mode: 'Markdown' });
+        return;
+    }
+    grantVip(targetId, days, 'manual', null);
+    await ctx.reply(`✅ Granted ${days > 0 ? `${days} day(s)` : 'lifetime'} VIP to user \`${targetId}\`.`, { parse_mode: 'Markdown' });
+});
+
+bot.command('revokevip', async (ctx) => {
+    if (!(await requireAdmin(ctx))) return;
+    const targetId = ctx.message.text.split(' ')[1];
+    if (!targetId) {
+        await ctx.reply('Usage: `/revokevip 123456789`', { parse_mode: 'Markdown' });
+        return;
+    }
+    revokeVip(targetId);
+    await ctx.reply(`✅ VIP revoked for user \`${targetId}\`.`, { parse_mode: 'Markdown' });
 });
 
 bot.command('setreferralbonus', async (ctx) => {
@@ -1726,6 +1801,12 @@ async function processDueScheduledBroadcasts() {
 // Wraps recordRequest(): if the daily limit is hit but the user has earned
 // referral bonus credits, spend one of those instead of blocking them.
 function checkRandomAllowed(userId, config) {
+    // VIP (via promo code or manual grant) skips cooldown + daily limit
+    // entirely, but requests are still tallied (0, 0 = no cooldown/no cap).
+    if (isUserVip(userId)) {
+        recordRequest(userId, 0, 0);
+        return { allowed: true, isVip: true };
+    }
     const check = recordRequest(userId, config.cooldownSeconds, config.dailyLimit);
     if (!check.allowed && check.reason === 'daily_limit' && consumeBonusCredit(userId)) {
         return { allowed: true, usedBonus: true };
@@ -1912,6 +1993,7 @@ async function renderFileSharePanel(ctx) {
             [{ text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
             [{ text: '👤 About/Start Message', callback_data: 'about_menu' }],
             [{ text: '💎 VIP Promotion', callback_data: 'vip_menu' }],
+            [{ text: '🎟 Promo Codes', callback_data: 'promo_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
@@ -2029,6 +2111,65 @@ bot.action('vip_settext', async (ctx) => {
     pendingAction[ctx.from.id] = { type: 'vip_promo_text' };
     await ctx.editMessageText('✏️ Send the promo text shown above the Join button (benefits, price, etc.), or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'vip_menu' }]] }
+    });
+});
+
+// --- Promo Codes (admin creates codes that grant VIP access on redemption) ---
+async function renderPromoPanel(ctx) {
+    const codes = listPromoCodes();
+    let text = '🎟 *Promo Codes*\n\n';
+
+    if (codes.length === 0) {
+        text += '_No codes created yet._';
+    } else {
+        text += codes.slice(0, 15).map(c => {
+            const duration = c.days > 0 ? `${c.days}d` : 'Lifetime';
+            const uses = c.maxUses > 0 ? `${c.usedBy.length}/${c.maxUses}` : `${c.usedBy.length}/∞`;
+            return `\`${c.code}\` — ${duration} — used ${uses}`;
+        }).join('\n');
+        if (codes.length > 15) text += `\n_...and ${codes.length - 15} more_`;
+    }
+
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: '➕ Create Code', callback_data: 'promo_create_menu' }],
+            [{ text: '🗑 Delete Code', callback_data: 'promo_delete_menu' }],
+            [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
+        ]
+    };
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.action('promo_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderPromoPanel(ctx);
+});
+
+bot.action('promo_create_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'promo_create' };
+    await ctx.editMessageText(
+        '➕ *Create Promo Code*\n\n' +
+        'Send: `CODE DAYS [MAXUSES]`\n\n' +
+        '• `DAYS` — how many days of VIP access. Use `0` for lifetime/unlimited.\n' +
+        '• `MAXUSES` — optional, how many different users can redeem this code. Leave blank or `0` for unlimited people.\n\n' +
+        'Examples:\n' +
+        '`SUMMER30 30` → 30 days VIP, any number of people can use it\n' +
+        '`VIPFRIEND 0 1` → lifetime VIP, redeemable by only 1 person\n' +
+        '`WEEKPASS 7 50` → 7 days VIP, up to 50 people\n\n' +
+        'Or /cancel.',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] } }
+    );
+});
+
+bot.action('promo_delete_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'promo_delete' };
+    await ctx.editMessageText('🗑 Send the code to delete, or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
     });
 });
 
@@ -3788,6 +3929,56 @@ async function handlePendingAction(ctx, text) {
         saveConfig(config);
         delete pendingAction[userId];
         await ctx.reply('✅ Link URL saved.');
+        return;
+    }
+
+    if (action.type === 'redeem_code') {
+        delete pendingAction[userId];
+        await handleRedeemCode(ctx, text.trim());
+        return;
+    }
+
+    if (action.type === 'promo_create') {
+        const parts = text.trim().split(/\s+/);
+        if (parts.length < 2) {
+            await ctx.reply('⚠️ Send: `CODE DAYS [MAXUSES]` (e.g. `SUMMER30 30`), or /cancel.', { parse_mode: 'Markdown' });
+            return;
+        }
+        const [codeRaw, daysRaw, maxUsesRaw] = parts;
+        const days = parseInt(daysRaw, 10);
+        const maxUses = maxUsesRaw ? parseInt(maxUsesRaw, 10) : 0;
+        if (isNaN(days) || days < 0) {
+            await ctx.reply('⚠️ DAYS must be a whole number, 0 or more (0 = lifetime). Try again, or /cancel.');
+            return;
+        }
+        if (maxUsesRaw && (isNaN(maxUses) || maxUses < 0)) {
+            await ctx.reply('⚠️ MAXUSES must be a whole number, 0 or more (0 = unlimited people). Try again, or /cancel.');
+            return;
+        }
+        const result = createPromoCode(codeRaw, days, maxUses, userId);
+        delete pendingAction[userId];
+        if (!result.success) {
+            await ctx.reply(result.reason === 'exists' ? `⚠️ Code \`${codeRaw.toUpperCase()}\` already exists.` : '⚠️ Could not create that code.', { parse_mode: 'Markdown' });
+            return;
+        }
+        const durationText = days > 0 ? `${days} day(s)` : 'Lifetime';
+        const usesText = maxUses > 0 ? `${maxUses} user(s)` : 'Unlimited users';
+        await ctx.reply(
+            `✅ Promo code created!\n\n` +
+            `Code: \`${result.code.code}\`\n` +
+            `Grants: ${durationText} VIP\n` +
+            `Redeemable by: ${usesText}\n\n` +
+            `Share this with the user — they redeem it with /redeem or the 🎟 Redeem Code button.`,
+            { parse_mode: 'Markdown' }
+        );
+        return;
+    }
+
+    if (action.type === 'promo_delete') {
+        const code = text.trim().toUpperCase();
+        const deleted = deletePromoCode(code);
+        delete pendingAction[userId];
+        await ctx.reply(deleted ? `✅ Code \`${code}\` deleted.` : `⚠️ Code \`${code}\` not found.`, { parse_mode: 'Markdown' });
         return;
     }
 

@@ -10,7 +10,7 @@ const SCHEDULED_BROADCASTS_PATH = path.join(__dirname, 'scheduled_broadcasts.jso
 const AUTOPOST_PATH = path.join(__dirname, 'autopost_configs.json');
 const PENDING_JOIN_REQUESTS_PATH = path.join(__dirname, 'pending_join_requests.json');
 const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
-const MEGA_ACCOUNTS_PATH = path.join(__dirname, 'mega_accounts.json');
+const PROMO_CODES_PATH = path.join(__dirname, 'promo_codes.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -34,8 +34,7 @@ const DEFAULT_CONFIG = {
     aboutLinkText: 'Click Here', // custom clickable hyperlink text shown in the non-admin About panel
     aboutLinkUrl: null,          // url that aboutLinkText links to
     vipChannelLink: null,        // url the "💎 Buy VIP" button sends users to
-    vipPromoText: null,          // optional promo copy shown above the Join button
-    activeMegaAccountId: null    // which entry in mega_accounts.json is currently in use for downloads
+    vipPromoText: null           // optional promo copy shown above the Join button
 };
 
 // ===== Config backup (used by /backupconfig) =====
@@ -52,7 +51,7 @@ const CONFIG_BACKUP_FILES = [
     { path: AUTOPOST_PATH, name: 'autopost_configs.json' },
     { path: PENDING_JOIN_REQUESTS_PATH, name: 'pending_join_requests.json' },
     { path: VIP_CLICKS_PATH, name: 'vip_clicks.json' },
-    { path: MEGA_ACCOUNTS_PATH, name: 'mega_accounts.json' }
+    { path: PROMO_CODES_PATH, name: 'promo_codes.json' }
 ];
 
 // Only returns files that actually exist yet (a fresh install may not have
@@ -152,6 +151,10 @@ function getUser(users, userId) {
     if (users[key].referrals === undefined) users[key].referrals = [];
     if (users[key].referredBy === undefined) users[key].referredBy = null;
     if (users[key].bonusCredits === undefined) users[key].bonusCredits = 0;
+    // vipExpiresAt: null = not VIP, -1 = unlimited (never expires), number = ms epoch expiry
+    if (users[key].vipExpiresAt === undefined) users[key].vipExpiresAt = null;
+    if (users[key].vipSource === undefined) users[key].vipSource = null; // 'promo' | 'manual'
+    if (users[key].vipCode === undefined) users[key].vipCode = null;
     // Not backfilled with a fake date — left undefined so "new this week"
     // calculations only count users who actually joined after this field
     // was introduced, instead of falsely counting old users as brand new.
@@ -269,6 +272,123 @@ function getReferralStats(userId) {
         bonusCredits: u.bonusCredits || 0,
         referredBy: u.referredBy || null
     };
+}
+
+// ===== VIP status (granted via promo code redemption or manually by admin) =====
+
+// Grants VIP to a user. days > 0 = expires in that many days from now.
+// days <= 0 = unlimited (never expires). source/code are just for display
+// in /myvip and the admin panel.
+function grantVip(userId, days, source, code) {
+    const users = loadUsers();
+    const key = String(userId);
+    const u = getUser(users, key);
+    u.vipExpiresAt = days > 0 ? Date.now() + days * 24 * 60 * 60 * 1000 : -1;
+    u.vipSource = source || 'manual';
+    u.vipCode = code || null;
+    users[key] = u;
+    saveUsers(users);
+    return u.vipExpiresAt;
+}
+
+function revokeVip(userId) {
+    const users = loadUsers();
+    const key = String(userId);
+    const u = getUser(users, key);
+    u.vipExpiresAt = null;
+    u.vipSource = null;
+    u.vipCode = null;
+    users[key] = u;
+    saveUsers(users);
+}
+
+// True if the user currently has active (non-expired) VIP. Lazily treats a
+// past expiry as "not VIP" without needing a scheduled job to clean it up.
+function isUserVip(userId) {
+    const users = loadUsers();
+    const u = getUser(users, userId);
+    if (u.vipExpiresAt === -1) return true;
+    if (!u.vipExpiresAt) return false;
+    return u.vipExpiresAt > Date.now();
+}
+
+// Full VIP status for display (My Stats, admin lookups).
+function getVipInfo(userId) {
+    const users = loadUsers();
+    const u = getUser(users, userId);
+    if (u.vipExpiresAt === -1) {
+        return { active: true, unlimited: true, expiresAt: null, daysLeft: null, source: u.vipSource, code: u.vipCode };
+    }
+    if (!u.vipExpiresAt || u.vipExpiresAt <= Date.now()) {
+        return { active: false, unlimited: false, expiresAt: null, daysLeft: null, source: null, code: null };
+    }
+    const daysLeft = Math.ceil((u.vipExpiresAt - Date.now()) / (24 * 60 * 60 * 1000));
+    return { active: true, unlimited: false, expiresAt: u.vipExpiresAt, daysLeft, source: u.vipSource, code: u.vipCode };
+}
+
+// ===== Promo codes (admin-created, redeemed by users for VIP access) =====
+function loadPromoCodes() {
+    return safeReadJson(PROMO_CODES_PATH, {});
+}
+
+function savePromoCodes(codes) {
+    atomicWrite(PROMO_CODES_PATH, codes);
+}
+
+// days: 0 = unlimited VIP when redeemed. maxUses: 0 = unlimited redemptions.
+function createPromoCode(code, days, maxUses, createdBy) {
+    const key = String(code).trim().toUpperCase();
+    if (!key) return { success: false, reason: 'empty' };
+    const codes = loadPromoCodes();
+    if (codes[key]) return { success: false, reason: 'exists' };
+
+    codes[key] = {
+        code: key,
+        days: days > 0 ? days : 0,
+        maxUses: maxUses > 0 ? maxUses : 0,
+        usedBy: [],
+        createdBy: String(createdBy),
+        createdAt: new Date().toISOString()
+    };
+    savePromoCodes(codes);
+    return { success: true, code: codes[key] };
+}
+
+function deletePromoCode(code) {
+    const key = String(code).trim().toUpperCase();
+    const codes = loadPromoCodes();
+    if (!codes[key]) return false;
+    delete codes[key];
+    savePromoCodes(codes);
+    return true;
+}
+
+function listPromoCodes() {
+    return Object.values(loadPromoCodes()).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+// Redeems a code for a user: validates existence, use-limit, and that this
+// user hasn't already redeemed this specific code, then grants VIP.
+function redeemPromoCode(userId, code) {
+    const key = String(code).trim().toUpperCase();
+    const codes = loadPromoCodes();
+    const entry = codes[key];
+    if (!entry) return { success: false, reason: 'not_found' };
+
+    const userKey = String(userId);
+    if (entry.usedBy.some(u => u.userId === userKey)) {
+        return { success: false, reason: 'already_used' };
+    }
+    if (entry.maxUses > 0 && entry.usedBy.length >= entry.maxUses) {
+        return { success: false, reason: 'limit_reached' };
+    }
+
+    entry.usedBy.push({ userId: userKey, usedAt: new Date().toISOString() });
+    codes[key] = entry;
+    savePromoCodes(codes);
+
+    const expiresAt = grantVip(userId, entry.days, 'promo', key);
+    return { success: true, days: entry.days, unlimited: entry.days === 0, expiresAt };
 }
 
 // Returns THIS user's own /random stats (not admin-wide): files received,
@@ -787,126 +907,6 @@ function getVipStats() {
     return { totalClicks, uniqueUsers: users.length };
 }
 
-// ===== MEGA account management (multi-account bandwidth rotation) =====
-// One MEGA free account gets ~5GB/day of transfer quota. If you own several
-// accounts, the bot can rotate between them so a single busy day doesn't
-// stall every download — an account that hits its limit gets a 24h cooldown
-// and the bot picks the next ready one automatically.
-const MEGA_LIMIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
-
-function loadMegaAccounts() {
-    return safeReadJson(MEGA_ACCOUNTS_PATH, []);
-}
-
-function saveMegaAccounts(accounts) {
-    atomicWrite(MEGA_ACCOUNTS_PATH, accounts);
-}
-
-function addMegaAccount(email, password, label) {
-    const accounts = loadMegaAccounts();
-    const account = {
-        id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-        email,
-        password,
-        label: label || email,
-        addedAt: new Date().toISOString(),
-        limitHitAt: null
-    };
-    accounts.push(account);
-    saveMegaAccounts(accounts);
-    return account;
-}
-
-function removeMegaAccount(id) {
-    const accounts = loadMegaAccounts().filter(a => a.id !== id);
-    saveMegaAccounts(accounts);
-    const config = loadConfig();
-    if (config.activeMegaAccountId === id) {
-        config.activeMegaAccountId = null;
-        saveConfig(config);
-    }
-}
-
-// Raw list, credentials included — for internal login use only (never
-// render this straight to a chat message).
-function getMegaAccounts() {
-    return loadMegaAccounts();
-}
-
-// Safe-for-display list — no passwords, plus computed ready/cooldown state.
-function getMegaAccountsWithStatus() {
-    const accounts = loadMegaAccounts();
-    const config = loadConfig();
-    const now = Date.now();
-    return accounts.map(a => {
-        let ready = true;
-        let cooldownHoursLeft = 0;
-        if (a.limitHitAt) {
-            const elapsed = now - new Date(a.limitHitAt).getTime();
-            if (elapsed < MEGA_LIMIT_COOLDOWN_MS) {
-                ready = false;
-                cooldownHoursLeft = Math.ceil((MEGA_LIMIT_COOLDOWN_MS - elapsed) / 3600000);
-            }
-        }
-        return {
-            id: a.id,
-            label: a.label,
-            email: a.email,
-            addedAt: a.addedAt,
-            ready,
-            cooldownHoursLeft,
-            active: a.id === config.activeMegaAccountId
-        };
-    });
-}
-
-function isMegaAccountUsable(account) {
-    if (!account.limitHitAt) return true;
-    return (Date.now() - new Date(account.limitHitAt).getTime()) > MEGA_LIMIT_COOLDOWN_MS;
-}
-
-// Returns the account that should be used right now: the previously-active
-// one if it's still usable, otherwise the first ready account found.
-// Returns null if there are no accounts, or every account is on cooldown.
-function getActiveMegaAccount() {
-    const accounts = loadMegaAccounts();
-    if (accounts.length === 0) return null;
-
-    const config = loadConfig();
-    let active = accounts.find(a => a.id === config.activeMegaAccountId);
-
-    if (!active || !isMegaAccountUsable(active)) {
-        active = accounts.find(isMegaAccountUsable) || null;
-        if (active && active.id !== config.activeMegaAccountId) {
-            config.activeMegaAccountId = active.id;
-            saveConfig(config);
-        }
-    }
-    return active;
-}
-
-function setActiveMegaAccount(id) {
-    const config = loadConfig();
-    config.activeMegaAccountId = id;
-    saveConfig(config);
-}
-
-// Marks an account as bandwidth-limited (starts its 24h cooldown) and
-// immediately points the active slot at the next ready account, if any.
-function markMegaAccountLimited(id) {
-    const accounts = loadMegaAccounts();
-    const account = accounts.find(a => a.id === id);
-    if (account) {
-        account.limitHitAt = new Date().toISOString();
-        saveMegaAccounts(accounts);
-    }
-    const next = accounts.find(a => a.id !== id && isMegaAccountUsable(a));
-    const config = loadConfig();
-    config.activeMegaAccountId = next ? next.id : null;
-    saveConfig(config);
-    return next || null;
-}
-
 module.exports = {
     loadConfig,
     saveConfig,
@@ -961,11 +961,12 @@ module.exports = {
     getConfigBackupFiles,
     recordVipClick,
     getVipStats,
-    addMegaAccount,
-    removeMegaAccount,
-    getMegaAccounts,
-    getMegaAccountsWithStatus,
-    getActiveMegaAccount,
-    setActiveMegaAccount,
-    markMegaAccountLimited
+    grantVip,
+    revokeVip,
+    isUserVip,
+    getVipInfo,
+    createPromoCode,
+    deletePromoCode,
+    listPromoCodes,
+    redeemPromoCode
 };

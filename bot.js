@@ -63,14 +63,7 @@ const {
     getMaintenanceWhitelist,
     getConfigBackupFiles,
     recordVipClick,
-    getVipStats,
-    addMegaAccount,
-    removeMegaAccount,
-    getMegaAccounts,
-    getMegaAccountsWithStatus,
-    getActiveMegaAccount,
-    setActiveMegaAccount,
-    markMegaAccountLimited
+    getVipStats
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -649,42 +642,6 @@ async function downloadMegaFile(megaUrl, userId, onProgress) {
     });
 }
 
-// Wraps downloadMegaFile() with account rotation: if a download fails with
-// a bandwidth/quota-limit error and MEGA accounts are configured, the
-// current active account is put on a 24h cooldown and the next ready
-// account becomes active, then the download is retried automatically.
-// (Note: MEGA's quota for anonymous public-link downloads is generally
-// IP-based rather than tied to a login — this rotation still gives clean
-// account tracking + a retry path either way, and covers the case fully if
-// your accounts do end up rate-limited individually.)
-async function downloadMegaFileWithRotation(megaUrl, userId, onProgress, onRotate) {
-    const accounts = getMegaAccounts();
-    const maxAttempts = Math.max(accounts.length, 1);
-    let lastError;
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        try {
-            return await downloadMegaFile(megaUrl, userId, onProgress);
-        } catch (error) {
-            lastError = error;
-            const msg = (error.message || '').toLowerCase();
-            const isQuotaError = msg.includes('quota') || msg.includes('bandwidth') || msg.includes('429') || msg.includes('eoverquota');
-            if (!isQuotaError || accounts.length === 0) throw error;
-
-            const active = getActiveMegaAccount();
-            if (!active) throw error;
-
-            const next = markMegaAccountLimited(active.id);
-            if (onRotate) {
-                try { await onRotate(active, next); } catch (e) { /* notification failure shouldn't block the retry */ }
-            }
-            if (!next) throw error; // that was the last usable account
-            // loop continues — next attempt picks up the newly-rotated account
-        }
-    }
-    throw lastError;
-}
-
 function createProgressUpdater(editStatusFunc, actionPrefix, totalFiles = 1) {
     let lastUpdate = 0;
     let lastProgressText = '';
@@ -777,13 +734,7 @@ async function processMegaLink(ctx, megaLink) {
         };
 
         const downloadUpdater = createProgressUpdater(editStatus, '⬇️ *Downloading from MEGA*');
-        const result = await downloadMegaFileWithRotation(megaLink, userId, downloadUpdater, async (limited, next) => {
-            await editStatus(`⚠️ *Bandwidth limit hit* on \`${limited.label}\`\n\n${next ? `🔄 Switching to \`${next.label}\`, retrying...` : '❌ No other ready MEGA accounts.'}`);
-            await sendToLogChannel(
-                `⚠️ *MEGA Account Limited*\n\nAccount: \`${limited.label}\`\n${next ? `Switched to: \`${next.label}\`` : 'No other ready accounts — downloads may fail until cooldown ends.'}`,
-                `mega_limit:${limited.id}`
-            );
-        });
+        const result = await downloadMegaFile(megaLink, userId, downloadUpdater);
 
         const deleteStatus = async () => {
             if (statusMsg) {
@@ -1241,14 +1192,6 @@ function escapeHtml(str) {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
-}
-
-// Escapes the characters Telegram's legacy Markdown parse_mode treats as
-// formatting (_, *, `, [) so admin-entered free text/URLs (promo copy,
-// link text, account labels, etc.) can never break a panel's rendering by
-// accidentally triggering "can't parse entities".
-function escapeMarkdown(str) {
-    return String(str).replace(/([_*`[])/g, '\\$1');
 }
 
 // "💎 Buy VIP" — the main promo entry point. Shown on /start, the About
@@ -1969,7 +1912,6 @@ async function renderFileSharePanel(ctx) {
             [{ text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
             [{ text: '👤 About/Start Message', callback_data: 'about_menu' }],
             [{ text: '💎 VIP Promotion', callback_data: 'vip_menu' }],
-            [{ text: '📦 Mega Management', callback_data: 'megamgmt_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
@@ -1990,9 +1932,9 @@ bot.action('fs_toggle_protect', async (ctx) => {
 async function renderAboutPanel(ctx) {
     const config = loadConfig();
     const text = '👤 *About / Start Message*\n\n' +
-        `Join Group Link: ${config.aboutJoinGroupLink ? escapeMarkdown(config.aboutJoinGroupLink) : '_Not set_'}\n` +
-        `Link Text: ${config.aboutLinkText ? escapeMarkdown(config.aboutLinkText) : '_Not set_'}\n` +
-        `Link URL: ${config.aboutLinkUrl ? escapeMarkdown(config.aboutLinkUrl) : '_Not set_'}\n\n` +
+        `Join Group Link: ${config.aboutJoinGroupLink || '_Not set_'}\n` +
+        `Link Text: ${config.aboutLinkText || '_Not set_'}\n` +
+        `Link URL: ${config.aboutLinkUrl || '_Not set_'}\n\n` +
         '_Shown to regular users when they tap ℹ️ About on /start. Creator credit and tech stack are fixed._';
 
     const keyboard = {
@@ -2049,8 +1991,8 @@ async function renderVipPanel(ctx) {
     const config = loadConfig();
     const stats = getVipStats();
     const text = '💎 *VIP Promotion*\n\n' +
-        `Channel Link: ${config.vipChannelLink ? escapeMarkdown(config.vipChannelLink) : '_Not set_'}\n` +
-        `Promo Text: ${config.vipPromoText ? escapeMarkdown(config.vipPromoText) : '_Not set_'}\n\n` +
+        `Channel Link: ${config.vipChannelLink || '_Not set_'}\n` +
+        `Promo Text: ${config.vipPromoText || '_Not set_'}\n\n` +
         `📊 Button taps: ${stats.totalClicks} total, ${stats.uniqueUsers} unique user(s)\n\n` +
         '_"💎 Buy VIP" shows on /start, About, when a user hits the daily limit, and on the force-sub join prompt._' +
         (config.vipChannelLink ? '' : '\n\n⚠️ Set a channel link below to activate the button — it stays hidden until then.');
@@ -2088,71 +2030,6 @@ bot.action('vip_settext', async (ctx) => {
     await ctx.editMessageText('✏️ Send the promo text shown above the Join button (benefits, price, etc.), or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'vip_menu' }]] }
     });
-});
-
-// --- Mega Management (multi-account bandwidth rotation) ---
-// A free MEGA account has a daily transfer quota (~5GB). If you own several
-// accounts, add them here — when the active one hits its limit, the bot
-// marks it on a 24h cooldown and rotates to the next ready account
-// automatically, logging the switch to the log channel.
-async function renderMegaManagementPanel(ctx) {
-    const accounts = getMegaAccountsWithStatus();
-    const lines = ['📦 *Mega Management*', '', `Accounts: ${accounts.length}`, ''];
-
-    if (accounts.length === 0) {
-        lines.push('_No MEGA accounts added yet — downloads use the default/anonymous session._');
-    } else {
-        accounts.forEach((a, i) => {
-            const marker = a.active ? '🔵 ' : '';
-            const status = a.ready ? '✅ Ready' : `⏳ Limited (${a.cooldownHoursLeft}h left)`;
-            lines.push(`${i + 1}. ${marker}${escapeMarkdown(a.label)} — ${status}`);
-        });
-        lines.push('', '_🔵 = currently active. When it hits the bandwidth limit, the bot rotates to the next ready one automatically._');
-    }
-
-    const keyboard = {
-        inline_keyboard: [
-            [{ text: '➕ Add Account', callback_data: 'megamgmt_add' }],
-            ...(accounts.length > 0 ? [[{ text: '➖ Remove Account', callback_data: 'megamgmt_remove_menu' }]] : []),
-            [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
-        ]
-    };
-    await ctx.editMessageText(lines.join('\n'), { parse_mode: 'Markdown', reply_markup: keyboard });
-}
-
-bot.action('megamgmt_menu', async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    await ctx.answerCbQuery();
-    await renderMegaManagementPanel(ctx);
-});
-
-bot.action('megamgmt_add', async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'mega_add_email' };
-    await ctx.editMessageText('📧 Send the MEGA account email, or /cancel.', {
-        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'megamgmt_menu' }]] }
-    });
-});
-
-bot.action('megamgmt_remove_menu', async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    await ctx.answerCbQuery();
-    const accounts = getMegaAccountsWithStatus();
-    if (accounts.length === 0) {
-        await renderMegaManagementPanel(ctx);
-        return;
-    }
-    const rows = accounts.map(a => [{ text: `🗑 ${a.label}`, callback_data: `megamgmt_remove:${a.id}` }]);
-    rows.push([{ text: '🔙 Back', callback_data: 'megamgmt_menu' }]);
-    await ctx.editMessageText('➖ *Remove Account*\n\nTap one to remove.', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
-});
-
-bot.action(/^megamgmt_remove:(.+)$/, async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    await ctx.answerCbQuery();
-    removeMegaAccount(ctx.match[1]);
-    await renderMegaManagementPanel(ctx);
 });
 
 // --- Maintenance mode ---
@@ -2649,7 +2526,7 @@ async function getVideoThumbnailFileId(adminId, chatId, messageId) {
 async function blurBuffer(buffer) {
     if (!sharp) return null;
     try {
-        return await sharp(buffer).blur(25).toBuffer();
+        return await sharp(buffer).blur(5).toBuffer();
     } catch (error) {
         console.error('blurBuffer failed:', error.message);
         return null;
@@ -3939,33 +3816,6 @@ async function handlePendingAction(ctx, text) {
         saveConfig(config);
         delete pendingAction[userId];
         await ctx.reply('✅ Promo text saved.');
-        return;
-    }
-
-    if (action.type === 'mega_add_email') {
-        const email = text.trim();
-        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-            await ctx.reply('⚠️ That doesn\'t look like a valid email. Try again, or /cancel.');
-            return;
-        }
-        pendingAction[userId] = { type: 'mega_add_password', email };
-        await ctx.reply('🔑 Now send the password for this account.');
-        return;
-    }
-
-    if (action.type === 'mega_add_password') {
-        const password = text; // not trimmed — passwords can meaningfully include whitespace
-        if (!password) {
-            await ctx.reply('⚠️ Send the password, or /cancel.');
-            return;
-        }
-        const email = action.email;
-        delete pendingAction[userId];
-        const account = addMegaAccount(email, password, email.split('@')[0]);
-        // Best-effort cleanup — remove the password from chat history. Not
-        // guaranteed to succeed everywhere, so it's wrapped and ignored on failure.
-        try { await ctx.deleteMessage(); } catch (e) { /* ignore */ }
-        await ctx.reply(`✅ MEGA account added: ${account.label}\n\nIt'll be used once the current active account hits its bandwidth limit (or immediately, if this is the first one added).`);
         return;
     }
 

@@ -927,6 +927,22 @@ bot.start(async (ctx) => {
                 }
             }
 
+            // Same cooldown / daily-limit gate as /random (setdailylimit),
+            // so this deep link can't be used to bypass the daily cap.
+            const check = checkRandomAllowed(ctx.from.id, config);
+            if (!check.allowed) {
+                if (check.reason === 'cooldown') {
+                    await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
+                } else {
+                    await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
+                        config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
+                }
+                return;
+            }
+            if (check.usedBonus) {
+                await ctx.reply('💎 Used 1 bonus credit (daily limit reached).');
+            }
+
             try {
                 await ctx.telegram.copyMessage(ctx.chat.id, decoded.chatId, decoded.messageId,
                     config.protectContent ? { protect_content: true } : {});
@@ -1052,6 +1068,22 @@ Just send any MEGA link in chat, I'll process it automatically.
 async function checkMembership(ctx, groupId, userId) {
     const settings = getForceSubSettings(groupId);
     if (settings.mode === 'pending') {
+        // Always try a live check first. A user who is already a genuine
+        // member — added directly by an admin after manual verification,
+        // or approved from Telegram's own request list without ever using
+        // this bot's "Request to Join" link — should pass immediately,
+        // even though we have no join-request record for them.
+        try {
+            const member = await ctx.telegram.getChatMember(groupId, userId);
+            if (['member', 'administrator', 'creator'].includes(member.status)) {
+                return true;
+            }
+        } catch (error) {
+            console.error('Membership live check failed:', error.message);
+            // Lookup failed — fall through to the join-request record below
+            // instead of failing closed immediately.
+        }
+
         // "Pending" groups never actually let the user in (or only after a
         // delay) — sending the join request itself is treated as proof,
         // UNLESS Telegram has since actually approved them into the group
@@ -1061,13 +1093,9 @@ async function checkMembership(ctx, groupId, userId) {
         // unlocking files after they've left.
         if (!hasJoinRequest(groupId, userId)) return false;
         if (isJoinRequestApproved(groupId, userId)) {
-            try {
-                const member = await ctx.telegram.getChatMember(groupId, userId);
-                return ['member', 'administrator', 'creator'].includes(member.status);
-            } catch (error) {
-                console.error('Membership recheck failed:', error.message);
-                return false; // fail closed — don't trust a stale request over a failed live check
-            }
+            // Already live-checked above and they weren't a real member —
+            // don't trust a stale "approved" record over that.
+            return false;
         }
         return true;
     }

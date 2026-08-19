@@ -915,6 +915,18 @@ bot.start(async (ctx) => {
         const decoded = decodeFileTag(ctx.startPayload);
         if (decoded) {
             const config = loadConfig();
+
+            // Force-sub gate — same check /start (no payload) does below.
+            // Without this, the "Get Full Video" deep link bypassed membership
+            // verification entirely.
+            if (config.forceSubGroupIds.length > 0) {
+                const unjoined = await getUnjoinedGroups(ctx, config.forceSubGroupIds, ctx.from.id);
+                if (unjoined.length > 0) {
+                    await sendJoinPrompt(ctx, unjoined);
+                    return;
+                }
+            }
+
             try {
                 await ctx.telegram.copyMessage(ctx.chat.id, decoded.chatId, decoded.messageId,
                     config.protectContent ? { protect_content: true } : {});

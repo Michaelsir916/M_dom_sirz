@@ -74,6 +74,27 @@ const {
     redeemPromoCode
 } = require('./fileShare');
 const queue = require('./queue');
+const megaManager = require('./megaManager');
+
+// ===== MEGA-link dedupe =====
+// Telegram (and Bot API webhook retries in particular) can redeliver the
+// same update, and users sometimes double-send/edit-resend a link. Without
+// this, the same MEGA link gets downloaded + re-uploaded twice. Keyed by
+// chat_id:message_id, capped so it can't grow forever on a long-running bot.
+const processedMegaMessageIds = new Map(); // "chatId:messageId" -> timestamp
+const MAX_PROCESSED_MEGA_IDS = 5000;
+
+function alreadyProcessedMegaMessage(chatId, messageId) {
+    const key = `${chatId}:${messageId}`;
+    if (processedMegaMessageIds.has(key)) return true;
+
+    processedMegaMessageIds.set(key, Date.now());
+    if (processedMegaMessageIds.size > MAX_PROCESSED_MEGA_IDS) {
+        const oldestKey = processedMegaMessageIds.keys().next().value;
+        processedMegaMessageIds.delete(oldestKey);
+    }
+    return false;
+}
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -412,6 +433,36 @@ function cleanupFolder(folderPath) {
     }
 }
 
+// How long a MEGA download stream can go without receiving any data before
+// we consider it stuck and kill it (as opposed to a total download timeout,
+// which would also punish large-but-healthy transfers).
+const STALL_TIMEOUT_MS = parseInt(process.env.MEGA_STALL_TIMEOUT_MS) || 30000;
+
+// Wraps a readable MEGA download stream with an inactivity watchdog: the
+// timer resets on every chunk received, and if it ever fires the stream is
+// destroyed with an error so the surrounding download logic sees a normal
+// 'error' event (and the outer queue.js retry logic can kick in) instead of
+// hanging forever on a stalled connection.
+function attachStallWatchdog(stream, label) {
+    let timer;
+    const reset = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+            const err = new Error(`Stalled: no data received for ${STALL_TIMEOUT_MS / 1000}s (${label})`);
+            err.code = 'MEGA_STALL';
+            stream.destroy(err);
+        }, STALL_TIMEOUT_MS);
+    };
+
+    reset();
+    stream.on('data', reset);
+    stream.once('close', () => clearTimeout(timer));
+    stream.once('end', () => clearTimeout(timer));
+    stream.once('error', () => clearTimeout(timer));
+
+    return stream;
+}
+
 async function getAllFilesFromFolder(folder) {
     const files = [];
 
@@ -499,7 +550,7 @@ async function downloadMegaFolder(folder, tempDir, onProgress) {
                 await new Promise((resolve, reject) => {
                     const writeStream = fs.createWriteStream(filePath);
                     let downloadedBytes = 0;
-                    const stream = file.download();
+                    const stream = attachStallWatchdog(file.download(), file.name);
 
                     stream.on('data', chunk => {
                         downloadedBytes += chunk.length;
@@ -565,9 +616,15 @@ async function downloadMegaFile(megaUrl, userId, onProgress) {
         fs.mkdirSync(tempDir, { recursive: true });
     }
 
+    // Route the download through the authenticated MEGA account (from .env)
+    // instead of an anonymous public-link request. Anonymous requests share
+    // MEGA's per-IP quota and get throttled/blocked quickly; an authenticated
+    // account gets its own transfer quota.
+    await megaManager.ensureConnected();
+
     return new Promise((resolve, reject) => {
         try {
-            const file = mega.File.fromURL(megaUrl);
+            const file = mega.File.fromURL(megaUrl, {}, megaManager.storage);
 
             if (!file) {
                 throw new Error('Could not parse MEGA URL');
@@ -607,7 +664,7 @@ async function downloadMegaFile(megaUrl, userId, onProgress) {
 
                     const writeStream = fs.createWriteStream(tempPath);
                     let downloadedBytes = 0;
-                    const stream = file.download();
+                    const stream = attachStallWatchdog(file.download(), file.name);
 
                     stream.on('data', chunk => {
                         downloadedBytes += chunk.length;
@@ -3656,6 +3713,10 @@ bot.on('channel_post', async (ctx) => {
             const megaLink = cleanMegaLink(text);
             if (megaLink) {
                 if (!(await isTrustedChannelAdmin(ctx))) return;
+                if (alreadyProcessedMegaMessage(ctx.chat.id, post.message_id)) {
+                    console.log(`⏭️ Duplicate MEGA link msg #${post.message_id} in channel ${ctx.chat.id} — skipped`);
+                    return;
+                }
                 console.log(`🔍 Detected MEGA link in channel ${ctx.chat.id}`);
                 await queue.add(() => processMegaLink(ctx, megaLink));
             }
@@ -4102,6 +4163,11 @@ bot.on('message', async (ctx) => {
             await logUnauthorizedAccess(ctx, 'mega_link_download');
             await ctx.reply('❌ This feature is available to admins only.');
         }
+        return;
+    }
+
+    if (alreadyProcessedMegaMessage(ctx.chat.id, ctx.message.message_id)) {
+        console.log(`⏭️ Duplicate MEGA link msg #${ctx.message.message_id} in ${ctx.chat.type} ${ctx.chat.id} — skipped`);
         return;
     }
 

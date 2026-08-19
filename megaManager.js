@@ -61,7 +61,7 @@ class MegaManager {
                 if (!this.isConnected && this.connectionPromise) {
                     this.connectionPromise.reject(new Error('Connection timeout'));
                 }
-            }, 20000);
+            }, 40000);
 
         } catch (error) {
             console.error('Failed to initialize MEGA:', error);
@@ -93,7 +93,34 @@ class MegaManager {
         try {
             await this.connectionPromise.promise;
         } catch (error) {
+            // connectionPromise wraps ONE Promise object — once it has
+            // rejected (e.g. the 20s startup timeout fired), awaiting it
+            // again replays that exact same cached rejection forever, even
+            // after the network recovers. Clear it here so the next call
+            // starts a fresh login attempt instead of looping on a stale
+            // failure until the bot is restarted.
+            this.connectionPromise = null;
             throw new Error(`MEGA connection failed: ${error.message}`);
+        }
+    }
+
+    // Call this instead of ensureConnected() from download/upload entry
+    // points when you want a failed connection to actually retry rather
+    // than just report the same error again. Since ensureConnected() now
+    // clears connectionPromise on failure, calling it a second time here
+    // triggers a brand-new login instead of reusing a dead one.
+    async ensureConnectedWithRetry(retries = 1) {
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                if (!this.connectionPromise && !this.isConnected) {
+                    await this.initialize();
+                }
+                await this.ensureConnected();
+                return;
+            } catch (error) {
+                if (attempt === retries) throw error;
+                console.log(`⏳ MEGA connect attempt ${attempt + 1} failed, retrying...`);
+            }
         }
     }
 

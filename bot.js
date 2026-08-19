@@ -620,7 +620,12 @@ async function downloadMegaFile(megaUrl, userId, onProgress) {
     // instead of an anonymous public-link request. Anonymous requests share
     // MEGA's per-IP quota and get throttled/blocked quickly; an authenticated
     // account gets its own transfer quota.
-    await megaManager.ensureConnected();
+    //
+    // Uses ensureConnectedWithRetry (not ensureConnected) because a single
+    // failed/timed-out login used to get cached forever — every download
+    // after that would fail instantly with the same stale error until the
+    // bot was restarted. This retries a fresh login once before giving up.
+    await megaManager.ensureConnectedWithRetry(1);
 
     return new Promise((resolve, reject) => {
         try {

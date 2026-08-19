@@ -17,17 +17,32 @@ class MegaManager {
     async initialize() {
         try {
             console.log('🔧 Initializing MEGA Manager...');
-            
-           
-            this.storage = new mega.Storage({
-                email: 'session',
-                password: process.env.MEGA_SESSION,
-                autologin: false
+
+            const email = process.env.MEGA_EMAIL;
+            const password = process.env.MEGA_PASSWORD;
+
+            if (!email || !password) {
+                throw new Error('MEGA_EMAIL / MEGA_PASSWORD not set in .env — authenticated login requires both');
+            }
+
+            this.connectionPromise = {};
+            this.connectionPromise.promise = new Promise((resolve, reject) => {
+                this.connectionPromise.resolve = resolve;
+                this.connectionPromise.reject = reject;
             });
 
-         
+            // Real authenticated account login (not an anonymous/public-link
+            // session). This is what lets downloads use the account's own
+            // transfer quota instead of MEGA's anonymous per-IP quota.
+            this.storage = new mega.Storage({
+                email,
+                password,
+                autologin: true,
+                keepalive: true
+            });
+
             this.storage.on('ready', () => {
-                console.log('✅ MEGA connected successfully!');
+                console.log(`✅ MEGA connected successfully as ${email}`);
                 this.isConnected = true;
                 if (this.connectionPromise) {
                     this.connectionPromise.resolve();
@@ -42,24 +57,28 @@ class MegaManager {
                 }
             });
 
-          
-            this.connectionPromise = {};
-            this.connectionPromise.promise = new Promise((resolve, reject) => {
-                this.connectionPromise.resolve = resolve;
-                this.connectionPromise.reject = reject;
-            });
-
-        
             setTimeout(() => {
                 if (!this.isConnected && this.connectionPromise) {
                     this.connectionPromise.reject(new Error('Connection timeout'));
                 }
-            }, 10000);
+            }, 20000);
 
         } catch (error) {
             console.error('Failed to initialize MEGA:', error);
-            throw error;
+            this.isConnected = false;
+            if (this.connectionPromise) {
+                this.connectionPromise.reject(error);
+            }
         }
+    }
+
+    // Allows callers to retry a login that failed at startup (e.g. .env was
+    // fixed after the process started) without restarting the whole bot.
+    async reconnect() {
+        this.isConnected = false;
+        this.storage = null;
+        await this.initialize();
+        return this.ensureConnected();
     }
 
     async ensureConnected() {

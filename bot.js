@@ -71,7 +71,13 @@ const {
     createPromoCode,
     deletePromoCode,
     listPromoCodes,
-    redeemPromoCode
+    redeemPromoCode,
+    createCategory,
+    deleteCategory,
+    getCategoryById,
+    listCategories,
+    getCategoryFileCount,
+    getUnseenCategoryFiles
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -1185,6 +1191,7 @@ const MY_STATS_KEYBOARD = {
     inline_keyboard: [
         [{ text: '💎 Buy VIP', callback_data: 'vip_info' }],
         [{ text: '🎬 Free Video', callback_data: 'user_random' }],
+        [{ text: '📁 VIP Files', callback_data: 'vip_files_menu' }],
         [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
         [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
         [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
@@ -1192,27 +1199,107 @@ const MY_STATS_KEYBOARD = {
     ]
 };
 
-// Minimal HTML-escaping for admin-supplied text/URLs dropped into an
+// --- User-facing: VIP-only Categories ("📁 VIP Files") ---
+// Non-VIP users tapping this get an upsell instead of the category list —
+// membership is re-checked again on every step (menu open AND file pick) so
+// a VIP that expires mid-browse can't keep pulling files past their expiry.
+bot.action('vip_files_menu', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!isUserVip(ctx.from.id)) {
+        await ctx.reply(
+            '🔒 <b>VIP Files</b> is a members-only area with exclusive categories you won\'t find in the free pool.\n\n' +
+            'Get VIP access to unlock it.',
+            {
+                parse_mode: 'HTML',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '💎 Buy VIP', callback_data: 'vip_info' }],
+                        [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }]
+                    ]
+                }
+            }
+        );
+        return;
+    }
+
+    const categories = listCategories();
+    if (categories.length === 0) {
+        await ctx.reply('📁 No VIP categories have been added yet — check back later!', { reply_markup: MY_STATS_KEYBOARD });
+        return;
+    }
+
+    const rows = categories.slice(0, 30).map(c => [{ text: `📁 ${c.name}`, callback_data: `vipfile_cat:${c.id}` }]);
+    await ctx.reply('📁 <b>VIP Files</b>\n\nPick a category:', {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^vipfile_cat:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    if (!isUserVip(ctx.from.id)) {
+        await ctx.reply('🔒 Your VIP access has expired. Renew to keep browsing VIP Files.', {
+            reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP', callback_data: 'vip_info' }]] }
+        });
+        return;
+    }
+
+    const id = ctx.match[1];
+    const category = getCategoryById(id);
+    if (!category) {
+        await ctx.reply('⚠️ This category no longer exists.', { reply_markup: MY_STATS_KEYBOARD });
+        return;
+    }
+
+    const config = loadConfig();
+    const unseen = getUnseenCategoryFiles(ctx.from.id, id);
+    if (unseen.length === 0) {
+        await ctx.reply(`🎉 You've received every file in "${category.name}" so far! Check back later for new ones.`, { reply_markup: MY_STATS_KEYBOARD });
+        return;
+    }
+
+    const file = unseen[Math.floor(Math.random() * unseen.length)];
+    try {
+        const sent = await ctx.telegram.copyMessage(ctx.chat.id, file.chat_id, file.message_id,
+            config.protectContent ? { protect_content: true } : {});
+        markSeen(ctx.from.id, [file]);
+
+        if (config.autoDeleteMinutes > 0) {
+            const ms = config.autoDeleteMinutes * 60 * 1000;
+            setTimeout(() => {
+                ctx.telegram.deleteMessage(ctx.chat.id, sent.message_id).catch(() => {});
+            }, ms);
+            await ctx.reply(`📁 From "${category.name}" — auto-deletes in ${config.autoDeleteMinutes} minute(s).`, {
+                reply_markup: { inline_keyboard: [[{ text: `📁 Another from ${category.name}`, callback_data: `vipfile_cat:${id}` }]] }
+            });
+        } else {
+            await ctx.reply(`📁 From "${category.name}"`, {
+                reply_markup: { inline_keyboard: [[{ text: `📁 Another from ${category.name}`, callback_data: `vipfile_cat:${id}` }]] }
+            });
+        }
+    } catch (error) {
+        console.error('Failed to copy VIP category file:', error.message);
+        if (error.message && error.message.includes('message to copy not found')) {
+            removeSharedFile(file.chat_id, file.message_id);
+        }
+        await ctx.reply('❌ Could not send that file, please try again.', { reply_markup: MY_STATS_KEYBOARD });
+    }
+});
+
+// Minimal HTML-escaping for admin/user-supplied text dropped into an
 // HTML-parse-mode message (About panel link text, join-group link, VIP
-// promo text, etc).
+// promo text, promo codes, etc). HTML mode is used for anything containing
+// user-controlled text because Telegram's legacy Markdown mode has no
+// escape mechanism at all (backslash-escaping only works in MarkdownV2) —
+// a stray _ * ` [ in the saved text would leave an unbalanced entity and
+// Telegram rejects the whole message with "can't parse entities". HTML only
+// needs these 4 characters escaped, so it's simple to make airtight.
 function escapeHtml(str) {
     return String(str)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
-}
-
-// Escaping for admin/user-supplied text dropped into a legacy
-// parse_mode:'Markdown' message (VIP channel link, VIP promo text, promo
-// codes, etc). Without this, a stray _ * ` [ in the saved text leaves an
-// unbalanced Markdown entity and Telegram rejects the whole message with
-// "can't parse entities" — the panel then silently fails to render (the
-// button's loading spinner just clears with nothing shown) or, for a
-// plain ctx.reply, the admin gets no response at all even though the
-// underlying action (e.g. promo code creation) already succeeded.
-function escapeMarkdown(str) {
-    return String(str).replace(/([_*`\[])/g, '\\$1');
 }
 
 // "💎 Buy VIP" — the main promo entry point. Shown on /start, the About
@@ -2084,11 +2171,11 @@ bot.action('about_seturl', async (ctx) => {
 async function renderVipPanel(ctx) {
     const config = loadConfig();
     const stats = getVipStats();
-    const text = '💎 *VIP Promotion*\n\n' +
-        `Channel Link: ${config.vipChannelLink ? escapeMarkdown(config.vipChannelLink) : '_Not set_'}\n` +
-        `Promo Text: ${config.vipPromoText ? escapeMarkdown(config.vipPromoText) : '_Not set_'}\n\n` +
+    const text = '💎 <b>VIP Promotion</b>\n\n' +
+        `Channel Link: ${config.vipChannelLink ? escapeHtml(config.vipChannelLink) : '<i>Not set</i>'}\n` +
+        `Promo Text: ${config.vipPromoText ? escapeHtml(config.vipPromoText) : '<i>Not set</i>'}\n\n` +
         `📊 Button taps: ${stats.totalClicks} total, ${stats.uniqueUsers} unique user(s)\n\n` +
-        '_"💎 Buy VIP" shows on /start, About, when a user hits the daily limit, and on the force-sub join prompt._' +
+        '<i>"💎 Buy VIP" shows on /start, About, when a user hits the daily limit, and on the force-sub join prompt.</i>' +
         (config.vipChannelLink ? '' : '\n\n⚠️ Set a channel link below to activate the button — it stays hidden until then.');
 
     const keyboard = {
@@ -2098,7 +2185,7 @@ async function renderVipPanel(ctx) {
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
-    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
 }
 
 bot.action('vip_menu', async (ctx) => {
@@ -2129,27 +2216,28 @@ bot.action('vip_settext', async (ctx) => {
 // --- Promo Codes (admin creates codes that grant VIP access on redemption) ---
 async function renderPromoPanel(ctx) {
     const codes = listPromoCodes();
-    let text = '🎟 *Promo Codes*\n\n';
+    let text = '🎟 <b>Promo Codes</b>\n\n';
 
     if (codes.length === 0) {
-        text += '_No codes created yet._';
+        text += '<i>No codes created yet.</i>';
     } else {
         text += codes.slice(0, 15).map(c => {
             const duration = c.days > 0 ? `${c.days}d` : 'Lifetime';
             const uses = c.maxUses > 0 ? `${c.usedBy.length}/${c.maxUses}` : `${c.usedBy.length}/∞`;
-            return `\`${escapeMarkdown(c.code)}\` — ${duration} — used ${uses}`;
+            return `<code>${escapeHtml(c.code)}</code> — ${duration} — used ${uses}`;
         }).join('\n');
-        if (codes.length > 15) text += `\n_...and ${codes.length - 15} more_`;
+        if (codes.length > 15) text += `\n<i>...and ${codes.length - 15} more</i>`;
     }
 
     const keyboard = {
         inline_keyboard: [
             [{ text: '➕ Create Code', callback_data: 'promo_create_menu' }],
             [{ text: '🗑 Delete Code', callback_data: 'promo_delete_menu' }],
+            [{ text: '📁 VIP Categories', callback_data: 'category_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
-    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard });
 }
 
 bot.action('promo_menu', async (ctx) => {
@@ -2163,16 +2251,16 @@ bot.action('promo_create_menu', async (ctx) => {
     await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'promo_create' };
     await ctx.editMessageText(
-        '➕ *Create Promo Code*\n\n' +
-        'Send: `CODE DAYS [MAXUSES]`\n\n' +
-        '• `DAYS` — how many days of VIP access. Use `0` for lifetime/unlimited.\n' +
-        '• `MAXUSES` — optional, how many different users can redeem this code. Leave blank or `0` for unlimited people.\n\n' +
+        '➕ <b>Create Promo Code</b>\n\n' +
+        'Send: <code>CODE DAYS [MAXUSES]</code>\n\n' +
+        '• <code>DAYS</code> — how many days of VIP access. Use <code>0</code> for lifetime/unlimited.\n' +
+        '• <code>MAXUSES</code> — optional, how many different users can redeem this code. Leave blank or <code>0</code> for unlimited people.\n\n' +
         'Examples:\n' +
-        '`SUMMER30 30` → 30 days VIP, any number of people can use it\n' +
-        '`VIPFRIEND 0 1` → lifetime VIP, redeemable by only 1 person\n' +
-        '`WEEKPASS 7 50` → 7 days VIP, up to 50 people\n\n' +
+        '<code>SUMMER30 30</code> → 30 days VIP, any number of people can use it\n' +
+        '<code>VIPFRIEND 0 1</code> → lifetime VIP, redeemable by only 1 person\n' +
+        '<code>WEEKPASS 7 50</code> → 7 days VIP, up to 50 people\n\n' +
         'Or /cancel.',
-        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] } }
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] } }
     );
 });
 
@@ -2183,6 +2271,111 @@ bot.action('promo_delete_menu', async (ctx) => {
     await ctx.editMessageText('🗑 Send the code to delete, or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
     });
+});
+
+// --- VIP Categories (VIP-exclusive file folders) ---
+// A category is a named, VIP-only bucket of files. Creating one immediately
+// enters "recording" mode (config.activeCategory): every photo/video the
+// admin posts into the tracked source group/channel from that point on is
+// tagged into this category instead of the normal public /random pool, until
+// the admin taps ⏹ Stop. VIP users then browse categories one at a time via
+// the "📁 VIP Files" button and pull a random unseen file from whichever one
+// they pick — see vip_files_menu / vipfile_cat below.
+async function renderCategoryPanel(ctx) {
+    const config = loadConfig();
+    const categories = listCategories();
+    const active = config.activeCategory ? getCategoryById(config.activeCategory) : null;
+
+    let text = '📁 <b>VIP Categories</b>\n\n';
+    text += active
+        ? `🔴 <b>Recording now:</b> ${escapeHtml(active.name)}\n<i>Every file posted in the source channel is being saved here.</i>\n\n`
+        : '<i>Not currently recording — files posted in the source channel go to the normal pool.</i>\n\n';
+
+    if (categories.length === 0) {
+        text += '<i>No categories created yet.</i>';
+    } else {
+        text += categories.slice(0, 20).map(c => {
+            const count = getCategoryFileCount(c.id);
+            const mark = config.activeCategory === c.id ? '🔴 ' : '';
+            return `${mark}📁 ${escapeHtml(c.name)} — ${count} file(s)`;
+        }).join('\n');
+        if (categories.length > 20) text += `\n<i>...and ${categories.length - 20} more</i>`;
+    }
+
+    const rows = [[{ text: '➕ Create Category', callback_data: 'category_create_menu' }]];
+    if (config.activeCategory) {
+        rows.push([{ text: '⏹ Stop Recording', callback_data: 'category_stop' }]);
+    }
+    if (categories.length > 0) {
+        rows.push([{ text: '🗑 Delete Category', callback_data: 'category_delete_menu' }]);
+    }
+    rows.push([{ text: '🔙 Back', callback_data: 'promo_menu' }]);
+
+    await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: { inline_keyboard: rows } });
+}
+
+bot.action('category_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderCategoryPanel(ctx);
+});
+
+bot.action('category_create_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'category_create' };
+    await ctx.editMessageText(
+        '➕ <b>Create VIP Category</b>\n\n' +
+        'Send the name for this category (any name you like — it\'s just a label VIP users will see).\n\n' +
+        'As soon as it\'s created, recording starts automatically: every photo/video you post in the source channel from then on is saved into this category instead of the normal pool, until you tap ⏹ Stop Recording.\n\n' +
+        'Or /cancel.',
+        { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'category_menu' }]] } }
+    );
+});
+
+bot.action('category_stop', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const config = loadConfig();
+    const wasActive = config.activeCategory ? getCategoryById(config.activeCategory) : null;
+    config.activeCategory = null;
+    saveConfig(config);
+    await ctx.answerCbQuery(wasActive ? `⏹ Stopped recording "${wasActive.name}"` : '⏹ Stopped');
+    await renderCategoryPanel(ctx);
+});
+
+bot.action('category_delete_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    const categories = listCategories();
+    if (categories.length === 0) {
+        await ctx.editMessageText('No categories to delete.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'category_menu' }]] }
+        });
+        return;
+    }
+    const rows = categories.slice(0, 20).map(c => [{ text: `❌ ${c.name}`, callback_data: `category_del:${c.id}` }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'category_menu' }]);
+    await ctx.editMessageText('🗑 Tap a category to delete it.\n\n<i>Note: files already saved in it are kept but become unreachable from the VIP Files menu once it\'s deleted.</i>', {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+bot.action(/^category_del:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const id = ctx.match[1];
+    const cat = getCategoryById(id);
+    const deleted = deleteCategory(id);
+    if (deleted && cat) {
+        // If the deleted category was the one currently recording, stop recording too.
+        const config = loadConfig();
+        if (config.activeCategory === id) {
+            config.activeCategory = null;
+            saveConfig(config);
+        }
+    }
+    await ctx.answerCbQuery(deleted ? `✅ Deleted "${cat ? cat.name : id}"` : '⚠️ Not found (may already be deleted)');
+    await renderCategoryPanel(ctx);
 });
 
 // --- Maintenance mode ---
@@ -2785,7 +2978,7 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
     }
 
     const sourceIds = cfg.sourceChannelIds.map(String);
-    const files = loadSharedFiles().filter(f => f.type === 'video' && sourceIds.includes(String(f.chat_id)));
+    const files = loadSharedFiles().filter(f => f.type === 'video' && !f.category && sourceIds.includes(String(f.chat_id)));
     const unposted = files.filter(f => !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`));
 
     // Low-queue warning: fires once when the queue drops below the
@@ -2938,7 +3131,7 @@ async function checkDailyHealthReport() {
         const stats = getAutopostStats(cfg.adminId);
         const sourceIds = (cfg.sourceChannelIds || []).map(String);
         const queueCount = sourceIds.length > 0
-            ? loadSharedFiles().filter(f => f.type === 'video' && sourceIds.includes(String(f.chat_id)) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
+            ? loadSharedFiles().filter(f => f.type === 'video' && !f.category && sourceIds.includes(String(f.chat_id)) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
             : 0;
         lines.push(`• Admin \`${cfg.adminId}\`: ${cfg.enabled ? '✅ Running' : '⏸ Paused'} | Queue: ${queueCount}${queueCount < LOW_QUEUE_THRESHOLD ? ' ⚠️' : ''} | Posted today: ${stats.today}`);
     }
@@ -3009,7 +3202,7 @@ async function renderAutopostPanel(ctx) {
         ? sourceIds.map(id => getKnownChats().find(c => String(c.id) === String(id))?.title || id).join(', ')
         : 'Not set';
     const queueCount = sourceIds.length > 0
-        ? loadSharedFiles().filter(f => f.type === 'video' && sourceIds.map(String).includes(String(f.chat_id)) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
+        ? loadSharedFiles().filter(f => f.type === 'video' && !f.category && sourceIds.map(String).includes(String(f.chat_id)) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
         : 0;
     const stats = getAutopostStats(adminId);
     const text = '🖼 *Auto-Post* (only visible/controllable by you)\n\n' +
@@ -3508,9 +3701,11 @@ bot.on(['photo', 'video', 'animation'], async (ctx) => {
 
     const type = Array.isArray(ctx.message.photo) ? 'photo' : 'video';
     const fileUniqueId = type === 'video' ? ctx.message.video.file_unique_id : ctx.message.photo[ctx.message.photo.length - 1].file_unique_id;
-    const added = addSharedFile(ctx.chat.id, ctx.message.message_id, type, fileUniqueId);
+    const added = addSharedFile(ctx.chat.id, ctx.message.message_id, type, fileUniqueId, config.activeCategory || null);
     if (added) {
-        console.log(`Tracked ${type} msg #${ctx.message.message_id} in share pool`);
+        console.log(config.activeCategory
+            ? `Tracked ${type} msg #${ctx.message.message_id} in VIP category ${config.activeCategory}`
+            : `Tracked ${type} msg #${ctx.message.message_id} in share pool`);
     } else {
         console.log(`Duplicate ${type} msg #${ctx.message.message_id} — already in share pool, skipped`);
     }
@@ -3610,9 +3805,11 @@ bot.on('channel_post', async (ctx) => {
         if (isTrackedSourceChat(ctx.chat.id, config)) {
             const type = post.photo ? 'photo' : 'video';
             const fileUniqueId = type === 'video' ? post.video.file_unique_id : post.photo[post.photo.length - 1].file_unique_id;
-            const added = addSharedFile(ctx.chat.id, post.message_id, type, fileUniqueId);
+            const added = addSharedFile(ctx.chat.id, post.message_id, type, fileUniqueId, config.activeCategory || null);
             if (added) {
-                console.log(`Tracked ${type} msg #${post.message_id} in share pool (channel)`);
+                console.log(config.activeCategory
+                    ? `Tracked ${type} msg #${post.message_id} in VIP category ${config.activeCategory} (channel)`
+                    : `Tracked ${type} msg #${post.message_id} in share pool (channel)`);
             } else {
                 console.log(`Duplicate ${type} msg #${post.message_id} — already in share pool, skipped (channel)`);
             }
@@ -3953,7 +4150,7 @@ async function handlePendingAction(ctx, text) {
     if (action.type === 'promo_create') {
         const parts = text.trim().split(/\s+/);
         if (parts.length < 2) {
-            await ctx.reply('⚠️ Send: `CODE DAYS [MAXUSES]` (e.g. `SUMMER30 30`), or /cancel.', { parse_mode: 'Markdown' });
+            await ctx.reply('⚠️ Send: <code>CODE DAYS [MAXUSES]</code> (e.g. <code>SUMMER30 30</code>), or /cancel.', { parse_mode: 'HTML' });
             return;
         }
         const [codeRaw, daysRaw, maxUsesRaw] = parts;
@@ -3970,18 +4167,18 @@ async function handlePendingAction(ctx, text) {
         const result = createPromoCode(codeRaw, days, maxUses, userId);
         delete pendingAction[userId];
         if (!result.success) {
-            await ctx.reply(result.reason === 'exists' ? `⚠️ Code \`${escapeMarkdown(codeRaw.toUpperCase())}\` already exists.` : '⚠️ Could not create that code.', { parse_mode: 'Markdown' });
+            await ctx.reply(result.reason === 'exists' ? `⚠️ Code <code>${escapeHtml(codeRaw.toUpperCase())}</code> already exists.` : '⚠️ Could not create that code.', { parse_mode: 'HTML' });
             return;
         }
         const durationText = days > 0 ? `${days} day(s)` : 'Lifetime';
         const usesText = maxUses > 0 ? `${maxUses} user(s)` : 'Unlimited users';
         await ctx.reply(
             `✅ Promo code created!\n\n` +
-            `Code: \`${escapeMarkdown(result.code.code)}\`\n` +
+            `Code: <code>${escapeHtml(result.code.code)}</code>\n` +
             `Grants: ${durationText} VIP\n` +
             `Redeemable by: ${usesText}\n\n` +
             `Share this with the user — they redeem it with /redeem or the 🎟 Redeem Code button.`,
-            { parse_mode: 'Markdown' }
+            { parse_mode: 'HTML' }
         );
         return;
     }
@@ -3990,7 +4187,35 @@ async function handlePendingAction(ctx, text) {
         const code = text.trim().toUpperCase();
         const deleted = deletePromoCode(code);
         delete pendingAction[userId];
-        await ctx.reply(deleted ? `✅ Code \`${escapeMarkdown(code)}\` deleted.` : `⚠️ Code \`${escapeMarkdown(code)}\` not found.`, { parse_mode: 'Markdown' });
+        await ctx.reply(deleted ? `✅ Code <code>${escapeHtml(code)}</code> deleted.` : `⚠️ Code <code>${escapeHtml(code)}</code> not found.`, { parse_mode: 'HTML' });
+        return;
+    }
+
+    if (action.type === 'category_create') {
+        const name = text.trim();
+        const result = createCategory(name, userId);
+        delete pendingAction[userId];
+        if (!result.success) {
+            const messages = {
+                empty: '⚠️ Category name can\'t be empty. Try again, or /cancel.',
+                too_long: '⚠️ Category name is too long (max 64 characters). Try again, or /cancel.',
+                exists: `⚠️ A category named <b>${escapeHtml(name)}</b> already exists. Try again, or /cancel.`
+            };
+            await ctx.reply(messages[result.reason] || '⚠️ Could not create that category.', { parse_mode: 'HTML' });
+            return;
+        }
+        const config = loadConfig();
+        config.activeCategory = result.category.id;
+        saveConfig(config);
+        await ctx.reply(
+            `✅ Category <b>${escapeHtml(result.category.name)}</b> created and recording started!\n\n` +
+            `Every photo/video you post in the source channel now goes into this category (VIP-only — hidden from the normal /random pool).\n\n` +
+            `Tap ⏹ Stop Recording in the 📁 VIP Categories panel when you're done.`,
+            {
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: '⏹ Stop Recording', callback_data: 'category_stop' }]] }
+            }
+        );
         return;
     }
 

@@ -34,7 +34,6 @@ const {
     recordKnownChat,
     getKnownChats,
     removeKnownChat,
-    markKnownChatDead,
     markUserBlocked,
     addBroadcastHistory,
     getBroadcastHistory,
@@ -72,39 +71,9 @@ const {
     createPromoCode,
     deletePromoCode,
     listPromoCodes,
-    redeemPromoCode,
-    listVipCategories,
-    getVipCategory,
-    createVipCategory,
-    deleteVipCategory,
-    addVipCategoryFile,
-    removeVipCategoryFile,
-    setActiveVipCategory,
-    stopVipCapture,
-    getActiveVipCategory
+    redeemPromoCode
 } = require('./fileShare');
 const queue = require('./queue');
-const megaManager = require('./megaManager');
-
-// ===== MEGA-link dedupe =====
-// Telegram (and Bot API webhook retries in particular) can redeliver the
-// same update, and users sometimes double-send/edit-resend a link. Without
-// this, the same MEGA link gets downloaded + re-uploaded twice. Keyed by
-// chat_id:message_id, capped so it can't grow forever on a long-running bot.
-const processedMegaMessageIds = new Map(); // "chatId:messageId" -> timestamp
-const MAX_PROCESSED_MEGA_IDS = 5000;
-
-function alreadyProcessedMegaMessage(chatId, messageId) {
-    const key = `${chatId}:${messageId}`;
-    if (processedMegaMessageIds.has(key)) return true;
-
-    processedMegaMessageIds.set(key, Date.now());
-    if (processedMegaMessageIds.size > MAX_PROCESSED_MEGA_IDS) {
-        const oldestKey = processedMegaMessageIds.keys().next().value;
-        processedMegaMessageIds.delete(oldestKey);
-    }
-    return false;
-}
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
@@ -443,36 +412,6 @@ function cleanupFolder(folderPath) {
     }
 }
 
-// How long a MEGA download stream can go without receiving any data before
-// we consider it stuck and kill it (as opposed to a total download timeout,
-// which would also punish large-but-healthy transfers).
-const STALL_TIMEOUT_MS = parseInt(process.env.MEGA_STALL_TIMEOUT_MS) || 30000;
-
-// Wraps a readable MEGA download stream with an inactivity watchdog: the
-// timer resets on every chunk received, and if it ever fires the stream is
-// destroyed with an error so the surrounding download logic sees a normal
-// 'error' event (and the outer queue.js retry logic can kick in) instead of
-// hanging forever on a stalled connection.
-function attachStallWatchdog(stream, label) {
-    let timer;
-    const reset = () => {
-        clearTimeout(timer);
-        timer = setTimeout(() => {
-            const err = new Error(`Stalled: no data received for ${STALL_TIMEOUT_MS / 1000}s (${label})`);
-            err.code = 'MEGA_STALL';
-            stream.destroy(err);
-        }, STALL_TIMEOUT_MS);
-    };
-
-    reset();
-    stream.on('data', reset);
-    stream.once('close', () => clearTimeout(timer));
-    stream.once('end', () => clearTimeout(timer));
-    stream.once('error', () => clearTimeout(timer));
-
-    return stream;
-}
-
 async function getAllFilesFromFolder(folder) {
     const files = [];
 
@@ -560,7 +499,7 @@ async function downloadMegaFolder(folder, tempDir, onProgress) {
                 await new Promise((resolve, reject) => {
                     const writeStream = fs.createWriteStream(filePath);
                     let downloadedBytes = 0;
-                    const stream = attachStallWatchdog(file.download(), file.name);
+                    const stream = file.download();
 
                     stream.on('data', chunk => {
                         downloadedBytes += chunk.length;
@@ -626,20 +565,9 @@ async function downloadMegaFile(megaUrl, userId, onProgress) {
         fs.mkdirSync(tempDir, { recursive: true });
     }
 
-    // Route the download through the authenticated MEGA account (from .env)
-    // instead of an anonymous public-link request. Anonymous requests share
-    // MEGA's per-IP quota and get throttled/blocked quickly; an authenticated
-    // account gets its own transfer quota.
-    //
-    // Uses ensureConnectedWithRetry (not ensureConnected) because a single
-    // failed/timed-out login used to get cached forever — every download
-    // after that would fail instantly with the same stale error until the
-    // bot was restarted. This retries a fresh login once before giving up.
-    await megaManager.ensureConnectedWithRetry(1);
-
     return new Promise((resolve, reject) => {
         try {
-            const file = mega.File.fromURL(megaUrl, {}, megaManager.storage);
+            const file = mega.File.fromURL(megaUrl);
 
             if (!file) {
                 throw new Error('Could not parse MEGA URL');
@@ -679,7 +607,7 @@ async function downloadMegaFile(megaUrl, userId, onProgress) {
 
                     const writeStream = fs.createWriteStream(tempPath);
                     let downloadedBytes = 0;
-                    const stream = attachStallWatchdog(file.download(), file.name);
+                    const stream = file.download();
 
                     stream.on('data', chunk => {
                         downloadedBytes += chunk.length;
@@ -987,34 +915,6 @@ bot.start(async (ctx) => {
         const decoded = decodeFileTag(ctx.startPayload);
         if (decoded) {
             const config = loadConfig();
-
-            // Force-sub gate — same check /start (no payload) does below.
-            // Without this, the "Get Full Video" deep link bypassed membership
-            // verification entirely.
-            if (config.forceSubGroupIds.length > 0) {
-                const unjoined = await getUnjoinedGroups(ctx, config.forceSubGroupIds, ctx.from.id);
-                if (unjoined.length > 0) {
-                    await sendJoinPrompt(ctx, unjoined);
-                    return;
-                }
-            }
-
-            // Same cooldown / daily-limit gate as /random (setdailylimit),
-            // so this deep link can't be used to bypass the daily cap.
-            const check = checkRandomAllowed(ctx.from.id, config);
-            if (!check.allowed) {
-                if (check.reason === 'cooldown') {
-                    await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
-                } else {
-                    await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                        config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
-                }
-                return;
-            }
-            if (check.usedBonus) {
-                await ctx.reply('💎 Used 1 bonus credit (daily limit reached).');
-            }
-
             try {
                 await ctx.telegram.copyMessage(ctx.chat.id, decoded.chatId, decoded.messageId,
                     config.protectContent ? { protect_content: true } : {});
@@ -1140,22 +1040,6 @@ Just send any MEGA link in chat, I'll process it automatically.
 async function checkMembership(ctx, groupId, userId) {
     const settings = getForceSubSettings(groupId);
     if (settings.mode === 'pending') {
-        // Always try a live check first. A user who is already a genuine
-        // member — added directly by an admin after manual verification,
-        // or approved from Telegram's own request list without ever using
-        // this bot's "Request to Join" link — should pass immediately,
-        // even though we have no join-request record for them.
-        try {
-            const member = await ctx.telegram.getChatMember(groupId, userId);
-            if (['member', 'administrator', 'creator'].includes(member.status)) {
-                return true;
-            }
-        } catch (error) {
-            console.error('Membership live check failed:', error.message);
-            // Lookup failed — fall through to the join-request record below
-            // instead of failing closed immediately.
-        }
-
         // "Pending" groups never actually let the user in (or only after a
         // delay) — sending the join request itself is treated as proof,
         // UNLESS Telegram has since actually approved them into the group
@@ -1165,9 +1049,13 @@ async function checkMembership(ctx, groupId, userId) {
         // unlocking files after they've left.
         if (!hasJoinRequest(groupId, userId)) return false;
         if (isJoinRequestApproved(groupId, userId)) {
-            // Already live-checked above and they weren't a real member —
-            // don't trust a stale "approved" record over that.
-            return false;
+            try {
+                const member = await ctx.telegram.getChatMember(groupId, userId);
+                return ['member', 'administrator', 'creator'].includes(member.status);
+            } catch (error) {
+                console.error('Membership recheck failed:', error.message);
+                return false; // fail closed — don't trust a stale request over a failed live check
+            }
         }
         return true;
     }
@@ -1297,7 +1185,6 @@ const MY_STATS_KEYBOARD = {
     inline_keyboard: [
         [{ text: '💎 Buy VIP', callback_data: 'vip_info' }],
         [{ text: '🎬 Free Video', callback_data: 'user_random' }],
-        [{ text: '📁 VIP Folder', callback_data: 'user_vipfolder' }],
         [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
         [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
         [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
@@ -1314,6 +1201,18 @@ function escapeHtml(str) {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
+}
+
+// Escaping for admin/user-supplied text dropped into a legacy
+// parse_mode:'Markdown' message (VIP channel link, VIP promo text, promo
+// codes, etc). Without this, a stray _ * ` [ in the saved text leaves an
+// unbalanced Markdown entity and Telegram rejects the whole message with
+// "can't parse entities" — the panel then silently fails to render (the
+// button's loading spinner just clears with nothing shown) or, for a
+// plain ctx.reply, the admin gets no response at all even though the
+// underlying action (e.g. promo code creation) already succeeded.
+function escapeMarkdown(str) {
+    return String(str).replace(/([_*`\[])/g, '\\$1');
 }
 
 // "💎 Buy VIP" — the main promo entry point. Shown on /start, the About
@@ -2006,90 +1905,6 @@ bot.action('recheck_sub', async (ctx) => {
     await sendRandomFiles(ctx);
 });
 
-// --- User-facing: VIP Folder (promo/VIP-exclusive categories) ---
-const VIPFOLDER_PAGE_SIZE = 10;
-
-async function renderUserVipFolder(ctx, edit) {
-    if (!isUserVip(ctx.from.id)) {
-        const text = '🔒 *VIP Folder*\n\nThis section is only for VIP members (redeem a promo code, or buy VIP).';
-        const keyboard = { inline_keyboard: [
-            [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
-            [{ text: '💎 Buy VIP', callback_data: 'vip_info' }]
-        ] };
-        if (edit) await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
-        else await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: keyboard });
-        return;
-    }
-
-    const cats = listVipCategories();
-    const text = '📁 *VIP Folder*\n\n' + (cats.length
-        ? 'Pick a category to receive its files:'
-        : '_No categories available yet — check back later._');
-    const keyboard = { inline_keyboard: [
-        ...cats.slice(0, 30).map(c => [{ text: `${c.name} (${c.files.length})`, callback_data: `uvf_cat:${c.id}:0` }])
-    ] };
-    if (edit) await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
-    else await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: keyboard });
-}
-
-bot.action('user_vipfolder', async (ctx) => {
-    await ctx.answerCbQuery();
-    await renderUserVipFolder(ctx, true);
-});
-
-// Sends one page (VIPFOLDER_PAGE_SIZE files) of a category starting at
-// `offset`, with a "▶️ More" button if there's more left.
-bot.action(/^uvf_cat:([^:]+):(\d+)$/, async (ctx) => {
-    if (!isUserVip(ctx.from.id)) {
-        await ctx.answerCbQuery('🔒 VIP members only.', { show_alert: true });
-        return;
-    }
-    const [, id, offsetRaw] = ctx.match;
-    const offset = parseInt(offsetRaw, 10) || 0;
-
-    const cat = getVipCategory(id);
-    if (!cat) {
-        await ctx.answerCbQuery('⚠️ Category not found.');
-        return;
-    }
-
-    await ctx.answerCbQuery();
-    const config = loadConfig();
-    const page = cat.files.slice(offset, offset + VIPFOLDER_PAGE_SIZE);
-
-    if (page.length === 0) {
-        await ctx.reply(offset === 0 ? '_No files in this category yet._' : '🎉 That\'s all the files in this category.', { parse_mode: 'Markdown' });
-        return;
-    }
-
-    let sentCount = 0;
-    for (const file of page) {
-        try {
-            await ctx.telegram.copyMessage(ctx.chat.id, file.chat_id, file.message_id,
-                config.protectContent ? { protect_content: true } : {});
-            sentCount++;
-        } catch (error) {
-            console.error('Failed to copy VIP category file:', error.message);
-            if (error.message && error.message.includes('message to copy not found')) {
-                removeVipCategoryFile(id, file.chat_id, file.message_id);
-            }
-        }
-    }
-
-    const nextOffset = offset + page.length;
-    const hasMore = nextOffset < cat.files.length;
-    const keyboard = hasMore
-        ? { inline_keyboard: [[{ text: '▶️ More', callback_data: `uvf_cat:${id}:${nextOffset}` }]] }
-        : undefined;
-
-    await ctx.reply(
-        sentCount > 0
-            ? `📁 Sent ${sentCount} file(s) from "${cat.name}".${hasMore ? '' : ' 🎉 That\'s everything in this category.'}`
-            : '❌ Could not send those files, please try again.',
-        keyboard ? { reply_markup: keyboard } : undefined
-    );
-});
-
 // --- Admin-only /start menu ---
 const ADMIN_START_TEXT = 'Welcome, Admin!\n\nChoose a section to manage:';
 const ADMIN_START_KEYBOARD = {
@@ -2270,8 +2085,8 @@ async function renderVipPanel(ctx) {
     const config = loadConfig();
     const stats = getVipStats();
     const text = '💎 *VIP Promotion*\n\n' +
-        `Channel Link: ${config.vipChannelLink || '_Not set_'}\n` +
-        `Promo Text: ${config.vipPromoText || '_Not set_'}\n\n` +
+        `Channel Link: ${config.vipChannelLink ? escapeMarkdown(config.vipChannelLink) : '_Not set_'}\n` +
+        `Promo Text: ${config.vipPromoText ? escapeMarkdown(config.vipPromoText) : '_Not set_'}\n\n` +
         `📊 Button taps: ${stats.totalClicks} total, ${stats.uniqueUsers} unique user(s)\n\n` +
         '_"💎 Buy VIP" shows on /start, About, when a user hits the daily limit, and on the force-sub join prompt._' +
         (config.vipChannelLink ? '' : '\n\n⚠️ Set a channel link below to activate the button — it stays hidden until then.');
@@ -2322,7 +2137,7 @@ async function renderPromoPanel(ctx) {
         text += codes.slice(0, 15).map(c => {
             const duration = c.days > 0 ? `${c.days}d` : 'Lifetime';
             const uses = c.maxUses > 0 ? `${c.usedBy.length}/${c.maxUses}` : `${c.usedBy.length}/∞`;
-            return `\`${c.code}\` — ${duration} — used ${uses}`;
+            return `\`${escapeMarkdown(c.code)}\` — ${duration} — used ${uses}`;
         }).join('\n');
         if (codes.length > 15) text += `\n_...and ${codes.length - 15} more_`;
     }
@@ -2331,7 +2146,6 @@ async function renderPromoPanel(ctx) {
         inline_keyboard: [
             [{ text: '➕ Create Code', callback_data: 'promo_create_menu' }],
             [{ text: '🗑 Delete Code', callback_data: 'promo_delete_menu' }],
-            [{ text: '📁 VIP Folder', callback_data: 'vipfolder_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
@@ -2369,120 +2183,6 @@ bot.action('promo_delete_menu', async (ctx) => {
     await ctx.editMessageText('🗑 Send the code to delete, or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
     });
-});
-
-// --- VIP Folder (promo/VIP-exclusive files, organized into admin-named categories) ---
-// Flow: admin creates categories with custom names, taps one to make it the
-// "active capture category" — every photo/video posted in the source channel
-// from that point on is saved into it (and ONLY it — not the normal /random
-// pool) until the admin stops capture or switches to another category.
-// VIP users (promo redeemers, or manually granted VIP) then browse by
-// category from their own menu and receive every file in it.
-async function renderVipFolderPanel(ctx) {
-    const cats = listVipCategories();
-    const active = getActiveVipCategory();
-
-    let text = '📁 *VIP Folder*\n\n' +
-        'Files here are only visible to VIP / promo-code users, organized into categories you name.\n\n';
-
-    text += active
-        ? `🔴 *Capturing now:* \`${active.name}\`\nEvery photo/video posted in the source channel is being saved here.`
-        : '⚪ *Not capturing* — source channel posts go to the normal pool.';
-
-    text += '\n\n*Categories:*\n';
-    text += cats.length
-        ? cats.map(c => `${c.id === (active && active.id) ? '🔴' : '•'} ${c.name} — ${c.files.length} file(s)`).join('\n')
-        : '_None yet. Create one to get started._';
-
-    const rows = cats.slice(0, 20).map(c => [{
-        text: `${c.id === (active && active.id) ? '🔴 ' : ''}${c.name} (${c.files.length})`,
-        callback_data: `vipfolder_select:${c.id}`
-    }]);
-
-    const keyboard = { inline_keyboard: [
-        ...rows,
-        [{ text: '➕ Create Category', callback_data: 'vipfolder_create' }],
-        ...(active ? [[{ text: '⏹ Stop Capturing', callback_data: 'vipfolder_stop' }]] : []),
-        ...(cats.length ? [[{ text: '🗑 Delete Category', callback_data: 'vipfolder_delete_menu' }]] : []),
-        [{ text: '🔙 Back', callback_data: 'promo_menu' }]
-    ] };
-
-    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
-}
-
-bot.action('vipfolder_menu', async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    await ctx.answerCbQuery();
-    await renderVipFolderPanel(ctx);
-});
-
-bot.action('vipfolder_create', async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'vipfolder_create' };
-    await ctx.editMessageText(
-        '➕ *Create VIP Category*\n\nSend the name for this category (e.g. `Movies`, `Web Series`, `Exclusive Clips`), or /cancel.',
-        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'vipfolder_menu' }]] } }
-    );
-});
-
-// Tapping a category makes it the live capture target. Tapping the SAME
-// (already active) category again turns capture off — a quick on/off toggle
-// without needing a separate button.
-bot.action(/^vipfolder_select:(.+)$/, async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    const id = ctx.match[1];
-    const cat = getVipCategory(id);
-    if (!cat) {
-        await ctx.answerCbQuery('⚠️ Category not found.');
-        await renderVipFolderPanel(ctx);
-        return;
-    }
-
-    const active = getActiveVipCategory();
-    if (active && active.id === id) {
-        stopVipCapture();
-        await ctx.answerCbQuery('⏹ Stopped capturing.');
-    } else {
-        setActiveVipCategory(id);
-        await ctx.answerCbQuery(`🔴 Now capturing into "${cat.name}"`);
-    }
-    await renderVipFolderPanel(ctx);
-});
-
-bot.action('vipfolder_stop', async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    stopVipCapture();
-    await ctx.answerCbQuery('⏹ Stopped capturing.');
-    await renderVipFolderPanel(ctx);
-});
-
-bot.action('vipfolder_delete_menu', async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    await ctx.answerCbQuery();
-    const cats = listVipCategories();
-    if (cats.length === 0) {
-        await renderVipFolderPanel(ctx);
-        return;
-    }
-    const keyboard = {
-        inline_keyboard: [
-            ...cats.slice(0, 20).map(c => [{ text: `🗑 ${c.name} (${c.files.length})`, callback_data: `vipfolder_delete:${c.id}` }]),
-            [{ text: '🔙 Back', callback_data: 'vipfolder_menu' }]
-        ]
-    };
-    await ctx.editMessageText('🗑 *Delete VIP Category*\n\nThis also deletes every file reference saved in it. This cannot be undone.\n\nPick a category:', {
-        parse_mode: 'Markdown', reply_markup: keyboard
-    });
-});
-
-bot.action(/^vipfolder_delete:(.+)$/, async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    const id = ctx.match[1];
-    const cat = getVipCategory(id);
-    const deleted = deleteVipCategory(id);
-    await ctx.answerCbQuery(deleted ? `🗑 Deleted "${cat ? cat.name : id}"` : '⚠️ Not found.');
-    await renderVipFolderPanel(ctx);
 });
 
 // --- Maintenance mode ---
@@ -2972,13 +2672,6 @@ async function getVideoThumbnailFileId(adminId, chatId, messageId) {
         return thumbFileId;
     } catch (error) {
         console.error('getVideoThumbnailFileId failed:', error.message);
-        // Distinguish "whole channel is gone" (banned/deleted/bot removed)
-        // from "this one video/message is gone" — the former deserves an
-        // immediate, distinct admin warning instead of blending into the
-        // routine per-video retry/skip noise.
-        if (looksLikeChannelGone(error.description || error.message)) {
-            await logSourceChannelUnreachable(adminId, chatId, error);
-        }
         return null;
     }
 }
@@ -3014,11 +2707,9 @@ async function downloadTelegramFile(fileId) {
 // problem — reported distinctly from per-video retry/skip so admins get a
 // clear "go fix your channel setting" pointer instead of a confusing video
 // error. Deduped per admin+channel so a broken channel doesn't spam every
-// tick. Also marks the channel dead in known_chats.json so it drops out of
-// channel pickers instead of being pickable again by mistake.
+// tick.
 async function logDestinationUnreachable(adminId, channelId, err) {
     const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-    markKnownChatDead(channelId, err.description || err.message);
     await logAutopostEvent(
         `🚫 *Auto-Post: Destination Channel Unreachable*\n\n` +
         `*When:* ${timestamp} IST\n` +
@@ -3027,76 +2718,9 @@ async function logDestinationUnreachable(adminId, channelId, err) {
         `*Error:* ${err.description || err.message}\n\n` +
         `This isn't a video problem — the destination channel can't be reached ` +
         `(I may have been removed as admin, the channel may have been deleted, ` +
-        `or the ID is wrong). I've marked it dead so it won't show up as a ` +
-        `pickable channel elsewhere. Re-set it via 🖼 Auto-Post → 📤 Set Destination Channel.`,
+        `or the ID is wrong). Re-set it via 🖼 Auto-Post → 📤 Set Destination Channel.`,
         `ap-nodest:${adminId}:${channelId}`
     );
-}
-
-// Same idea as logDestinationUnreachable, but for a SOURCE channel — fires
-// when the bot can no longer reach a configured source (banned/deleted
-// channel, bot removed as admin, etc). This is what lets a banned source
-// channel surface as an immediate, clear warning instead of silently
-// showing up as repeated "no thumbnail" retries. Deduped per admin+channel,
-// and also marks the channel dead so it drops out of channel pickers.
-async function logSourceChannelUnreachable(adminId, channelId, err) {
-    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-    const chat = getKnownChats(undefined, { includeDead: true }).find(c => String(c.id) === String(channelId));
-    markKnownChatDead(channelId, err.description || err.message);
-    await logAutopostEvent(
-        `⚠️ *Auto-Post: Source Channel Unreachable*\n\n` +
-        `*When:* ${timestamp} IST\n` +
-        `*Admin:* \`${adminId}\`\n` +
-        `*Channel:* ${chat ? chat.title : '?'} (\`${channelId}\`)\n` +
-        `*Error:* ${err.description || err.message}\n\n` +
-        `This looks like the source channel was banned/deleted, or I was ` +
-        `removed as admin there — not a single-video problem. New posts from ` +
-        `it won't be captured until this is fixed. I've marked it dead so it ` +
-        `won't show up as a pickable channel elsewhere. Remove it via 🖼 Auto-Post → ` +
-        `➖ Remove Source Channel, or re-add me as admin if it still exists (which ` +
-        `will automatically un-mark it as dead).`,
-        `ap-nosrc:${adminId}:${channelId}`
-    );
-}
-
-// Error strings that indicate the whole channel is gone/unreachable, as
-// opposed to a single message/video being missing (which just means that
-// one video was deleted and is a normal per-video retry/skip case).
-const CHANNEL_GONE_PATTERNS = [
-    /chat not found/i,
-    /channel_private/i,
-    /have no rights/i,
-    /bot was kicked/i,
-    /user_deactivated/i,
-    /peer_id_invalid/i,
-    /bot is not a member/i,
-    /chat_write_forbidden/i
-];
-
-function looksLikeChannelGone(message) {
-    return CHANNEL_GONE_PATTERNS.some(re => re.test(message || ''));
-}
-
-// Proactive health check — pings every configured source channel even when
-// no new video has been posted (so a ban/removal doesn't sit undetected
-// until the next post attempt). Runs on its own slower interval.
-async function checkSourceChannelsHealth() {
-    const configs = getAllAutopostConfigs();
-    const seen = new Set(); // avoid re-checking the same channel twice per tick
-    for (const cfg of configs) {
-        for (const channelId of (cfg.sourceChannelIds || [])) {
-            const key = String(channelId);
-            if (seen.has(key)) continue;
-            seen.add(key);
-            try {
-                await bot.telegram.getChat(channelId);
-            } catch (error) {
-                if (looksLikeChannelGone(error.description || error.message)) {
-                    await logSourceChannelUnreachable(cfg.adminId, channelId, error);
-                }
-            }
-        }
-    }
 }
 
 // A single video is retried at most this many times (across ticks) before
@@ -3493,27 +3117,9 @@ bot.action('ap_verify_dest', async (ctx) => {
 // that channel's future video posts into the shared file pool — see the
 // `isAutopostSourceChannel()` check used by the message/channel_post
 // handlers further down.
-// Manual ID/@username entry is now the default — the known-chats list mixes
-// in every chat the bot is admin in (force-sub groups, mega-upload channel,
-// etc.), which made it easy to pick the wrong one. The list is still
-// available as a fallback via "📋 Show Channel List" below.
 bot.action('ap_setsource_menu', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'ap_setsource_manual' };
-    await ctx.editMessageText('➕ *Add Auto-Post Source Channel*\n\n⌨️ Send the source channel ID (e.g. `-1001234567890`) or `@username` to add.\n\nI must already be admin there. Send /cancel to abort.', {
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [
-            [{ text: '📋 Show Channel List Instead', callback_data: 'ap_setsource_showlist' }],
-            [{ text: '❌ Cancel', callback_data: 'ap_menu' }]
-        ] }
-    });
-});
-
-bot.action('ap_setsource_showlist', async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    await ctx.answerCbQuery();
-    delete pendingAction[ctx.from.id];
     const cfg = getAutopostConfig(ctx.from.id);
     const exclude = [...(cfg.sourceChannelIds || []), ...(cfg.channelId ? [cfg.channelId] : [])];
     const { rows, truncated, total } = knownChatPickerKeyboard(exclude, 'ap_setsource', 'ap_menu', ctx.from.id);
@@ -3902,18 +3508,6 @@ bot.on(['photo', 'video', 'animation'], async (ctx) => {
 
     const type = Array.isArray(ctx.message.photo) ? 'photo' : 'video';
     const fileUniqueId = type === 'video' ? ctx.message.video.file_unique_id : ctx.message.photo[ctx.message.photo.length - 1].file_unique_id;
-
-    // VIP Folder capture mode: while a category is active, source-channel
-    // posts go ONLY into that category (VIP-exclusive) — not the normal pool.
-    const activeCat = getActiveVipCategory();
-    if (activeCat) {
-        const addedVip = addVipCategoryFile(activeCat.id, ctx.chat.id, ctx.message.message_id, type, fileUniqueId);
-        console.log(addedVip
-            ? `Tracked ${type} msg #${ctx.message.message_id} in VIP category "${activeCat.name}"`
-            : `Duplicate ${type} msg #${ctx.message.message_id} — already in VIP category "${activeCat.name}", skipped`);
-        return;
-    }
-
     const added = addSharedFile(ctx.chat.id, ctx.message.message_id, type, fileUniqueId);
     if (added) {
         console.log(`Tracked ${type} msg #${ctx.message.message_id} in share pool`);
@@ -4016,17 +3610,6 @@ bot.on('channel_post', async (ctx) => {
         if (isTrackedSourceChat(ctx.chat.id, config)) {
             const type = post.photo ? 'photo' : 'video';
             const fileUniqueId = type === 'video' ? post.video.file_unique_id : post.photo[post.photo.length - 1].file_unique_id;
-
-            // VIP Folder capture mode: divert into the active category only.
-            const activeCat = getActiveVipCategory();
-            if (activeCat) {
-                const addedVip = addVipCategoryFile(activeCat.id, ctx.chat.id, post.message_id, type, fileUniqueId);
-                console.log(addedVip
-                    ? `Tracked ${type} msg #${post.message_id} in VIP category "${activeCat.name}" (channel)`
-                    : `Duplicate ${type} msg #${post.message_id} — already in VIP category "${activeCat.name}", skipped (channel)`);
-                return;
-            }
-
             const added = addSharedFile(ctx.chat.id, post.message_id, type, fileUniqueId);
             if (added) {
                 console.log(`Tracked ${type} msg #${post.message_id} in share pool (channel)`);
@@ -4045,10 +3628,6 @@ bot.on('channel_post', async (ctx) => {
             const megaLink = cleanMegaLink(text);
             if (megaLink) {
                 if (!(await isTrustedChannelAdmin(ctx))) return;
-                if (alreadyProcessedMegaMessage(ctx.chat.id, post.message_id)) {
-                    console.log(`⏭️ Duplicate MEGA link msg #${post.message_id} in channel ${ctx.chat.id} — skipped`);
-                    return;
-                }
                 console.log(`🔍 Detected MEGA link in channel ${ctx.chat.id}`);
                 await queue.add(() => processMegaLink(ctx, megaLink));
             }
@@ -4391,14 +3970,14 @@ async function handlePendingAction(ctx, text) {
         const result = createPromoCode(codeRaw, days, maxUses, userId);
         delete pendingAction[userId];
         if (!result.success) {
-            await ctx.reply(result.reason === 'exists' ? `⚠️ Code \`${codeRaw.toUpperCase()}\` already exists.` : '⚠️ Could not create that code.', { parse_mode: 'Markdown' });
+            await ctx.reply(result.reason === 'exists' ? `⚠️ Code \`${escapeMarkdown(codeRaw.toUpperCase())}\` already exists.` : '⚠️ Could not create that code.', { parse_mode: 'Markdown' });
             return;
         }
         const durationText = days > 0 ? `${days} day(s)` : 'Lifetime';
         const usesText = maxUses > 0 ? `${maxUses} user(s)` : 'Unlimited users';
         await ctx.reply(
             `✅ Promo code created!\n\n` +
-            `Code: \`${result.code.code}\`\n` +
+            `Code: \`${escapeMarkdown(result.code.code)}\`\n` +
             `Grants: ${durationText} VIP\n` +
             `Redeemable by: ${usesText}\n\n` +
             `Share this with the user — they redeem it with /redeem or the 🎟 Redeem Code button.`,
@@ -4411,24 +3990,7 @@ async function handlePendingAction(ctx, text) {
         const code = text.trim().toUpperCase();
         const deleted = deletePromoCode(code);
         delete pendingAction[userId];
-        await ctx.reply(deleted ? `✅ Code \`${code}\` deleted.` : `⚠️ Code \`${code}\` not found.`, { parse_mode: 'Markdown' });
-        return;
-    }
-
-    if (action.type === 'vipfolder_create') {
-        const name = text.trim();
-        const result = createVipCategory(name, userId);
-        delete pendingAction[userId];
-        if (!result.success) {
-            const msg = result.reason === 'exists' ? `⚠️ A category named "${name}" already exists.`
-                : result.reason === 'too_long' ? '⚠️ Name is too long (max 64 characters).'
-                : '⚠️ Please send a valid name, or /cancel.';
-            await ctx.reply(msg);
-            return;
-        }
-        await ctx.reply(
-            `✅ Category "${result.category.name}" created.\n\nGo to 📁 VIP Folder and tap it to start capturing files posted in the source channel into it.`
-        );
+        await ctx.reply(deleted ? `✅ Code \`${escapeMarkdown(code)}\` deleted.` : `⚠️ Code \`${escapeMarkdown(code)}\` not found.`, { parse_mode: 'Markdown' });
         return;
     }
 
@@ -4512,11 +4074,6 @@ bot.on('message', async (ctx) => {
             await logUnauthorizedAccess(ctx, 'mega_link_download');
             await ctx.reply('❌ This feature is available to admins only.');
         }
-        return;
-    }
-
-    if (alreadyProcessedMegaMessage(ctx.chat.id, ctx.message.message_id)) {
-        console.log(`⏭️ Duplicate MEGA link msg #${ctx.message.message_id} in ${ctx.chat.type} ${ctx.chat.id} — skipped`);
         return;
     }
 
@@ -4643,12 +4200,6 @@ bot.telegram.getMe().then(async botInfo => {
     setInterval(() => {
         processDelayedJoinApprovals().catch(err => logError('Delayed join approval tick', err));
     }, 60 * 1000);
-    // Slower interval — proactively pings every source channel so a ban/
-    // removal is caught even during a quiet period with no new posts to
-    // trigger the reactive check inside getVideoThumbnailFileId.
-    setInterval(() => {
-        checkSourceChannelsHealth().catch(err => logError('Source channel health check', err));
-    }, 30 * 60 * 1000);
 
     bot.launch()
         .catch(err => {

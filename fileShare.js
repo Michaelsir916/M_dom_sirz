@@ -11,6 +11,7 @@ const AUTOPOST_PATH = path.join(__dirname, 'autopost_configs.json');
 const PENDING_JOIN_REQUESTS_PATH = path.join(__dirname, 'pending_join_requests.json');
 const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
 const PROMO_CODES_PATH = path.join(__dirname, 'promo_codes.json');
+const VIP_CATEGORIES_PATH = path.join(__dirname, 'vip_categories.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -34,7 +35,10 @@ const DEFAULT_CONFIG = {
     aboutLinkText: 'Click Here', // custom clickable hyperlink text shown in the non-admin About panel
     aboutLinkUrl: null,          // url that aboutLinkText links to
     vipChannelLink: null,        // url the "💎 Buy VIP" button sends users to
-    vipPromoText: null           // optional promo copy shown above the Join button
+    vipPromoText: null,          // optional promo copy shown above the Join button
+    activeVipCategoryId: null    // when set, files posted in the source channel go into
+                                  // this VIP category ONLY (not the normal /random pool),
+                                  // until the admin stops capture or switches category
 };
 
 // ===== Config backup (used by /backupconfig) =====
@@ -51,7 +55,8 @@ const CONFIG_BACKUP_FILES = [
     { path: AUTOPOST_PATH, name: 'autopost_configs.json' },
     { path: PENDING_JOIN_REQUESTS_PATH, name: 'pending_join_requests.json' },
     { path: VIP_CLICKS_PATH, name: 'vip_clicks.json' },
-    { path: PROMO_CODES_PATH, name: 'promo_codes.json' }
+    { path: PROMO_CODES_PATH, name: 'promo_codes.json' },
+    { path: VIP_CATEGORIES_PATH, name: 'vip_categories.json' }
 ];
 
 // Only returns files that actually exist yet (a fresh install may not have
@@ -389,6 +394,128 @@ function redeemPromoCode(userId, code) {
 
     const expiresAt = grantVip(userId, entry.days, 'promo', key);
     return { success: true, days: entry.days, unlimited: entry.days === 0, expiresAt };
+}
+
+// ===== VIP Folder categories (promo/VIP-exclusive, admin-curated, per-category) =====
+// Separate storage pool from shared_files.json. While config.activeVipCategoryId
+// is set, files posted in the source channel are diverted here (only) instead
+// of the normal random-share pool — see isTrackedSourceChat/addSharedFile call
+// sites in bot.js. VIP users browse by category and get every file in it.
+function loadVipCategories() {
+    return safeReadJson(VIP_CATEGORIES_PATH, {});
+}
+
+function saveVipCategories(cats) {
+    atomicWrite(VIP_CATEGORIES_PATH, cats);
+}
+
+function listVipCategories() {
+    return Object.values(loadVipCategories()).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+function getVipCategory(id) {
+    return loadVipCategories()[id] || null;
+}
+
+// Names are case-insensitively unique so admins don't end up with two
+// near-identical categories by accident.
+function createVipCategory(name, createdBy) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) return { success: false, reason: 'empty' };
+    if (trimmed.length > 64) return { success: false, reason: 'too_long' };
+
+    const cats = loadVipCategories();
+    const dupe = Object.values(cats).find(c => c.name.toLowerCase() === trimmed.toLowerCase());
+    if (dupe) return { success: false, reason: 'exists' };
+
+    const id = 'vc_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    cats[id] = {
+        id,
+        name: trimmed,
+        files: [],
+        createdBy: String(createdBy),
+        createdAt: new Date().toISOString()
+    };
+    saveVipCategories(cats);
+    return { success: true, category: cats[id] };
+}
+
+// Deleting a category that's currently the active capture target also turns
+// capture off — otherwise new source-channel posts would silently vanish
+// into a category id that no longer exists.
+function deleteVipCategory(id) {
+    const cats = loadVipCategories();
+    if (!cats[id]) return false;
+    delete cats[id];
+    saveVipCategories(cats);
+
+    const config = loadConfig();
+    if (config.activeVipCategoryId === id) {
+        config.activeVipCategoryId = null;
+        saveConfig(config);
+    }
+    return true;
+}
+
+function renameVipCategory(id, newName) {
+    const trimmed = String(newName || '').trim();
+    if (!trimmed) return { success: false, reason: 'empty' };
+    const cats = loadVipCategories();
+    if (!cats[id]) return { success: false, reason: 'not_found' };
+    const dupe = Object.values(cats).find(c => c.id !== id && c.name.toLowerCase() === trimmed.toLowerCase());
+    if (dupe) return { success: false, reason: 'exists' };
+    cats[id].name = trimmed;
+    saveVipCategories(cats);
+    return { success: true, category: cats[id] };
+}
+
+// Adds a file reference to a category. Dedupes the same way addSharedFile
+// does (by chat_id+message_id, and by file_unique_id when known).
+function addVipCategoryFile(categoryId, chatId, messageId, type, fileUniqueId) {
+    const cats = loadVipCategories();
+    const cat = cats[categoryId];
+    if (!cat) return false;
+    if (cat.files.some(f => f.chat_id === chatId && f.message_id === messageId)) return false;
+    if (fileUniqueId && cat.files.some(f => f.file_unique_id === fileUniqueId)) return false;
+    cat.files.push({
+        chat_id: chatId,
+        message_id: messageId,
+        type,
+        file_unique_id: fileUniqueId || null,
+        added_at: new Date().toISOString()
+    });
+    saveVipCategories(cats);
+    return true;
+}
+
+function removeVipCategoryFile(categoryId, chatId, messageId) {
+    const cats = loadVipCategories();
+    const cat = cats[categoryId];
+    if (!cat) return;
+    const before = cat.files.length;
+    cat.files = cat.files.filter(f => !(f.chat_id === chatId && f.message_id === messageId));
+    if (cat.files.length !== before) saveVipCategories(cats);
+}
+
+// Marks `categoryId` as the live capture target — every source-channel post
+// from now on is saved into it (and only it) until stopVipCapture() or
+// setActiveVipCategory() with a different id is called.
+function setActiveVipCategory(categoryId) {
+    const config = loadConfig();
+    config.activeVipCategoryId = categoryId;
+    saveConfig(config);
+}
+
+function stopVipCapture() {
+    const config = loadConfig();
+    config.activeVipCategoryId = null;
+    saveConfig(config);
+}
+
+function getActiveVipCategory() {
+    const config = loadConfig();
+    if (!config.activeVipCategoryId) return null;
+    return getVipCategory(config.activeVipCategoryId);
 }
 
 // Returns THIS user's own /random stats (not admin-wide): files received,
@@ -968,5 +1095,15 @@ module.exports = {
     createPromoCode,
     deletePromoCode,
     listPromoCodes,
-    redeemPromoCode
+    redeemPromoCode,
+    listVipCategories,
+    getVipCategory,
+    createVipCategory,
+    deleteVipCategory,
+    renameVipCategory,
+    addVipCategoryFile,
+    removeVipCategoryFile,
+    setActiveVipCategory,
+    stopVipCapture,
+    getActiveVipCategory
 };

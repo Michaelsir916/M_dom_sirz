@@ -71,7 +71,16 @@ const {
     createPromoCode,
     deletePromoCode,
     listPromoCodes,
-    redeemPromoCode
+    redeemPromoCode,
+    listVipCategories,
+    getVipCategory,
+    createVipCategory,
+    deleteVipCategory,
+    addVipCategoryFile,
+    removeVipCategoryFile,
+    setActiveVipCategory,
+    stopVipCapture,
+    getActiveVipCategory
 } = require('./fileShare');
 const queue = require('./queue');
 const megaManager = require('./megaManager');
@@ -1287,6 +1296,7 @@ const MY_STATS_KEYBOARD = {
     inline_keyboard: [
         [{ text: '💎 Buy VIP', callback_data: 'vip_info' }],
         [{ text: '🎬 Free Video', callback_data: 'user_random' }],
+        [{ text: '📁 VIP Folder', callback_data: 'user_vipfolder' }],
         [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
         [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
         [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
@@ -1995,6 +2005,90 @@ bot.action('recheck_sub', async (ctx) => {
     await sendRandomFiles(ctx);
 });
 
+// --- User-facing: VIP Folder (promo/VIP-exclusive categories) ---
+const VIPFOLDER_PAGE_SIZE = 10;
+
+async function renderUserVipFolder(ctx, edit) {
+    if (!isUserVip(ctx.from.id)) {
+        const text = '🔒 *VIP Folder*\n\nThis section is only for VIP members (redeem a promo code, or buy VIP).';
+        const keyboard = { inline_keyboard: [
+            [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
+            [{ text: '💎 Buy VIP', callback_data: 'vip_info' }]
+        ] };
+        if (edit) await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+        else await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+        return;
+    }
+
+    const cats = listVipCategories();
+    const text = '📁 *VIP Folder*\n\n' + (cats.length
+        ? 'Pick a category to receive its files:'
+        : '_No categories available yet — check back later._');
+    const keyboard = { inline_keyboard: [
+        ...cats.slice(0, 30).map(c => [{ text: `${c.name} (${c.files.length})`, callback_data: `uvf_cat:${c.id}:0` }])
+    ] };
+    if (edit) await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+    else await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.action('user_vipfolder', async (ctx) => {
+    await ctx.answerCbQuery();
+    await renderUserVipFolder(ctx, true);
+});
+
+// Sends one page (VIPFOLDER_PAGE_SIZE files) of a category starting at
+// `offset`, with a "▶️ More" button if there's more left.
+bot.action(/^uvf_cat:([^:]+):(\d+)$/, async (ctx) => {
+    if (!isUserVip(ctx.from.id)) {
+        await ctx.answerCbQuery('🔒 VIP members only.', { show_alert: true });
+        return;
+    }
+    const [, id, offsetRaw] = ctx.match;
+    const offset = parseInt(offsetRaw, 10) || 0;
+
+    const cat = getVipCategory(id);
+    if (!cat) {
+        await ctx.answerCbQuery('⚠️ Category not found.');
+        return;
+    }
+
+    await ctx.answerCbQuery();
+    const config = loadConfig();
+    const page = cat.files.slice(offset, offset + VIPFOLDER_PAGE_SIZE);
+
+    if (page.length === 0) {
+        await ctx.reply(offset === 0 ? '_No files in this category yet._' : '🎉 That\'s all the files in this category.', { parse_mode: 'Markdown' });
+        return;
+    }
+
+    let sentCount = 0;
+    for (const file of page) {
+        try {
+            await ctx.telegram.copyMessage(ctx.chat.id, file.chat_id, file.message_id,
+                config.protectContent ? { protect_content: true } : {});
+            sentCount++;
+        } catch (error) {
+            console.error('Failed to copy VIP category file:', error.message);
+            if (error.message && error.message.includes('message to copy not found')) {
+                removeVipCategoryFile(id, file.chat_id, file.message_id);
+            }
+        }
+    }
+
+    const nextOffset = offset + page.length;
+    const hasMore = nextOffset < cat.files.length;
+    const keyboard = hasMore
+        ? { inline_keyboard: [[{ text: '▶️ More', callback_data: `uvf_cat:${id}:${nextOffset}` }]] }
+        : undefined;
+
+    await ctx.reply(
+        sentCount > 0
+            ? `📁 Sent ${sentCount} file(s) from "${cat.name}".${hasMore ? '' : ' 🎉 That\'s everything in this category.'}`
+            : '❌ Could not send those files, please try again.',
+        keyboard ? { reply_markup: keyboard } : undefined
+    );
+});
+
 // --- Admin-only /start menu ---
 const ADMIN_START_TEXT = 'Welcome, Admin!\n\nChoose a section to manage:';
 const ADMIN_START_KEYBOARD = {
@@ -2236,6 +2330,7 @@ async function renderPromoPanel(ctx) {
         inline_keyboard: [
             [{ text: '➕ Create Code', callback_data: 'promo_create_menu' }],
             [{ text: '🗑 Delete Code', callback_data: 'promo_delete_menu' }],
+            [{ text: '📁 VIP Folder', callback_data: 'vipfolder_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
@@ -2273,6 +2368,120 @@ bot.action('promo_delete_menu', async (ctx) => {
     await ctx.editMessageText('🗑 Send the code to delete, or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
     });
+});
+
+// --- VIP Folder (promo/VIP-exclusive files, organized into admin-named categories) ---
+// Flow: admin creates categories with custom names, taps one to make it the
+// "active capture category" — every photo/video posted in the source channel
+// from that point on is saved into it (and ONLY it — not the normal /random
+// pool) until the admin stops capture or switches to another category.
+// VIP users (promo redeemers, or manually granted VIP) then browse by
+// category from their own menu and receive every file in it.
+async function renderVipFolderPanel(ctx) {
+    const cats = listVipCategories();
+    const active = getActiveVipCategory();
+
+    let text = '📁 *VIP Folder*\n\n' +
+        'Files here are only visible to VIP / promo-code users, organized into categories you name.\n\n';
+
+    text += active
+        ? `🔴 *Capturing now:* \`${active.name}\`\nEvery photo/video posted in the source channel is being saved here.`
+        : '⚪ *Not capturing* — source channel posts go to the normal pool.';
+
+    text += '\n\n*Categories:*\n';
+    text += cats.length
+        ? cats.map(c => `${c.id === (active && active.id) ? '🔴' : '•'} ${c.name} — ${c.files.length} file(s)`).join('\n')
+        : '_None yet. Create one to get started._';
+
+    const rows = cats.slice(0, 20).map(c => [{
+        text: `${c.id === (active && active.id) ? '🔴 ' : ''}${c.name} (${c.files.length})`,
+        callback_data: `vipfolder_select:${c.id}`
+    }]);
+
+    const keyboard = { inline_keyboard: [
+        ...rows,
+        [{ text: '➕ Create Category', callback_data: 'vipfolder_create' }],
+        ...(active ? [[{ text: '⏹ Stop Capturing', callback_data: 'vipfolder_stop' }]] : []),
+        ...(cats.length ? [[{ text: '🗑 Delete Category', callback_data: 'vipfolder_delete_menu' }]] : []),
+        [{ text: '🔙 Back', callback_data: 'promo_menu' }]
+    ] };
+
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.action('vipfolder_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderVipFolderPanel(ctx);
+});
+
+bot.action('vipfolder_create', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'vipfolder_create' };
+    await ctx.editMessageText(
+        '➕ *Create VIP Category*\n\nSend the name for this category (e.g. `Movies`, `Web Series`, `Exclusive Clips`), or /cancel.',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'vipfolder_menu' }]] } }
+    );
+});
+
+// Tapping a category makes it the live capture target. Tapping the SAME
+// (already active) category again turns capture off — a quick on/off toggle
+// without needing a separate button.
+bot.action(/^vipfolder_select:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const id = ctx.match[1];
+    const cat = getVipCategory(id);
+    if (!cat) {
+        await ctx.answerCbQuery('⚠️ Category not found.');
+        await renderVipFolderPanel(ctx);
+        return;
+    }
+
+    const active = getActiveVipCategory();
+    if (active && active.id === id) {
+        stopVipCapture();
+        await ctx.answerCbQuery('⏹ Stopped capturing.');
+    } else {
+        setActiveVipCategory(id);
+        await ctx.answerCbQuery(`🔴 Now capturing into "${cat.name}"`);
+    }
+    await renderVipFolderPanel(ctx);
+});
+
+bot.action('vipfolder_stop', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    stopVipCapture();
+    await ctx.answerCbQuery('⏹ Stopped capturing.');
+    await renderVipFolderPanel(ctx);
+});
+
+bot.action('vipfolder_delete_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    const cats = listVipCategories();
+    if (cats.length === 0) {
+        await renderVipFolderPanel(ctx);
+        return;
+    }
+    const keyboard = {
+        inline_keyboard: [
+            ...cats.slice(0, 20).map(c => [{ text: `🗑 ${c.name} (${c.files.length})`, callback_data: `vipfolder_delete:${c.id}` }]),
+            [{ text: '🔙 Back', callback_data: 'vipfolder_menu' }]
+        ]
+    };
+    await ctx.editMessageText('🗑 *Delete VIP Category*\n\nThis also deletes every file reference saved in it. This cannot be undone.\n\nPick a category:', {
+        parse_mode: 'Markdown', reply_markup: keyboard
+    });
+});
+
+bot.action(/^vipfolder_delete:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const id = ctx.match[1];
+    const cat = getVipCategory(id);
+    const deleted = deleteVipCategory(id);
+    await ctx.answerCbQuery(deleted ? `🗑 Deleted "${cat ? cat.name : id}"` : '⚠️ Not found.');
+    await renderVipFolderPanel(ctx);
 });
 
 // --- Maintenance mode ---
@@ -3598,6 +3807,18 @@ bot.on(['photo', 'video', 'animation'], async (ctx) => {
 
     const type = Array.isArray(ctx.message.photo) ? 'photo' : 'video';
     const fileUniqueId = type === 'video' ? ctx.message.video.file_unique_id : ctx.message.photo[ctx.message.photo.length - 1].file_unique_id;
+
+    // VIP Folder capture mode: while a category is active, source-channel
+    // posts go ONLY into that category (VIP-exclusive) — not the normal pool.
+    const activeCat = getActiveVipCategory();
+    if (activeCat) {
+        const addedVip = addVipCategoryFile(activeCat.id, ctx.chat.id, ctx.message.message_id, type, fileUniqueId);
+        console.log(addedVip
+            ? `Tracked ${type} msg #${ctx.message.message_id} in VIP category "${activeCat.name}"`
+            : `Duplicate ${type} msg #${ctx.message.message_id} — already in VIP category "${activeCat.name}", skipped`);
+        return;
+    }
+
     const added = addSharedFile(ctx.chat.id, ctx.message.message_id, type, fileUniqueId);
     if (added) {
         console.log(`Tracked ${type} msg #${ctx.message.message_id} in share pool`);
@@ -3700,6 +3921,17 @@ bot.on('channel_post', async (ctx) => {
         if (isTrackedSourceChat(ctx.chat.id, config)) {
             const type = post.photo ? 'photo' : 'video';
             const fileUniqueId = type === 'video' ? post.video.file_unique_id : post.photo[post.photo.length - 1].file_unique_id;
+
+            // VIP Folder capture mode: divert into the active category only.
+            const activeCat = getActiveVipCategory();
+            if (activeCat) {
+                const addedVip = addVipCategoryFile(activeCat.id, ctx.chat.id, post.message_id, type, fileUniqueId);
+                console.log(addedVip
+                    ? `Tracked ${type} msg #${post.message_id} in VIP category "${activeCat.name}" (channel)`
+                    : `Duplicate ${type} msg #${post.message_id} — already in VIP category "${activeCat.name}", skipped (channel)`);
+                return;
+            }
+
             const added = addSharedFile(ctx.chat.id, post.message_id, type, fileUniqueId);
             if (added) {
                 console.log(`Tracked ${type} msg #${post.message_id} in share pool (channel)`);
@@ -4085,6 +4317,23 @@ async function handlePendingAction(ctx, text) {
         const deleted = deletePromoCode(code);
         delete pendingAction[userId];
         await ctx.reply(deleted ? `✅ Code \`${code}\` deleted.` : `⚠️ Code \`${code}\` not found.`, { parse_mode: 'Markdown' });
+        return;
+    }
+
+    if (action.type === 'vipfolder_create') {
+        const name = text.trim();
+        const result = createVipCategory(name, userId);
+        delete pendingAction[userId];
+        if (!result.success) {
+            const msg = result.reason === 'exists' ? `⚠️ A category named "${name}" already exists.`
+                : result.reason === 'too_long' ? '⚠️ Name is too long (max 64 characters).'
+                : '⚠️ Please send a valid name, or /cancel.';
+            await ctx.reply(msg);
+            return;
+        }
+        await ctx.reply(
+            `✅ Category "${result.category.name}" created.\n\nGo to 📁 VIP Folder and tap it to start capturing files posted in the source channel into it.`
+        );
         return;
     }
 

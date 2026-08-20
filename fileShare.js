@@ -626,18 +626,25 @@ function saveKnownChats(chats) {
 // captured from the my_chat_member update. Once set, it's never overwritten by
 // later calls that don't pass it (so a plain message/channel_post sighting
 // can't clobber the real "who added it" attribution).
+// Self-healing: any live sighting of a chat previously marked dead (see
+// markKnownChatDead) clears the dead flag — if we're seeing an update from
+// it, it's clearly reachable again.
 function recordKnownChat(chatId, title, type, addedBy) {
     const chats = loadKnownChats();
     const key = String(chatId);
     const existing = chats[key];
     const resolvedAddedBy = addedBy !== undefined ? addedBy : (existing ? existing.addedBy : undefined);
-    if (existing && existing.title === title && existing.type === type && existing.addedBy === resolvedAddedBy) return;
+    const wasDead = !!(existing && existing.dead);
+    if (existing && existing.title === title && existing.type === type && existing.addedBy === resolvedAddedBy && !wasDead) return;
     chats[key] = {
         id: chatId,
         title: title || 'Untitled',
         type,
         addedBy: resolvedAddedBy,
-        last_seen: new Date().toISOString()
+        last_seen: new Date().toISOString(),
+        dead: false,
+        deadReason: null,
+        deadAt: null
     };
     saveKnownChats(chats);
 }
@@ -646,11 +653,16 @@ function recordKnownChat(chatId, title, type, addedBy) {
 // PLUS legacy chats with no recorded addedBy (grandfathered in so nothing
 // already configured silently disappears — they'll get properly attributed
 // the next time the bot sees a my_chat_member update for them).
-function getKnownChats(adminId) {
+// By default, chats marked dead (see markKnownChatDead) are excluded — they
+// were unreachable (banned/deleted/bot removed) last time we checked, so
+// they shouldn't clutter channel pickers. Pass includeDead: true to see them
+// anyway (e.g. an admin-facing "dead channels" list).
+function getKnownChats(adminId, { includeDead = false } = {}) {
     const all = Object.values(loadKnownChats());
-    const filtered = adminId === undefined
+    let filtered = adminId === undefined
         ? all
         : all.filter(c => c.addedBy === undefined || c.addedBy === null || String(c.addedBy) === String(adminId));
+    if (!includeDead) filtered = filtered.filter(c => !c.dead);
     return filtered.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
 }
 
@@ -661,6 +673,23 @@ function removeKnownChat(chatId) {
         delete chats[key];
         saveKnownChats(chats);
     }
+}
+
+// Marks a known chat as unreachable (banned, deleted, bot removed as admin,
+// etc) instead of deleting it outright — keeps the history/title around for
+// context, but hides it from channel pickers (see getKnownChats) so admins
+// can't accidentally pick a dead channel as a source/destination again.
+// No-op if the chat was never recorded in the first place.
+function markKnownChatDead(chatId, reason) {
+    const chats = loadKnownChats();
+    const key = String(chatId);
+    if (!chats[key]) return false;
+    if (chats[key].dead) return false; // already marked — avoid re-writing/re-notifying every tick
+    chats[key].dead = true;
+    chats[key].deadReason = reason || null;
+    chats[key].deadAt = new Date().toISOString();
+    saveKnownChats(chats);
+    return true;
 }
 
 // ===== Broadcast history =====
@@ -1058,6 +1087,7 @@ module.exports = {
     recordKnownChat,
     getKnownChats,
     removeKnownChat,
+    markKnownChatDead,
     markUserBlocked,
     addBroadcastHistory,
     getBroadcastHistory,

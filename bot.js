@@ -34,6 +34,7 @@ const {
     recordKnownChat,
     getKnownChats,
     removeKnownChat,
+    markKnownChatDead,
     markUserBlocked,
     addBroadcastHistory,
     getBroadcastHistory,
@@ -2971,6 +2972,13 @@ async function getVideoThumbnailFileId(adminId, chatId, messageId) {
         return thumbFileId;
     } catch (error) {
         console.error('getVideoThumbnailFileId failed:', error.message);
+        // Distinguish "whole channel is gone" (banned/deleted/bot removed)
+        // from "this one video/message is gone" — the former deserves an
+        // immediate, distinct admin warning instead of blending into the
+        // routine per-video retry/skip noise.
+        if (looksLikeChannelGone(error.description || error.message)) {
+            await logSourceChannelUnreachable(adminId, chatId, error);
+        }
         return null;
     }
 }
@@ -3006,9 +3014,11 @@ async function downloadTelegramFile(fileId) {
 // problem — reported distinctly from per-video retry/skip so admins get a
 // clear "go fix your channel setting" pointer instead of a confusing video
 // error. Deduped per admin+channel so a broken channel doesn't spam every
-// tick.
+// tick. Also marks the channel dead in known_chats.json so it drops out of
+// channel pickers instead of being pickable again by mistake.
 async function logDestinationUnreachable(adminId, channelId, err) {
     const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    markKnownChatDead(channelId, err.description || err.message);
     await logAutopostEvent(
         `🚫 *Auto-Post: Destination Channel Unreachable*\n\n` +
         `*When:* ${timestamp} IST\n` +
@@ -3017,9 +3027,76 @@ async function logDestinationUnreachable(adminId, channelId, err) {
         `*Error:* ${err.description || err.message}\n\n` +
         `This isn't a video problem — the destination channel can't be reached ` +
         `(I may have been removed as admin, the channel may have been deleted, ` +
-        `or the ID is wrong). Re-set it via 🖼 Auto-Post → 📤 Set Destination Channel.`,
+        `or the ID is wrong). I've marked it dead so it won't show up as a ` +
+        `pickable channel elsewhere. Re-set it via 🖼 Auto-Post → 📤 Set Destination Channel.`,
         `ap-nodest:${adminId}:${channelId}`
     );
+}
+
+// Same idea as logDestinationUnreachable, but for a SOURCE channel — fires
+// when the bot can no longer reach a configured source (banned/deleted
+// channel, bot removed as admin, etc). This is what lets a banned source
+// channel surface as an immediate, clear warning instead of silently
+// showing up as repeated "no thumbnail" retries. Deduped per admin+channel,
+// and also marks the channel dead so it drops out of channel pickers.
+async function logSourceChannelUnreachable(adminId, channelId, err) {
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const chat = getKnownChats(undefined, { includeDead: true }).find(c => String(c.id) === String(channelId));
+    markKnownChatDead(channelId, err.description || err.message);
+    await logAutopostEvent(
+        `⚠️ *Auto-Post: Source Channel Unreachable*\n\n` +
+        `*When:* ${timestamp} IST\n` +
+        `*Admin:* \`${adminId}\`\n` +
+        `*Channel:* ${chat ? chat.title : '?'} (\`${channelId}\`)\n` +
+        `*Error:* ${err.description || err.message}\n\n` +
+        `This looks like the source channel was banned/deleted, or I was ` +
+        `removed as admin there — not a single-video problem. New posts from ` +
+        `it won't be captured until this is fixed. I've marked it dead so it ` +
+        `won't show up as a pickable channel elsewhere. Remove it via 🖼 Auto-Post → ` +
+        `➖ Remove Source Channel, or re-add me as admin if it still exists (which ` +
+        `will automatically un-mark it as dead).`,
+        `ap-nosrc:${adminId}:${channelId}`
+    );
+}
+
+// Error strings that indicate the whole channel is gone/unreachable, as
+// opposed to a single message/video being missing (which just means that
+// one video was deleted and is a normal per-video retry/skip case).
+const CHANNEL_GONE_PATTERNS = [
+    /chat not found/i,
+    /channel_private/i,
+    /have no rights/i,
+    /bot was kicked/i,
+    /user_deactivated/i,
+    /peer_id_invalid/i,
+    /bot is not a member/i,
+    /chat_write_forbidden/i
+];
+
+function looksLikeChannelGone(message) {
+    return CHANNEL_GONE_PATTERNS.some(re => re.test(message || ''));
+}
+
+// Proactive health check — pings every configured source channel even when
+// no new video has been posted (so a ban/removal doesn't sit undetected
+// until the next post attempt). Runs on its own slower interval.
+async function checkSourceChannelsHealth() {
+    const configs = getAllAutopostConfigs();
+    const seen = new Set(); // avoid re-checking the same channel twice per tick
+    for (const cfg of configs) {
+        for (const channelId of (cfg.sourceChannelIds || [])) {
+            const key = String(channelId);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            try {
+                await bot.telegram.getChat(channelId);
+            } catch (error) {
+                if (looksLikeChannelGone(error.description || error.message)) {
+                    await logSourceChannelUnreachable(cfg.adminId, channelId, error);
+                }
+            }
+        }
+    }
 }
 
 // A single video is retried at most this many times (across ticks) before
@@ -3416,9 +3493,27 @@ bot.action('ap_verify_dest', async (ctx) => {
 // that channel's future video posts into the shared file pool — see the
 // `isAutopostSourceChannel()` check used by the message/channel_post
 // handlers further down.
+// Manual ID/@username entry is now the default — the known-chats list mixes
+// in every chat the bot is admin in (force-sub groups, mega-upload channel,
+// etc.), which made it easy to pick the wrong one. The list is still
+// available as a fallback via "📋 Show Channel List" below.
 bot.action('ap_setsource_menu', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'ap_setsource_manual' };
+    await ctx.editMessageText('➕ *Add Auto-Post Source Channel*\n\n⌨️ Send the source channel ID (e.g. `-1001234567890`) or `@username` to add.\n\nI must already be admin there. Send /cancel to abort.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [
+            [{ text: '📋 Show Channel List Instead', callback_data: 'ap_setsource_showlist' }],
+            [{ text: '❌ Cancel', callback_data: 'ap_menu' }]
+        ] }
+    });
+});
+
+bot.action('ap_setsource_showlist', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    delete pendingAction[ctx.from.id];
     const cfg = getAutopostConfig(ctx.from.id);
     const exclude = [...(cfg.sourceChannelIds || []), ...(cfg.channelId ? [cfg.channelId] : [])];
     const { rows, truncated, total } = knownChatPickerKeyboard(exclude, 'ap_setsource', 'ap_menu', ctx.from.id);
@@ -4548,6 +4643,12 @@ bot.telegram.getMe().then(async botInfo => {
     setInterval(() => {
         processDelayedJoinApprovals().catch(err => logError('Delayed join approval tick', err));
     }, 60 * 1000);
+    // Slower interval — proactively pings every source channel so a ban/
+    // removal is caught even during a quiet period with no new posts to
+    // trigger the reactive check inside getVideoThumbnailFileId.
+    setInterval(() => {
+        checkSourceChannelsHealth().catch(err => logError('Source channel health check', err));
+    }, 30 * 60 * 1000);
 
     bot.launch()
         .catch(err => {

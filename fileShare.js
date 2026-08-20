@@ -11,7 +11,7 @@ const AUTOPOST_PATH = path.join(__dirname, 'autopost_configs.json');
 const PENDING_JOIN_REQUESTS_PATH = path.join(__dirname, 'pending_join_requests.json');
 const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
 const PROMO_CODES_PATH = path.join(__dirname, 'promo_codes.json');
-const VIP_CATEGORIES_PATH = path.join(__dirname, 'vip_categories.json');
+const CATEGORIES_PATH = path.join(__dirname, 'categories.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -36,9 +36,9 @@ const DEFAULT_CONFIG = {
     aboutLinkUrl: null,          // url that aboutLinkText links to
     vipChannelLink: null,        // url the "💎 Buy VIP" button sends users to
     vipPromoText: null,          // optional promo copy shown above the Join button
-    activeVipCategoryId: null    // when set, files posted in the source channel go into
-                                  // this VIP category ONLY (not the normal /random pool),
-                                  // until the admin stops capture or switches category
+    activeCategory: null         // id of the VIP-only category currently "recording" —
+                                  // while set, every file posted in the source chat is
+                                  // tagged into this category instead of the normal pool
 };
 
 // ===== Config backup (used by /backupconfig) =====
@@ -56,7 +56,7 @@ const CONFIG_BACKUP_FILES = [
     { path: PENDING_JOIN_REQUESTS_PATH, name: 'pending_join_requests.json' },
     { path: VIP_CLICKS_PATH, name: 'vip_clicks.json' },
     { path: PROMO_CODES_PATH, name: 'promo_codes.json' },
-    { path: VIP_CATEGORIES_PATH, name: 'vip_categories.json' }
+    { path: CATEGORIES_PATH, name: 'categories.json' }
 ];
 
 // Only returns files that actually exist yet (a fresh install may not have
@@ -105,7 +105,12 @@ function saveSharedFiles(files) {
 // exact same video re-forwarded/re-posted under a different message_id
 // (e.g. someone reposts the same clip into the source channel again)
 // doesn't get queued and auto-posted twice.
-function addSharedFile(chatId, messageId, type, fileUniqueId) {
+//
+// category: null = normal /random pool (visible to everyone). A category id
+// (see createCategory below) tags the file into a VIP-only category instead
+// — it's then invisible to the normal pool and only reachable by VIP users
+// browsing that specific category.
+function addSharedFile(chatId, messageId, type, fileUniqueId, category = null) {
     const files = loadSharedFiles();
     if (files.some(f => f.chat_id === chatId && f.message_id === messageId)) return false;
     if (fileUniqueId && files.some(f => f.file_unique_id === fileUniqueId)) return false;
@@ -114,6 +119,7 @@ function addSharedFile(chatId, messageId, type, fileUniqueId) {
         message_id: messageId,
         type,
         file_unique_id: fileUniqueId || null,
+        category: category || null,
         added_at: new Date().toISOString()
     });
     saveSharedFiles(files);
@@ -166,12 +172,14 @@ function getUser(users, userId) {
     return users[key];
 }
 
-// Files this user has NOT received yet
+// Files this user has NOT received yet. Only draws from the normal (non-VIP)
+// pool — files tagged into a VIP category (see categories, below) are
+// excluded here and only reachable via getUnseenCategoryFiles.
 function getUnseenFiles(userId) {
     const users = loadUsers();
     const u = getUser(users, userId);
     const seenSet = new Set(u.seen);
-    return loadSharedFiles().filter(f => !seenSet.has(`${f.chat_id}:${f.message_id}`));
+    return loadSharedFiles().filter(f => !f.category && !seenSet.has(`${f.chat_id}:${f.message_id}`));
 }
 
 // Marks the given files as seen for this user
@@ -396,126 +404,85 @@ function redeemPromoCode(userId, code) {
     return { success: true, days: entry.days, unlimited: entry.days === 0, expiresAt };
 }
 
-// ===== VIP Folder categories (promo/VIP-exclusive, admin-curated, per-category) =====
-// Separate storage pool from shared_files.json. While config.activeVipCategoryId
-// is set, files posted in the source channel are diverted here (only) instead
-// of the normal random-share pool — see isTrackedSourceChat/addSharedFile call
-// sites in bot.js. VIP users browse by category and get every file in it.
-function loadVipCategories() {
-    return safeReadJson(VIP_CATEGORIES_PATH, {});
+// ===== VIP-only Categories =====
+// A category is a named, VIP-exclusive folder of files. Files land in one
+// via addSharedFile(..., categoryId) instead of the normal pool (see the
+// "active category" recording toggle in config.activeCategory, driven from
+// bot.js). Only VIP users (isUserVip) can browse categories and pull files
+// from them — see getUnseenCategoryFiles.
+function loadCategories() {
+    return safeReadJson(CATEGORIES_PATH, {});
 }
 
-function saveVipCategories(cats) {
-    atomicWrite(VIP_CATEGORIES_PATH, cats);
+function saveCategories(categories) {
+    atomicWrite(CATEGORIES_PATH, categories);
 }
 
-function listVipCategories() {
-    return Object.values(loadVipCategories()).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+// Short, URL/callback_data-safe id — the display name (which the admin can
+// set to literally anything, including spaces/emoji/Malayalam) is kept
+// separately and never used inside a Telegram callback_data payload.
+function generateCategoryId() {
+    return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
 
-function getVipCategory(id) {
-    return loadVipCategories()[id] || null;
-}
-
-// Names are case-insensitively unique so admins don't end up with two
-// near-identical categories by accident.
-function createVipCategory(name, createdBy) {
-    const trimmed = String(name || '').trim();
+function createCategory(name, createdBy) {
+    const trimmed = String(name).trim();
     if (!trimmed) return { success: false, reason: 'empty' };
     if (trimmed.length > 64) return { success: false, reason: 'too_long' };
 
-    const cats = loadVipCategories();
-    const dupe = Object.values(cats).find(c => c.name.toLowerCase() === trimmed.toLowerCase());
-    if (dupe) return { success: false, reason: 'exists' };
-
-    const id = 'vc_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-    cats[id] = {
-        id,
-        name: trimmed,
-        files: [],
-        createdBy: String(createdBy),
-        createdAt: new Date().toISOString()
-    };
-    saveVipCategories(cats);
-    return { success: true, category: cats[id] };
-}
-
-// Deleting a category that's currently the active capture target also turns
-// capture off — otherwise new source-channel posts would silently vanish
-// into a category id that no longer exists.
-function deleteVipCategory(id) {
-    const cats = loadVipCategories();
-    if (!cats[id]) return false;
-    delete cats[id];
-    saveVipCategories(cats);
-
-    const config = loadConfig();
-    if (config.activeVipCategoryId === id) {
-        config.activeVipCategoryId = null;
-        saveConfig(config);
+    const categories = loadCategories();
+    const nameLower = trimmed.toLowerCase();
+    if (Object.values(categories).some(c => c.name.toLowerCase() === nameLower)) {
+        return { success: false, reason: 'exists' };
     }
+
+    let id = generateCategoryId();
+    while (categories[id]) id = generateCategoryId(); // astronomically unlikely, but stay safe
+
+    const entry = { id, name: trimmed, createdBy: String(createdBy), createdAt: new Date().toISOString() };
+    categories[id] = entry;
+    saveCategories(categories);
+    return { success: true, category: entry };
+}
+
+function deleteCategory(id) {
+    const categories = loadCategories();
+    if (!categories[id]) return false;
+    delete categories[id];
+    saveCategories(categories);
     return true;
+    // Note: files already tagged with this category id are left as-is
+    // (historical data) — they simply become unreachable through the VIP
+    // Files menu once the category itself is gone, since that menu is
+    // driven off this list, not off the file pool.
 }
 
-function renameVipCategory(id, newName) {
-    const trimmed = String(newName || '').trim();
-    if (!trimmed) return { success: false, reason: 'empty' };
-    const cats = loadVipCategories();
-    if (!cats[id]) return { success: false, reason: 'not_found' };
-    const dupe = Object.values(cats).find(c => c.id !== id && c.name.toLowerCase() === trimmed.toLowerCase());
-    if (dupe) return { success: false, reason: 'exists' };
-    cats[id].name = trimmed;
-    saveVipCategories(cats);
-    return { success: true, category: cats[id] };
+function getCategoryById(id) {
+    if (!id) return null;
+    const categories = loadCategories();
+    return categories[id] || null;
 }
 
-// Adds a file reference to a category. Dedupes the same way addSharedFile
-// does (by chat_id+message_id, and by file_unique_id when known).
-function addVipCategoryFile(categoryId, chatId, messageId, type, fileUniqueId) {
-    const cats = loadVipCategories();
-    const cat = cats[categoryId];
-    if (!cat) return false;
-    if (cat.files.some(f => f.chat_id === chatId && f.message_id === messageId)) return false;
-    if (fileUniqueId && cat.files.some(f => f.file_unique_id === fileUniqueId)) return false;
-    cat.files.push({
-        chat_id: chatId,
-        message_id: messageId,
-        type,
-        file_unique_id: fileUniqueId || null,
-        added_at: new Date().toISOString()
-    });
-    saveVipCategories(cats);
-    return true;
+function listCategories() {
+    return Object.values(loadCategories()).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 }
 
-function removeVipCategoryFile(categoryId, chatId, messageId) {
-    const cats = loadVipCategories();
-    const cat = cats[categoryId];
-    if (!cat) return;
-    const before = cat.files.length;
-    cat.files = cat.files.filter(f => !(f.chat_id === chatId && f.message_id === messageId));
-    if (cat.files.length !== before) saveVipCategories(cats);
+// How many files currently sit in a category — shown in the admin panel so
+// an admin can tell at a glance whether a folder is empty before deleting it
+// or pointing VIP users at it.
+function getCategoryFileCount(id) {
+    return loadSharedFiles().filter(f => f.category === id).length;
 }
 
-// Marks `categoryId` as the live capture target — every source-channel post
-// from now on is saved into it (and only it) until stopVipCapture() or
-// setActiveVipCategory() with a different id is called.
-function setActiveVipCategory(categoryId) {
-    const config = loadConfig();
-    config.activeVipCategoryId = categoryId;
-    saveConfig(config);
-}
-
-function stopVipCapture() {
-    const config = loadConfig();
-    config.activeVipCategoryId = null;
-    saveConfig(config);
-}
-
-function getActiveVipCategory() {
-    const config = loadConfig();
-    if (!config.activeVipCategoryId) return null;
-    return getVipCategory(config.activeVipCategoryId);
+// Files in this specific VIP category the user hasn't received yet. Reuses
+// the same per-user "seen" tag format (`chat_id:message_id`) as the normal
+// pool — a file's tag is unique regardless of which pool it's in, so one
+// seen-list safely covers both without collisions.
+function getUnseenCategoryFiles(userId, categoryId) {
+    const users = loadUsers();
+    const u = getUser(users, userId);
+    const seenSet = new Set(u.seen);
+    return loadSharedFiles().filter(f => f.category === categoryId && !seenSet.has(`${f.chat_id}:${f.message_id}`));
 }
 
 // Returns THIS user's own /random stats (not admin-wide): files received,
@@ -626,25 +593,18 @@ function saveKnownChats(chats) {
 // captured from the my_chat_member update. Once set, it's never overwritten by
 // later calls that don't pass it (so a plain message/channel_post sighting
 // can't clobber the real "who added it" attribution).
-// Self-healing: any live sighting of a chat previously marked dead (see
-// markKnownChatDead) clears the dead flag — if we're seeing an update from
-// it, it's clearly reachable again.
 function recordKnownChat(chatId, title, type, addedBy) {
     const chats = loadKnownChats();
     const key = String(chatId);
     const existing = chats[key];
     const resolvedAddedBy = addedBy !== undefined ? addedBy : (existing ? existing.addedBy : undefined);
-    const wasDead = !!(existing && existing.dead);
-    if (existing && existing.title === title && existing.type === type && existing.addedBy === resolvedAddedBy && !wasDead) return;
+    if (existing && existing.title === title && existing.type === type && existing.addedBy === resolvedAddedBy) return;
     chats[key] = {
         id: chatId,
         title: title || 'Untitled',
         type,
         addedBy: resolvedAddedBy,
-        last_seen: new Date().toISOString(),
-        dead: false,
-        deadReason: null,
-        deadAt: null
+        last_seen: new Date().toISOString()
     };
     saveKnownChats(chats);
 }
@@ -653,16 +613,11 @@ function recordKnownChat(chatId, title, type, addedBy) {
 // PLUS legacy chats with no recorded addedBy (grandfathered in so nothing
 // already configured silently disappears — they'll get properly attributed
 // the next time the bot sees a my_chat_member update for them).
-// By default, chats marked dead (see markKnownChatDead) are excluded — they
-// were unreachable (banned/deleted/bot removed) last time we checked, so
-// they shouldn't clutter channel pickers. Pass includeDead: true to see them
-// anyway (e.g. an admin-facing "dead channels" list).
-function getKnownChats(adminId, { includeDead = false } = {}) {
+function getKnownChats(adminId) {
     const all = Object.values(loadKnownChats());
-    let filtered = adminId === undefined
+    const filtered = adminId === undefined
         ? all
         : all.filter(c => c.addedBy === undefined || c.addedBy === null || String(c.addedBy) === String(adminId));
-    if (!includeDead) filtered = filtered.filter(c => !c.dead);
     return filtered.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
 }
 
@@ -673,23 +628,6 @@ function removeKnownChat(chatId) {
         delete chats[key];
         saveKnownChats(chats);
     }
-}
-
-// Marks a known chat as unreachable (banned, deleted, bot removed as admin,
-// etc) instead of deleting it outright — keeps the history/title around for
-// context, but hides it from channel pickers (see getKnownChats) so admins
-// can't accidentally pick a dead channel as a source/destination again.
-// No-op if the chat was never recorded in the first place.
-function markKnownChatDead(chatId, reason) {
-    const chats = loadKnownChats();
-    const key = String(chatId);
-    if (!chats[key]) return false;
-    if (chats[key].dead) return false; // already marked — avoid re-writing/re-notifying every tick
-    chats[key].dead = true;
-    chats[key].deadReason = reason || null;
-    chats[key].deadAt = new Date().toISOString();
-    saveKnownChats(chats);
-    return true;
 }
 
 // ===== Broadcast history =====
@@ -1087,7 +1025,6 @@ module.exports = {
     recordKnownChat,
     getKnownChats,
     removeKnownChat,
-    markKnownChatDead,
     markUserBlocked,
     addBroadcastHistory,
     getBroadcastHistory,
@@ -1126,14 +1063,10 @@ module.exports = {
     deletePromoCode,
     listPromoCodes,
     redeemPromoCode,
-    listVipCategories,
-    getVipCategory,
-    createVipCategory,
-    deleteVipCategory,
-    renameVipCategory,
-    addVipCategoryFile,
-    removeVipCategoryFile,
-    setActiveVipCategory,
-    stopVipCapture,
-    getActiveVipCategory
+    createCategory,
+    deleteCategory,
+    getCategoryById,
+    listCategories,
+    getCategoryFileCount,
+    getUnseenCategoryFiles
 };

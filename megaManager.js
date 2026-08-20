@@ -159,6 +159,20 @@ class MegaManager {
         }
     }
 
+    // Timeout scales with size instead of a single fixed 5-minute cap, so a
+    // small file doesn't wait needlessly long to fail and a large file isn't
+    // cut off before a slow-but-working transfer can finish.
+    // Assumes a conservative minimum sustained speed; base covers MEGA API
+    // handshake/connection overhead before bytes start moving.
+    calculateDownloadTimeout(bytes) {
+        const BASE_MS = 30000;                          // connection/setup overhead
+        const MIN_SPEED_BYTES_PER_MS = (1024 * 1024) / 1000; // assume at least ~1 MB/s
+        const MIN_TIMEOUT = 60000;                       // never less than 1 min
+        const MAX_TIMEOUT = 45 * 60 * 1000;              // never more than 45 min
+        const computed = BASE_MS + (bytes / MIN_SPEED_BYTES_PER_MS);
+        return Math.min(MAX_TIMEOUT, Math.max(MIN_TIMEOUT, computed));
+    }
+
     async downloadItem(megaUrl, userId) {
         await this.ensureConnected();
         
@@ -170,41 +184,49 @@ class MegaManager {
         console.log(`Downloading from: ${cleanUrl}`);
 
         return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
+            // Short timeout just for resolving the link + reading its
+            // attributes (name/size) — actual size isn't known yet, so this
+            // stays fixed. The real, size-aware timeout is set once we know
+            // what we're downloading (see handleFileDownload/handleFolderDownload).
+            const connectTimeout = setTimeout(() => {
                 reject(new Error('Download timeout'));
-            }, 300000);
+            }, 30000);
 
             try {
                 
                 const file = mega.File.fromURL(cleanUrl, {}, this.storage);
                 
                 file.loadAttributes((err) => {
+                    clearTimeout(connectTimeout);
                     if (err) {
-                        clearTimeout(timeout);
                         return reject(new Error(`Failed to load: ${err.message}`));
                     }
 
                     console.log(`Loaded: ${file.name} (${file.directory ? 'Folder' : 'File'})`);
 
                     if (file.directory) {
-                        this.handleFolderDownload(file, userId, timeout, resolve, reject);
+                        this.handleFolderDownload(file, userId, resolve, reject);
                     } else {
-                        this.handleFileDownload(file, userId, timeout, resolve, reject);
+                        this.handleFileDownload(file, userId, resolve, reject);
                     }
                 });
             } catch (error) {
-                clearTimeout(timeout);
+                clearTimeout(connectTimeout);
                 reject(new Error(`Invalid link: ${error.message}`));
             }
         });
     }
 
-    async handleFileDownload(file, userId, timeout, resolve, reject) {
+    async handleFileDownload(file, userId, resolve, reject) {
+        let timeout;
         try {
             if (file.size > this.maxFileSize) {
-                clearTimeout(timeout);
                 return reject(new Error(`File too large: ${this.formatBytes(file.size)}`));
             }
+
+            timeout = setTimeout(() => {
+                reject(new Error('Download timeout'));
+            }, this.calculateDownloadTimeout(file.size));
 
             const tempDir = path.join(os.tmpdir(), 'mega-bot', userId.toString());
             if (!fs.existsSync(tempDir)) {
@@ -214,7 +236,7 @@ class MegaManager {
             const tempPath = path.join(tempDir, this.sanitizeFilename(file.name));
             const writeStream = fs.createWriteStream(tempPath);
 
-            console.log(`Downloading file: ${file.name}`);
+            console.log(`Downloading file: ${file.name} (${this.formatBytes(file.size)}, timeout ${Math.round(this.calculateDownloadTimeout(file.size) / 1000)}s)`);
 
             file.download({})
                 .on('error', (err) => {
@@ -247,23 +269,26 @@ class MegaManager {
         }
     }
 
-    async handleFolderDownload(folder, userId, timeout, resolve, reject) {
+    async handleFolderDownload(folder, userId, resolve, reject) {
+        let timeout;
         try {
         
             const allFiles = this.getAllFilesFromFolder(folder);
             
             if (allFiles.length === 0) {
-                clearTimeout(timeout);
                 return reject(new Error('Folder is empty'));
             }
 
             const totalSize = allFiles.reduce((sum, file) => sum + file.size, 0);
             if (totalSize > this.maxFolderSize) {
-                clearTimeout(timeout);
                 return reject(new Error(`Folder too large: ${this.formatBytes(totalSize)}`));
             }
 
-            console.log(`Folder has ${allFiles.length} files, total: ${this.formatBytes(totalSize)}`);
+            timeout = setTimeout(() => {
+                reject(new Error('Download timeout'));
+            }, this.calculateDownloadTimeout(totalSize));
+
+            console.log(`Folder has ${allFiles.length} files, total: ${this.formatBytes(totalSize)}, timeout ${Math.round(this.calculateDownloadTimeout(totalSize) / 1000)}s`);
 
           
             const folderDir = path.join(os.tmpdir(), 'mega-bot', userId.toString(), this.sanitizeFilename(folder.name));

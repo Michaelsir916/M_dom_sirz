@@ -77,7 +77,9 @@ const {
     getCategoryById,
     listCategories,
     getCategoryFileCount,
-    getUnseenCategoryFiles
+    getUnseenCategoryFiles,
+    loadPendingActions,
+    savePendingActions
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -229,8 +231,20 @@ async function requireAdmin(ctx, viaAction = false) {
 // In-memory "what is this admin currently typing for" state, keyed by admin
 // user id. Used so button flows (add force-sub, set source, broadcast, custom
 // values) can ask the admin to send one plain message instead of a slash
-// command. Cleared on use, on /cancel, or lost on restart (admin just retaps).
-const pendingAction = {};
+// command. Cleared on use or on /cancel. Hydrated from disk at startup and
+// re-persisted on every change via setPendingAction/clearPendingAction below
+// so it survives a restart — see loadPendingActions in fileShare.js for why.
+const pendingAction = loadPendingActions();
+
+function setPendingAction(userId, action) {
+    pendingAction[userId] = action;
+    savePendingActions(pendingAction);
+}
+
+function clearPendingAction(userId) {
+    delete pendingAction[userId];
+    savePendingActions(pendingAction);
+}
 
 // In-memory holder for an auto-post "test preview" awaiting the admin's
 // ✅ Post / ❌ Skip tap (setup-time confirm only — scheduled runs never wait
@@ -1445,7 +1459,7 @@ bot.command('redeem', async (ctx) => {
     if (ctx.chat.type !== 'private') return;
     const parts = ctx.message.text.trim().split(/\s+/);
     if (parts.length < 2) {
-        pendingAction[ctx.from.id] = { type: 'redeem_code' };
+        setPendingAction(ctx.from.id, { type: 'redeem_code' });
         await ctx.reply('🎟 Send the promo code you want to redeem, or /cancel.');
         return;
     }
@@ -1454,7 +1468,7 @@ bot.command('redeem', async (ctx) => {
 
 bot.action('user_redeem', async (ctx) => {
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'redeem_code' };
+    setPendingAction(ctx.from.id, { type: 'redeem_code' });
     await ctx.reply('🎟 Send the promo code you want to redeem, or /cancel.');
 });
 
@@ -2138,7 +2152,7 @@ bot.action('about_menu', async (ctx) => {
 bot.action('about_setjoin', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'about_join_link' };
+    setPendingAction(ctx.from.id, { type: 'about_join_link' });
     await ctx.editMessageText('👥 Send the Join Group link (e.g. `https://t.me/yourgroup`), or /cancel.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'about_menu' }]] }
@@ -2148,7 +2162,7 @@ bot.action('about_setjoin', async (ctx) => {
 bot.action('about_settext', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'about_link_text' };
+    setPendingAction(ctx.from.id, { type: 'about_link_text' });
     await ctx.editMessageText('✏️ Send the clickable text (e.g. `Hello`), or /cancel.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'about_menu' }]] }
@@ -2158,7 +2172,7 @@ bot.action('about_settext', async (ctx) => {
 bot.action('about_seturl', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'about_link_url' };
+    setPendingAction(ctx.from.id, { type: 'about_link_url' });
     await ctx.editMessageText('🔗 Send the URL the text should link to, or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'about_menu' }]] }
     });
@@ -2197,7 +2211,7 @@ bot.action('vip_menu', async (ctx) => {
 bot.action('vip_setlink', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'vip_channel_link' };
+    setPendingAction(ctx.from.id, { type: 'vip_channel_link' });
     await ctx.editMessageText('🔗 Send the VIP channel link (e.g. `https://t.me/yourvipchannel`), or /cancel.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'vip_menu' }]] }
@@ -2207,7 +2221,7 @@ bot.action('vip_setlink', async (ctx) => {
 bot.action('vip_settext', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'vip_promo_text' };
+    setPendingAction(ctx.from.id, { type: 'vip_promo_text' });
     await ctx.editMessageText('✏️ Send the promo text shown above the Join button (benefits, price, etc.), or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'vip_menu' }]] }
     });
@@ -2249,7 +2263,7 @@ bot.action('promo_menu', async (ctx) => {
 bot.action('promo_create_menu', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'promo_create' };
+    setPendingAction(ctx.from.id, { type: 'promo_create' });
     await ctx.editMessageText(
         '➕ <b>Create Promo Code</b>\n\n' +
         'Send: <code>CODE DAYS [MAXUSES]</code>\n\n' +
@@ -2267,7 +2281,7 @@ bot.action('promo_create_menu', async (ctx) => {
 bot.action('promo_delete_menu', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'promo_delete' };
+    setPendingAction(ctx.from.id, { type: 'promo_delete' });
     await ctx.editMessageText('🗑 Send the code to delete, or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
     });
@@ -2323,7 +2337,7 @@ bot.action('category_menu', async (ctx) => {
 bot.action('category_create_menu', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'category_create' };
+    setPendingAction(ctx.from.id, { type: 'category_create' });
     await ctx.editMessageText(
         '➕ <b>Create VIP Category</b>\n\n' +
         'Send the name for this category (any name you like — it\'s just a label VIP users will see).\n\n' +
@@ -2417,7 +2431,7 @@ bot.action('mm_toggle', async (ctx) => {
 bot.action('mm_add_user', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'mm_add_user' };
+    setPendingAction(ctx.from.id, { type: 'mm_add_user' });
     await ctx.editMessageText('⌨️ Send the Telegram user ID to allow during maintenance, or /cancel.\n\n_Tip: ask them to send /start to any bot that shows their ID, e.g. @userinfobot._', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mm_menu' }]] }
@@ -2525,7 +2539,7 @@ bot.action(/^mud_setchannel:(-?\d+)$/, async (ctx) => {
 bot.action('mud_setchannel_manual', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'mud_setchannel_manual' };
+    setPendingAction(ctx.from.id, { type: 'mud_setchannel_manual' });
     await ctx.editMessageText('⌨️ Send the channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mud_menu' }]] }
@@ -2736,7 +2750,7 @@ bot.action(/^fs_addfs:(-?\d+)$/, async (ctx) => {
 bot.action('fs_addfs_manual', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'add_forcesub_manual' };
+    setPendingAction(ctx.from.id, { type: 'add_forcesub_manual' });
     await ctx.editMessageText('⌨️ Send the group/channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be a member/admin there. Send /cancel to abort.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'fs_listforcesub' }]] }
@@ -2746,7 +2760,7 @@ bot.action('fs_addfs_manual', async (ctx) => {
 bot.action('fs_addfs_bulk', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'add_forcesub_bulk' };
+    setPendingAction(ctx.from.id, { type: 'add_forcesub_bulk' });
     await ctx.editMessageText(
         '📥 Send multiple group/channel IDs or @usernames — one per line, or comma-separated.\n\n' +
         'Example:\n`-1001234567890`\n`@somechannel`\n`-1009876543210`\n\n' +
@@ -2788,7 +2802,7 @@ bot.action(/^fs_setsrc:(-?\d+)$/, async (ctx) => {
 bot.action('fs_setsrc_manual', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'set_source_manual' };
+    setPendingAction(ctx.from.id, { type: 'set_source_manual' });
     await ctx.editMessageText('⌨️ Send the source group/channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be a member/admin there. Send /cancel to abort.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu_fileshare' }]] }
@@ -2846,7 +2860,7 @@ bot.action('fs_broadcast_history', async (ctx) => {
 bot.action('fs_broadcast_send', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'broadcast' };
+    setPendingAction(ctx.from.id, { type: 'broadcast' });
     await ctx.editMessageText('📢 Send the text message to broadcast now — or send a photo/video/GIF with a caption — or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'fs_broadcast_menu' }]] }
     });
@@ -3271,7 +3285,7 @@ bot.action(/^ap_setchannel:(-?\d+)$/, async (ctx) => {
 bot.action('ap_setchannel_manual', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'ap_setchannel_manual' };
+    setPendingAction(ctx.from.id, { type: 'ap_setchannel_manual' });
     await ctx.editMessageText('⌨️ Send the destination channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
@@ -3346,7 +3360,7 @@ bot.action(/^ap_setsource:(-?\d+)$/, async (ctx) => {
 bot.action('ap_setsource_manual', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'ap_setsource_manual' };
+    setPendingAction(ctx.from.id, { type: 'ap_setsource_manual' });
     await ctx.editMessageText('⌨️ Send the source channel ID (e.g. `-1001234567890`) or `@username` to add.\n\nI must already be admin there. Send /cancel to abort.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
@@ -3408,7 +3422,7 @@ bot.action(/^ap_interval:(\d+)$/, async (ctx) => {
 bot.action('ap_interval_custom', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'autopost_interval_custom' };
+    setPendingAction(ctx.from.id, { type: 'autopost_interval_custom' });
     await ctx.editMessageText('✏️ Send the interval — e.g. `45m`, `2h`, `1h30m`, or just a number for minutes, or /cancel.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_interval_menu' }]] }
@@ -3418,7 +3432,7 @@ bot.action('ap_interval_custom', async (ctx) => {
 bot.action('ap_caption', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'autopost_caption' };
+    setPendingAction(ctx.from.id, { type: 'autopost_caption' });
     await ctx.editMessageText('✏️ Send the caption to use for every auto-post, or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
     });
@@ -3436,7 +3450,7 @@ bot.action('ap_thumb_toggle', async (ctx) => {
 bot.action('ap_thumb_upload', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'autopost_thumbnail' };
+    setPendingAction(ctx.from.id, { type: 'autopost_thumbnail' });
     await ctx.editMessageText('📤 Send the photo to use as the thumbnail for every auto-post, or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
     });
@@ -3581,7 +3595,7 @@ bot.action(/^fs_custom_(count|cooldown|dailylimit|autodelete)$/, async (ctx) => 
     await ctx.answerCbQuery();
     const type = `custom_${ctx.match[1]}`;
     const field = CUSTOM_FIELD_MAP[type];
-    pendingAction[ctx.from.id] = { type };
+    setPendingAction(ctx.from.id, { type });
     await ctx.editMessageText(`✏️ Send a whole number for *${field.label}* (${field.min}+), or /cancel.`, {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: field.menu }]] }
@@ -3667,7 +3681,7 @@ bot.on(['photo', 'video', 'animation'], async (ctx) => {
 
         // (c) Auto-post custom thumbnail upload — only photos accepted
         if (pendingAction[ctx.from.id]?.type === 'autopost_thumbnail') {
-            delete pendingAction[ctx.from.id];
+            clearPendingAction(ctx.from.id);
             if (kind !== 'photo') {
                 await ctx.reply('⚠️ Please send a photo for the custom thumbnail. Try again from the Auto-Post menu.');
                 return;
@@ -3679,7 +3693,7 @@ bot.on(['photo', 'video', 'animation'], async (ctx) => {
 
         // (a) Broadcast button flow — admin tapped "Send Now" then sent media
         if (pendingAction[ctx.from.id]?.type === 'broadcast') {
-            delete pendingAction[ctx.from.id];
+            clearPendingAction(ctx.from.id);
             await runMediaBroadcast(ctx, kind, fileId, caption.replace(/^\/broadcast\s*/i, ''));
             return;
         }
@@ -3874,13 +3888,13 @@ async function handlePendingAction(ctx, text) {
     if (!action) return;
 
     if (text.trim() === '/cancel') {
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply('❌ Cancelled.');
         return;
     }
 
     if (action.type === 'add_forcesub_bulk') {
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         const identifiers = text.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
         if (identifiers.length === 0) {
             await ctx.reply('⚠️ No IDs/usernames found in that message.');
@@ -3963,12 +3977,12 @@ async function handlePendingAction(ctx, text) {
             saveConfig(config);
             await ctx.reply(`✅ Set "${chat.title}" as the source ${chat.type === 'channel' ? 'channel' : 'group'}.`);
         }
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         return;
     }
 
     if (action.type === 'mm_add_user') {
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         const idText = text.trim();
         if (!/^\d+$/.test(idText)) {
             await ctx.reply('⚠️ That doesn\'t look like a numeric Telegram user ID.');
@@ -4004,7 +4018,7 @@ async function handlePendingAction(ctx, text) {
         config.megaUploadChannelId = chat.id;
         config.megaUploadMode = 'channel';
         saveConfig(config);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply(`✅ MEGA uploads (yours) will now go to "${chat.title}".`);
         return;
     }
@@ -4031,7 +4045,7 @@ async function handlePendingAction(ctx, text) {
         }
         recordKnownChat(chat.id, chat.title, chat.type);
         setAutopostConfig(userId, { channelId: chat.id });
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply(`✅ Auto-post destination set to "${chat.title}". This channel is used only for your auto-posts.`);
         return;
     }
@@ -4065,13 +4079,13 @@ async function handlePendingAction(ctx, text) {
         const ids = new Set((cfg.sourceChannelIds || []).map(String));
         ids.add(String(chat.id));
         setAutopostConfig(userId, { sourceChannelIds: Array.from(ids).map(Number) });
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply(`✅ Added "${chat.title}" as a source channel. New videos posted there will be picked up automatically.`);
         return;
     }
 
     if (action.type === 'broadcast') {
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         if (getAllUserIds().length === 0) {
             await ctx.reply('No users have used /random yet.');
             return;
@@ -4081,14 +4095,14 @@ async function handlePendingAction(ctx, text) {
     }
 
     if (action.type === 'autopost_caption') {
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         setAutopostConfig(userId, { caption: text });
         await ctx.reply('✅ Auto-post caption saved.');
         return;
     }
 
     if (action.type === 'autopost_interval_custom') {
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         const minutes = parseIntervalToMinutes(text);
         if (!minutes || minutes < 1) {
             await ctx.reply('⚠️ Couldn\'t read that. Send e.g. `45m`, `2h`, `1h30m`, or a plain number of minutes, or /cancel.', { parse_mode: 'Markdown' });
@@ -4108,7 +4122,7 @@ async function handlePendingAction(ctx, text) {
         const config = loadConfig();
         config.aboutJoinGroupLink = url;
         saveConfig(config);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply('✅ Join Group link saved.');
         return;
     }
@@ -4122,7 +4136,7 @@ async function handlePendingAction(ctx, text) {
         const config = loadConfig();
         config.aboutLinkText = t;
         saveConfig(config);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply('✅ Link text saved.');
         return;
     }
@@ -4136,13 +4150,13 @@ async function handlePendingAction(ctx, text) {
         const config = loadConfig();
         config.aboutLinkUrl = url;
         saveConfig(config);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply('✅ Link URL saved.');
         return;
     }
 
     if (action.type === 'redeem_code') {
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await handleRedeemCode(ctx, text.trim());
         return;
     }
@@ -4165,7 +4179,7 @@ async function handlePendingAction(ctx, text) {
             return;
         }
         const result = createPromoCode(codeRaw, days, maxUses, userId);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         if (!result.success) {
             await ctx.reply(result.reason === 'exists' ? `⚠️ Code <code>${escapeHtml(codeRaw.toUpperCase())}</code> already exists.` : '⚠️ Could not create that code.', { parse_mode: 'HTML' });
             return;
@@ -4186,7 +4200,7 @@ async function handlePendingAction(ctx, text) {
     if (action.type === 'promo_delete') {
         const code = text.trim().toUpperCase();
         const deleted = deletePromoCode(code);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply(deleted ? `✅ Code <code>${escapeHtml(code)}</code> deleted.` : `⚠️ Code <code>${escapeHtml(code)}</code> not found.`, { parse_mode: 'HTML' });
         return;
     }
@@ -4194,7 +4208,7 @@ async function handlePendingAction(ctx, text) {
     if (action.type === 'category_create') {
         const name = text.trim();
         const result = createCategory(name, userId);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         if (!result.success) {
             const messages = {
                 empty: '⚠️ Category name can\'t be empty. Try again, or /cancel.',
@@ -4228,7 +4242,7 @@ async function handlePendingAction(ctx, text) {
         const config = loadConfig();
         config.vipChannelLink = url;
         saveConfig(config);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply('✅ VIP channel link saved. The "💎 Buy VIP" button is now active.');
         return;
     }
@@ -4242,7 +4256,7 @@ async function handlePendingAction(ctx, text) {
         const config = loadConfig();
         config.vipPromoText = t;
         saveConfig(config);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply('✅ Promo text saved.');
         return;
     }
@@ -4257,12 +4271,12 @@ async function handlePendingAction(ctx, text) {
         const config = loadConfig();
         config[key] = n;
         saveConfig(config);
-        delete pendingAction[userId];
+        clearPendingAction(userId);
         await ctx.reply(`✅ ${label} set to ${n}.`);
         return;
     }
 
-    delete pendingAction[userId];
+    clearPendingAction(userId);
 }
 
 bot.on('message', async (ctx) => {

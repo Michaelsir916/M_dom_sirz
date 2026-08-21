@@ -11,8 +11,7 @@ const AUTOPOST_PATH = path.join(__dirname, 'autopost_configs.json');
 const PENDING_JOIN_REQUESTS_PATH = path.join(__dirname, 'pending_join_requests.json');
 const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
 const PROMO_CODES_PATH = path.join(__dirname, 'promo_codes.json');
-const CATEGORIES_PATH = path.join(__dirname, 'categories.json');
-const PENDING_ACTIONS_PATH = path.join(__dirname, 'pending_actions.json');
+const PENDING_DELETIONS_PATH = path.join(__dirname, 'pending_deletions.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -36,10 +35,7 @@ const DEFAULT_CONFIG = {
     aboutLinkText: 'Click Here', // custom clickable hyperlink text shown in the non-admin About panel
     aboutLinkUrl: null,          // url that aboutLinkText links to
     vipChannelLink: null,        // url the "💎 Buy VIP" button sends users to
-    vipPromoText: null,          // optional promo copy shown above the Join button
-    activeCategory: null         // id of the VIP-only category currently "recording" —
-                                  // while set, every file posted in the source chat is
-                                  // tagged into this category instead of the normal pool
+    vipPromoText: null           // optional promo copy shown above the Join button
 };
 
 // ===== Config backup (used by /backupconfig) =====
@@ -57,7 +53,7 @@ const CONFIG_BACKUP_FILES = [
     { path: PENDING_JOIN_REQUESTS_PATH, name: 'pending_join_requests.json' },
     { path: VIP_CLICKS_PATH, name: 'vip_clicks.json' },
     { path: PROMO_CODES_PATH, name: 'promo_codes.json' },
-    { path: CATEGORIES_PATH, name: 'categories.json' }
+    { path: PENDING_DELETIONS_PATH, name: 'pending_deletions.json' }
 ];
 
 // Only returns files that actually exist yet (a fresh install may not have
@@ -80,24 +76,6 @@ function safeReadJson(filePath, fallback) {
         console.error(`Error reading ${filePath}:`, e.message);
         return fallback;
     }
-}
-
-// ===== Pending admin actions ("what is this admin currently typing for") =====
-// Persisted (not just kept in memory) so a bot restart — or a brief moment
-// where a stray second process picks up the next update on Termux — can't
-// silently strand an admin mid-flow: they tap "➕ Create Code", the process
-// that handles the button sets this, then if a DIFFERENT process instance
-// (or the same one after a restart) receives their next text message with
-// nothing recorded for them, the message just falls through to normal
-// text handling and gets no reply at all — indistinguishable from the bot
-// doing nothing. Persisting to disk means whichever process is alive when
-// the reply arrives sees the same state the button press wrote.
-function loadPendingActions() {
-    return safeReadJson(PENDING_ACTIONS_PATH, {});
-}
-
-function savePendingActions(actions) {
-    atomicWrite(PENDING_ACTIONS_PATH, actions);
 }
 
 // ===== Config =====
@@ -124,12 +102,7 @@ function saveSharedFiles(files) {
 // exact same video re-forwarded/re-posted under a different message_id
 // (e.g. someone reposts the same clip into the source channel again)
 // doesn't get queued and auto-posted twice.
-//
-// category: null = normal /random pool (visible to everyone). A category id
-// (see createCategory below) tags the file into a VIP-only category instead
-// — it's then invisible to the normal pool and only reachable by VIP users
-// browsing that specific category.
-function addSharedFile(chatId, messageId, type, fileUniqueId, category = null) {
+function addSharedFile(chatId, messageId, type, fileUniqueId) {
     const files = loadSharedFiles();
     if (files.some(f => f.chat_id === chatId && f.message_id === messageId)) return false;
     if (fileUniqueId && files.some(f => f.file_unique_id === fileUniqueId)) return false;
@@ -138,7 +111,6 @@ function addSharedFile(chatId, messageId, type, fileUniqueId, category = null) {
         message_id: messageId,
         type,
         file_unique_id: fileUniqueId || null,
-        category: category || null,
         added_at: new Date().toISOString()
     });
     saveSharedFiles(files);
@@ -191,14 +163,12 @@ function getUser(users, userId) {
     return users[key];
 }
 
-// Files this user has NOT received yet. Only draws from the normal (non-VIP)
-// pool — files tagged into a VIP category (see categories, below) are
-// excluded here and only reachable via getUnseenCategoryFiles.
+// Files this user has NOT received yet
 function getUnseenFiles(userId) {
     const users = loadUsers();
     const u = getUser(users, userId);
     const seenSet = new Set(u.seen);
-    return loadSharedFiles().filter(f => !f.category && !seenSet.has(`${f.chat_id}:${f.message_id}`));
+    return loadSharedFiles().filter(f => !seenSet.has(`${f.chat_id}:${f.message_id}`));
 }
 
 // Marks the given files as seen for this user
@@ -212,6 +182,41 @@ function markSeen(userId, files) {
     }
     users[key] = u;
     saveUsers(users);
+}
+
+// ===== Pending message deletions (restart-safe auto-delete) =====
+// Auto-delete used to rely purely on an in-memory setTimeout, which is lost
+// on any pm2 restart/crash/redeploy that happens before the timer fires —
+// the message then never gets deleted. Every scheduled deletion is now also
+// persisted here; a periodic sweep (see getDuePendingDeletions, called from
+// bot.js on a tick + once at startup) can finish the job even if the
+// in-memory timer never got the chance to run.
+function loadPendingDeletions() {
+    return safeReadJson(PENDING_DELETIONS_PATH, []);
+}
+
+function savePendingDeletions(list) {
+    atomicWrite(PENDING_DELETIONS_PATH, list);
+}
+
+// Records a message for deletion at deleteAt (ms epoch timestamp).
+function schedulePendingDeletion(chatId, messageId, deleteAt) {
+    const list = loadPendingDeletions();
+    list.push({ chat_id: chatId, message_id: messageId, delete_at: deleteAt });
+    savePendingDeletions(list);
+}
+
+// Entries whose delete_at has already passed — due for deletion right now.
+function getDuePendingDeletions() {
+    const now = Date.now();
+    return loadPendingDeletions().filter(e => e.delete_at <= now);
+}
+
+// Removes one entry (after it's been deleted, or to give up on it).
+function removePendingDeletion(chatId, messageId) {
+    const list = loadPendingDeletions();
+    const filtered = list.filter(e => !(e.chat_id === chatId && e.message_id === messageId));
+    if (filtered.length !== list.length) savePendingDeletions(filtered);
 }
 
 // Checks + records a /random request (cooldown + daily limit). Returns { allowed, reason, retryAfter }
@@ -421,87 +426,6 @@ function redeemPromoCode(userId, code) {
 
     const expiresAt = grantVip(userId, entry.days, 'promo', key);
     return { success: true, days: entry.days, unlimited: entry.days === 0, expiresAt };
-}
-
-// ===== VIP-only Categories =====
-// A category is a named, VIP-exclusive folder of files. Files land in one
-// via addSharedFile(..., categoryId) instead of the normal pool (see the
-// "active category" recording toggle in config.activeCategory, driven from
-// bot.js). Only VIP users (isUserVip) can browse categories and pull files
-// from them — see getUnseenCategoryFiles.
-function loadCategories() {
-    return safeReadJson(CATEGORIES_PATH, {});
-}
-
-function saveCategories(categories) {
-    atomicWrite(CATEGORIES_PATH, categories);
-}
-
-// Short, URL/callback_data-safe id — the display name (which the admin can
-// set to literally anything, including spaces/emoji/Malayalam) is kept
-// separately and never used inside a Telegram callback_data payload.
-function generateCategoryId() {
-    return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-}
-
-function createCategory(name, createdBy) {
-    const trimmed = String(name).trim();
-    if (!trimmed) return { success: false, reason: 'empty' };
-    if (trimmed.length > 64) return { success: false, reason: 'too_long' };
-
-    const categories = loadCategories();
-    const nameLower = trimmed.toLowerCase();
-    if (Object.values(categories).some(c => c.name.toLowerCase() === nameLower)) {
-        return { success: false, reason: 'exists' };
-    }
-
-    let id = generateCategoryId();
-    while (categories[id]) id = generateCategoryId(); // astronomically unlikely, but stay safe
-
-    const entry = { id, name: trimmed, createdBy: String(createdBy), createdAt: new Date().toISOString() };
-    categories[id] = entry;
-    saveCategories(categories);
-    return { success: true, category: entry };
-}
-
-function deleteCategory(id) {
-    const categories = loadCategories();
-    if (!categories[id]) return false;
-    delete categories[id];
-    saveCategories(categories);
-    return true;
-    // Note: files already tagged with this category id are left as-is
-    // (historical data) — they simply become unreachable through the VIP
-    // Files menu once the category itself is gone, since that menu is
-    // driven off this list, not off the file pool.
-}
-
-function getCategoryById(id) {
-    if (!id) return null;
-    const categories = loadCategories();
-    return categories[id] || null;
-}
-
-function listCategories() {
-    return Object.values(loadCategories()).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
-}
-
-// How many files currently sit in a category — shown in the admin panel so
-// an admin can tell at a glance whether a folder is empty before deleting it
-// or pointing VIP users at it.
-function getCategoryFileCount(id) {
-    return loadSharedFiles().filter(f => f.category === id).length;
-}
-
-// Files in this specific VIP category the user hasn't received yet. Reuses
-// the same per-user "seen" tag format (`chat_id:message_id`) as the normal
-// pool — a file's tag is unique regardless of which pool it's in, so one
-// seen-list safely covers both without collisions.
-function getUnseenCategoryFiles(userId, categoryId) {
-    const users = loadUsers();
-    const u = getUser(users, userId);
-    const seenSet = new Set(u.seen);
-    return loadSharedFiles().filter(f => f.category === categoryId && !seenSet.has(`${f.chat_id}:${f.message_id}`));
 }
 
 // Returns THIS user's own /random stats (not admin-wide): files received,
@@ -1082,12 +1006,7 @@ module.exports = {
     deletePromoCode,
     listPromoCodes,
     redeemPromoCode,
-    createCategory,
-    deleteCategory,
-    getCategoryById,
-    listCategories,
-    getCategoryFileCount,
-    getUnseenCategoryFiles,
-    loadPendingActions,
-    savePendingActions
+    schedulePendingDeletion,
+    getDuePendingDeletions,
+    removePendingDeletion
 };

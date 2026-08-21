@@ -2093,7 +2093,9 @@ async function renderFileSharePanel(ctx) {
     const keyboard = {
         inline_keyboard: [
             [{ text: '➕ Add Force-Sub', callback_data: 'fs_addfs_menu' }, { text: '📋 Force-Sub List', callback_data: 'fs_listforcesub' }],
-            [{ text: '🎯 Set Source', callback_data: 'fs_setsrc_menu' }],
+            config.sourceGroupId
+                ? [{ text: '🎯 Set Source', callback_data: 'fs_setsrc_menu' }, { text: '❌ Remove Source', callback_data: 'fs_removesrc' }]
+                : [{ text: '🎯 Set Source', callback_data: 'fs_setsrc_menu' }],
             [{ text: '📁 List Files', callback_data: 'fs_listfiles' }, { text: '📊 Stats', callback_data: 'fs_stats' }],
             [{ text: `🔢 Per Request: ${config.shareCount}`, callback_data: 'fs_count_menu' }],
             [{ text: `⏱ Cooldown: ${config.cooldownSeconds}s`, callback_data: 'fs_cooldown_menu' }],
@@ -2471,7 +2473,7 @@ async function renderMegaUploadPanel(ctx) {
         : 'Not set';
     const text = '📦 *MEGA Upload Destination* (admin-only)\n\n' +
         `Mode: ${config.megaUploadMode === 'channel' ? '📤 Channel' : '👤 Personal (chat)'}\n` +
-        (config.megaUploadMode === 'channel' ? `Channel: ${channelLabel}\n` : '') +
+        `Channel: ${channelLabel}\n` +
         '\nApplies only when *you* (admin) send a MEGA link — regular users always get files in their own chat. ' +
         'Once set, it goes straight there, no asking each time. The progress bar always stays in this chat; ' +
         'only the clean file (no link, no caption) reaches the channel.';
@@ -2481,7 +2483,9 @@ async function renderMegaUploadPanel(ctx) {
                 { text: `${config.megaUploadMode === 'personal' ? '✅ ' : ''}👤 Personal`, callback_data: 'mud_mode:personal' },
                 { text: `${config.megaUploadMode === 'channel' ? '✅ ' : ''}📤 Channel`, callback_data: 'mud_mode:channel' }
             ],
-            [{ text: '🎯 Set Channel', callback_data: 'mud_setchannel_menu' }],
+            config.megaUploadChannelId
+                ? [{ text: '🎯 Set Channel', callback_data: 'mud_setchannel_menu' }, { text: '❌ Remove Channel', callback_data: 'mud_removechannel' }]
+                : [{ text: '🎯 Set Channel', callback_data: 'mud_setchannel_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
@@ -2543,6 +2547,25 @@ bot.action('mud_setchannel_manual', async (ctx) => {
     await ctx.editMessageText('⌨️ Send the channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mud_menu' }]] }
+    });
+});
+
+bot.action('mud_removechannel', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const config = loadConfig();
+    if (!config.megaUploadChannelId) {
+        await ctx.answerCbQuery('Nothing set to remove.');
+        await renderMegaUploadPanel(ctx);
+        return;
+    }
+    const chat = getKnownChats().find(c => String(c.id) === String(config.megaUploadChannelId));
+    const removedLabel = chat ? chat.title : config.megaUploadChannelId;
+    config.megaUploadChannelId = null;
+    config.megaUploadMode = 'personal'; // channel mode requires a channel — fall back automatically so uploads don't silently break
+    saveConfig(config);
+    await ctx.answerCbQuery('✅ Removed');
+    await ctx.editMessageText(`✅ Removed "${removedLabel}" as the MEGA upload destination.\n\nMode reverted to 👤 Personal — your own MEGA uploads will come to this chat until you set a new channel.`, {
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'mud_menu' }]] }
     });
 });
 
@@ -2806,6 +2829,24 @@ bot.action('fs_setsrc_manual', async (ctx) => {
     await ctx.editMessageText('⌨️ Send the source group/channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be a member/admin there. Send /cancel to abort.', {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu_fileshare' }]] }
+    });
+});
+
+bot.action('fs_removesrc', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const config = loadConfig();
+    if (!config.sourceGroupId) {
+        await ctx.answerCbQuery('Nothing set to remove.');
+        await renderFileSharePanel(ctx);
+        return;
+    }
+    const chat = getKnownChats().find(c => String(c.id) === String(config.sourceGroupId));
+    const removedLabel = chat ? chat.title : config.sourceGroupId;
+    config.sourceGroupId = null;
+    saveConfig(config);
+    await ctx.answerCbQuery('✅ Removed');
+    await ctx.editMessageText(`✅ Removed "${removedLabel}" as the source. New photo/video posts won't be tracked until a new source is set.`, {
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_fileshare' }]] }
     });
 });
 
@@ -3233,7 +3274,9 @@ async function renderAutopostPanel(ctx) {
     const keyboard = {
         inline_keyboard: [
             [{ text: '➕ Add Source Channel', callback_data: 'ap_setsource_menu' }, { text: '➖ Remove Source Channel', callback_data: 'ap_removesource_menu' }],
-            [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }],
+            cfg.channelId
+                ? [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }, { text: '❌ Remove Destination', callback_data: 'ap_removechannel' }]
+                : [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }],
             [{ text: '🔍 Verify Destination (sends a test message)', callback_data: 'ap_verify_dest' }],
             [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }],
             [{ text: '✏️ Set Caption', callback_data: 'ap_caption' }],
@@ -3290,6 +3333,26 @@ bot.action('ap_setchannel_manual', async (ctx) => {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'ap_menu' }]] }
     });
+});
+
+bot.action('ap_removechannel', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const cfg = getAutopostConfig(ctx.from.id);
+    if (!cfg.channelId) {
+        await ctx.answerCbQuery('Nothing set to remove.');
+        await renderAutopostPanel(ctx);
+        return;
+    }
+    const chat = getKnownChats().find(c => String(c.id) === String(cfg.channelId));
+    const removedLabel = chat ? chat.title : cfg.channelId;
+    const wasRunning = cfg.enabled;
+    setAutopostConfig(ctx.from.id, { channelId: null, enabled: false }); // pause too — a scheduled run with no destination would just fail
+    await ctx.answerCbQuery('✅ Removed');
+    await ctx.editMessageText(
+        `✅ Removed "${removedLabel}" as the destination channel.` +
+        (wasRunning ? '\n\n⏸ Auto-Post paused — set a new destination and tap ▶️ Enable to resume.' : ''),
+        { reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'ap_menu' }]] } }
+    );
 });
 
 // Proves — rather than just claims — where auto-posts are actually landing.

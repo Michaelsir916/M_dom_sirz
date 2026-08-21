@@ -12,6 +12,7 @@ const PENDING_JOIN_REQUESTS_PATH = path.join(__dirname, 'pending_join_requests.j
 const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
 const PROMO_CODES_PATH = path.join(__dirname, 'promo_codes.json');
 const CATEGORIES_PATH = path.join(__dirname, 'categories.json');
+const PENDING_ACTIONS_PATH = path.join(__dirname, 'pending_actions.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -79,6 +80,24 @@ function safeReadJson(filePath, fallback) {
         console.error(`Error reading ${filePath}:`, e.message);
         return fallback;
     }
+}
+
+// ===== Pending admin actions ("what is this admin currently typing for") =====
+// Persisted (not just kept in memory) so a bot restart — or a brief moment
+// where a stray second process picks up the next update on Termux — can't
+// silently strand an admin mid-flow: they tap "➕ Create Code", the process
+// that handles the button sets this, then if a DIFFERENT process instance
+// (or the same one after a restart) receives their next text message with
+// nothing recorded for them, the message just falls through to normal
+// text handling and gets no reply at all — indistinguishable from the bot
+// doing nothing. Persisting to disk means whichever process is alive when
+// the reply arrives sees the same state the button press wrote.
+function loadPendingActions() {
+    return safeReadJson(PENDING_ACTIONS_PATH, {});
+}
+
+function savePendingActions(actions) {
+    atomicWrite(PENDING_ACTIONS_PATH, actions);
 }
 
 // ===== Config =====
@@ -1068,5 +1087,7 @@ module.exports = {
     getCategoryById,
     listCategories,
     getCategoryFileCount,
-    getUnseenCategoryFiles
+    getUnseenCategoryFiles,
+    loadPendingActions,
+    savePendingActions
 };

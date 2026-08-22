@@ -692,6 +692,23 @@ function getTopReferrers(limit = 3) {
         .slice(0, limit);
 }
 
+// This user's position on the all-time referral leaderboard (1-based), plus
+// their count. Ties share the same rank (standard competition ranking).
+// Returns rank: null if they have zero referrals — not worth ranking.
+function getReferrerRank(userId) {
+    const users = loadUsers();
+    const ranked = Object.entries(users)
+        .map(([id, u]) => ({ id, count: (u.referrals || []).length }))
+        .filter(r => r.count > 0)
+        .sort((a, b) => b.count - a.count);
+    const key = String(userId);
+    const idx = ranked.findIndex(r => r.id === key);
+    if (idx === -1) return { rank: null, count: 0 };
+    const count = ranked[idx].count;
+    const rank = ranked.findIndex(r => r.count === count) + 1; // first index with this count
+    return { rank, count };
+}
+
 // ===== Known Chats (groups/channels the bot has seen) =====
 // Populated automatically whenever the bot receives an update from a
 // group/supergroup/channel. Used to build "tap to pick" buttons instead of
@@ -1132,6 +1149,7 @@ module.exports = {
     getUsersJoinedSince,
     getFilesAddedSince,
     getTopReferrers,
+    getReferrerRank,
     getUserStats,
     isNewUser,
     registerReferral,

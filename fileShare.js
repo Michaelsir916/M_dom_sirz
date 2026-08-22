@@ -12,6 +12,7 @@ const PENDING_JOIN_REQUESTS_PATH = path.join(__dirname, 'pending_join_requests.j
 const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
 const PROMO_CODES_PATH = path.join(__dirname, 'promo_codes.json');
 const PENDING_DELETIONS_PATH = path.join(__dirname, 'pending_deletions.json');
+const CATEGORIES_PATH = path.join(__dirname, 'categories.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -35,7 +36,8 @@ const DEFAULT_CONFIG = {
     aboutLinkText: 'Click Here', // custom clickable hyperlink text shown in the non-admin About panel
     aboutLinkUrl: null,          // url that aboutLinkText links to
     vipChannelLink: null,        // url the "💎 Buy VIP" button sends users to
-    vipPromoText: null           // optional promo copy shown above the Join button
+    vipPromoText: null,          // optional promo copy shown above the Join button
+    categoryStorageChannelId: null // dedicated channel VIP category videos are archived to (see fileShare.js VIP Categories section)
 };
 
 // ===== Config backup (used by /backupconfig) =====
@@ -53,7 +55,8 @@ const CONFIG_BACKUP_FILES = [
     { path: PENDING_JOIN_REQUESTS_PATH, name: 'pending_join_requests.json' },
     { path: VIP_CLICKS_PATH, name: 'vip_clicks.json' },
     { path: PROMO_CODES_PATH, name: 'promo_codes.json' },
-    { path: PENDING_DELETIONS_PATH, name: 'pending_deletions.json' }
+    { path: PENDING_DELETIONS_PATH, name: 'pending_deletions.json' },
+    { path: CATEGORIES_PATH, name: 'categories.json' }
 ];
 
 // Only returns files that actually exist yet (a fresh install may not have
@@ -426,6 +429,172 @@ function redeemPromoCode(userId, code) {
 
     const expiresAt = grantVip(userId, entry.days, 'promo', key);
     return { success: true, days: entry.days, unlimited: entry.days === 0, expiresAt };
+}
+
+// ===== VIP Categories (admin-curated video categories, VIP-only access) =====
+// Deliberately a SEPARATE store from shared_files.json (the free /random
+// pool). Videos here are never read by getUnseenFiles/addSharedFile and are
+// never mixed into the free pool — the only way a video enters a category is
+// addVideoToCategory(), and the only way it's ever delivered is through the
+// VIP-gated category browser in bot.js. That separation (not just a flag on
+// a shared record) is what guarantees free members can never reach this
+// content, by construction rather than by a check that could be missed.
+//
+// Stored by file_id/file_unique_id rather than (chat_id, message_id) like
+// the free pool — this lets an admin add a video from ANY chat (a forward,
+// a fresh upload straight to the bot, whatever) without needing a permanent
+// source channel to copyMessage from later. Telegram file_ids remain valid
+// as long as the underlying file exists on their servers.
+function loadCategories() {
+    return safeReadJson(CATEGORIES_PATH, {});
+}
+
+function saveCategories(categories) {
+    atomicWrite(CATEGORIES_PATH, categories);
+}
+
+function genId(prefix) {
+    return `${prefix}${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+const CATEGORY_NAME_MAX_LEN = 64;
+
+// Creates a category. Names are unique (case-insensitive) so two categories
+// that only differ by casing/whitespace can't be created by accident.
+function createCategory(name, createdBy) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) return { success: false, reason: 'empty' };
+    if (trimmed.length > CATEGORY_NAME_MAX_LEN) return { success: false, reason: 'too_long' };
+
+    const categories = loadCategories();
+    const dupe = Object.values(categories).some(c => c.name.toLowerCase() === trimmed.toLowerCase());
+    if (dupe) return { success: false, reason: 'exists' };
+
+    const id = genId('cat_');
+    const category = {
+        id,
+        name: trimmed,
+        createdAt: new Date().toISOString(),
+        createdBy: String(createdBy),
+        videos: []
+    };
+    categories[id] = category;
+    saveCategories(categories);
+    return { success: true, category };
+}
+
+function renameCategory(id, newName) {
+    const trimmed = String(newName || '').trim();
+    if (!trimmed) return { success: false, reason: 'empty' };
+    if (trimmed.length > CATEGORY_NAME_MAX_LEN) return { success: false, reason: 'too_long' };
+
+    const categories = loadCategories();
+    const category = categories[id];
+    if (!category) return { success: false, reason: 'not_found' };
+
+    const dupe = Object.values(categories).some(c => c.id !== id && c.name.toLowerCase() === trimmed.toLowerCase());
+    if (dupe) return { success: false, reason: 'exists' };
+
+    category.name = trimmed;
+    saveCategories(categories);
+    return { success: true, category };
+}
+
+// Deletes a category and its video references. The underlying Telegram
+// files/messages elsewhere are completely untouched — this only forgets
+// this bot's pointer to them.
+function deleteCategory(id) {
+    const categories = loadCategories();
+    if (!categories[id]) return false;
+    delete categories[id];
+    saveCategories(categories);
+    return true;
+}
+
+function listCategories() {
+    return Object.values(loadCategories()).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+}
+
+// Only categories that currently hold at least one video — used for the
+// user-facing browse list so a VIP member never opens an empty category.
+function listNonEmptyCategories() {
+    return listCategories().filter(c => (c.videos || []).length > 0);
+}
+
+function getCategory(id) {
+    return loadCategories()[id] || null;
+}
+
+// Adds one video (photo/video/animation) to a category. The video must
+// already have been archived into the dedicated Category Storage Channel
+// (see bot.js) — this just records the POINTER to that channel post
+// (chat_id + message_id), the same proven approach the free /random pool
+// uses (copyMessage from a permanent channel post), rather than storing a
+// raw file_id. That makes delivery self-healing: if a post is ever removed
+// from the storage channel, copyMessage fails predictably and the dangling
+// entry can be cleaned up automatically (see removeCategoryVideoByMessage).
+//
+// Dedupes on file_unique_id WITHIN the same category — re-adding the exact
+// same clip to a category it's already in is a no-op. The same video is
+// still allowed to belong to multiple different categories on purpose.
+function addVideoToCategory(categoryId, { chatId, messageId, fileUniqueId, type, addedBy, caption }) {
+    const categories = loadCategories();
+    const category = categories[categoryId];
+    if (!category) return { success: false, reason: 'not_found' };
+
+    if (fileUniqueId && category.videos.some(v => v.file_unique_id === fileUniqueId)) {
+        return { success: false, reason: 'duplicate' };
+    }
+
+    const video = {
+        id: genId('v_'),
+        chat_id: chatId,
+        message_id: messageId,
+        file_unique_id: fileUniqueId || null,
+        type: type || 'video',
+        caption: caption || null,
+        added_at: new Date().toISOString(),
+        added_by: String(addedBy)
+    };
+    category.videos.push(video);
+    saveCategories(categories);
+    return { success: true, video, count: category.videos.length };
+}
+
+function removeVideoFromCategory(categoryId, videoId) {
+    const categories = loadCategories();
+    const category = categories[categoryId];
+    if (!category) return false;
+    const before = category.videos.length;
+    category.videos = category.videos.filter(v => v.id !== videoId);
+    if (category.videos.length === before) return false;
+    saveCategories(categories);
+    return true;
+}
+
+// Self-heal: removes any category video entries pointing at a
+// (chat_id, message_id) that Telegram reports as gone (e.g. deleted
+// straight from the storage channel). Scans every category, since one
+// storage channel serves all of them — mirrors removeSharedFile()'s
+// self-healing for the free pool.
+function removeCategoryVideoByMessage(chatId, messageId) {
+    const categories = loadCategories();
+    let removed = false;
+    for (const cat of Object.values(categories)) {
+        const before = cat.videos.length;
+        cat.videos = cat.videos.filter(v => !(String(v.chat_id) === String(chatId) && v.message_id === messageId));
+        if (cat.videos.length !== before) removed = true;
+    }
+    if (removed) saveCategories(categories);
+    return removed;
+}
+
+function getCategoryStats() {
+    const categories = listCategories();
+    return {
+        totalCategories: categories.length,
+        totalVideos: categories.reduce((sum, c) => sum + (c.videos || []).length, 0)
+    };
 }
 
 // Returns THIS user's own /random stats (not admin-wide): files received,
@@ -1008,5 +1177,15 @@ module.exports = {
     redeemPromoCode,
     schedulePendingDeletion,
     getDuePendingDeletions,
-    removePendingDeletion
+    removePendingDeletion,
+    createCategory,
+    renameCategory,
+    deleteCategory,
+    listCategories,
+    listNonEmptyCategories,
+    getCategory,
+    addVideoToCategory,
+    removeVideoFromCategory,
+    removeCategoryVideoByMessage,
+    getCategoryStats
 };

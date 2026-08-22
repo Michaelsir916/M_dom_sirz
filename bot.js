@@ -2233,7 +2233,7 @@ async function renderFileSharePanel(ctx) {
         : 'Not set';
     const text = '🎬 *File Sharing*\n\n' +
         `Force-sub groups/channels: ${config.forceSubGroupIds.length}\n` +
-        `Source: ${sourceLabel}\n\n` +
+        `Source: ${escapeMd(sourceLabel)}\n\n` +
         '_Everything below is button-driven — no need to enter the target chat._';
 
     const keyboard = {
@@ -2274,9 +2274,9 @@ bot.action('fs_toggle_protect', async (ctx) => {
 async function renderAboutPanel(ctx) {
     const config = loadConfig();
     const text = '👤 *About / Start Message*\n\n' +
-        `Join Group Link: ${config.aboutJoinGroupLink || '_Not set_'}\n` +
-        `Link Text: ${config.aboutLinkText || '_Not set_'}\n` +
-        `Link URL: ${config.aboutLinkUrl || '_Not set_'}\n\n` +
+        `Join Group Link: ${config.aboutJoinGroupLink ? escapeMd(config.aboutJoinGroupLink) : '_Not set_'}\n` +
+        `Link Text: ${config.aboutLinkText ? escapeMd(config.aboutLinkText) : '_Not set_'}\n` +
+        `Link URL: ${config.aboutLinkUrl ? escapeMd(config.aboutLinkUrl) : '_Not set_'}\n\n` +
         '_Shown to regular users when they tap ℹ️ About on /start. Creator credit and tech stack are fixed._';
 
     const keyboard = {
@@ -2333,8 +2333,8 @@ async function renderVipPanel(ctx) {
     const config = loadConfig();
     const stats = getVipStats();
     const text = '💎 *VIP Promotion*\n\n' +
-        `Channel Link: ${config.vipChannelLink || '_Not set_'}\n` +
-        `Promo Text: ${config.vipPromoText || '_Not set_'}\n\n` +
+        `Channel Link: ${config.vipChannelLink ? escapeMd(config.vipChannelLink) : '_Not set_'}\n` +
+        `Promo Text: ${config.vipPromoText ? escapeMd(config.vipPromoText) : '_Not set_'}\n\n` +
         `📊 Button taps: ${stats.totalClicks} total, ${stats.uniqueUsers} unique user(s)\n\n` +
         '_"💎 Buy VIP" shows on /start, About, when a user hits the daily limit, and on the force-sub join prompt._' +
         (config.vipChannelLink ? '' : '\n\n⚠️ Set a channel link below to activate the button — it stays hidden until then.');
@@ -2454,7 +2454,7 @@ async function renderCategoriesPanel(ctx) {
         : null;
 
     let text = '📂 *VIP Categories*\n\n' +
-        `Storage channel: ${channelLabel ? `✅ ${channelLabel}` : '⚠️ Not set'}\n` +
+        `Storage channel: ${channelLabel ? `✅ ${escapeMd(channelLabel)}` : '⚠️ Not set'}\n` +
         `${stats.totalCategories} categor${stats.totalCategories === 1 ? 'y' : 'ies'}, ${stats.totalVideos} video(s) total.\n\n` +
         '_Videos placed in a category are completely hidden from free users and never enter the /random pool — only active VIP members can open them (💎 Buy VIP → 📂 VIP Categories)._';
 
@@ -2802,7 +2802,7 @@ async function renderMegaUploadPanel(ctx) {
         : 'Not set';
     const text = '📦 *MEGA Upload Destination* (admin-only)\n\n' +
         `Mode: ${config.megaUploadMode === 'channel' ? '📤 Channel' : '👤 Personal (chat)'}\n` +
-        (config.megaUploadMode === 'channel' ? `Channel: ${channelLabel}\n` : '') +
+        (config.megaUploadMode === 'channel' ? `Channel: ${escapeMd(channelLabel)}\n` : '') +
         '\nApplies only when *you* (admin) send a MEGA link — regular users always get files in their own chat. ' +
         'Once set, it goes straight there, no asking each time. The progress bar always stays in this chat; ' +
         'only the clean file (no link, no caption) reaches the channel.';
@@ -3540,11 +3540,11 @@ async function renderAutopostPanel(ctx) {
     const adminId = ctx.from.id;
     const cfg = getAutopostConfig(adminId);
     const channelLabel = cfg.channelId
-        ? `${getKnownChats().find(c => String(c.id) === String(cfg.channelId))?.title || '?'} (\`${cfg.channelId}\`)`
+        ? `${escapeMd(getKnownChats().find(c => String(c.id) === String(cfg.channelId))?.title || '?')} (\`${cfg.channelId}\`)`
         : 'Not set';
     const sourceIds = cfg.sourceChannelIds || [];
     const sourceLabel = sourceIds.length > 0
-        ? sourceIds.map(id => getKnownChats().find(c => String(c.id) === String(id))?.title || id).join(', ')
+        ? sourceIds.map(id => escapeMd(getKnownChats().find(c => String(c.id) === String(id))?.title || id)).join(', ')
         : 'Not set';
     const queueCount = sourceIds.length > 0
         ? loadSharedFiles().filter(f => f.type === 'video' && sourceIds.map(String).includes(String(f.chat_id)) && !cfg.postedTags.includes(`${f.chat_id}:${f.message_id}`)).length
@@ -3555,7 +3555,7 @@ async function renderAutopostPanel(ctx) {
         `Destination Channel: ${channelLabel} (posts go here)\n` +
         `Queue: ${queueCount} unposted video(s) waiting${queueCount < LOW_QUEUE_THRESHOLD ? ' ⚠️ low' : ''}\n` +
         `Interval: ${cfg.intervalMinutes === 0 ? 'Not set' : 'Every ' + formatIntervalMinutes(cfg.intervalMinutes)}\n` +
-        `Caption: "${cfg.caption}"\n` +
+        `Caption: "${escapeMd(cfg.caption)}"\n` +
         `Thumbnail: ${cfg.thumbnailMode === 'custom' ? (cfg.customThumbnailFileId ? 'Custom (uploaded)' : 'Custom (not uploaded yet!)') : "Video's own"}\n` +
         `Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}${sharp ? '' : ' (⚠️ sharp not installed — run npm install)'}\n` +
         `Status: ${cfg.enabled ? '✅ Running' : '⏸ Paused'}\n` +

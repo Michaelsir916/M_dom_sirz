@@ -377,7 +377,11 @@ function savePromoCodes(codes) {
 
 // days: 0 = unlimited VIP when redeemed. maxUses: 0 = unlimited redemptions.
 function createPromoCode(code, days, maxUses, createdBy) {
-    const key = String(code).trim().toUpperCase();
+    // Strip anything that isn't alnum/underscore/dash — promo codes are
+    // meant to be simple tokens anyway, and this also guarantees the code
+    // can never contain a backtick, which would otherwise break out of the
+    // `` `code` `` span used to display it in the admin panel.
+    const key = String(code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
     if (!key) return { success: false, reason: 'empty' };
     const codes = loadPromoCodes();
     if (codes[key]) return { success: false, reason: 'exists' };

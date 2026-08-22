@@ -74,7 +74,17 @@ const {
     redeemPromoCode,
     schedulePendingDeletion,
     getDuePendingDeletions,
-    removePendingDeletion
+    removePendingDeletion,
+    createCategory,
+    renameCategory,
+    deleteCategory,
+    listCategories,
+    listNonEmptyCategories,
+    getCategory,
+    addVideoToCategory,
+    removeVideoFromCategory,
+    removeCategoryVideoByMessage,
+    getCategoryStats
 } = require('./fileShare');
 const queue = require('./queue');
 
@@ -1277,6 +1287,7 @@ const MY_STATS_KEYBOARD = {
     inline_keyboard: [
         [{ text: '💎 Buy VIP', callback_data: 'vip_info' }],
         [{ text: '🎬 Free Video', callback_data: 'user_random' }],
+        [{ text: '📂 VIP Categories', callback_data: 'user_categories' }],
         [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
         [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
         [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
@@ -1293,6 +1304,14 @@ function escapeHtml(str) {
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
+}
+
+// Minimal Markdown-escaping for admin-supplied text (category names, etc.)
+// dropped into a parse_mode:'Markdown' message — without this, a name
+// containing _ * ` [ ] can silently break formatting or swallow the rest
+// of the message.
+function escapeMd(str) {
+    return String(str).replace(/([_*`\[\]])/g, '\\$1');
 }
 
 // "💎 Buy VIP" — the main promo entry point. Shown on /start, the About
@@ -1350,6 +1369,142 @@ bot.action('user_about', async (ctx) => {
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         ...(keyboard.inline_keyboard.length ? { reply_markup: keyboard } : {})
+    });
+});
+
+// --- User-facing: VIP Categories (browse-only; management is admin-only) ---
+// A category is only ever reachable here if it currently has ≥1 video (see
+// listNonEmptyCategories) and the requester passes BOTH gates below — the
+// same force-sub check every other file feature uses, then active VIP
+// status. The VIP/force-sub checks are repeated again inside catv_open
+// itself (not just here) since callback_data on an old message could in
+// principle be re-tapped after VIP lapses or before force-sub is verified —
+// hiding the button is a UX nicety, not the actual security boundary.
+const CAT_BROWSE_BATCH_SIZE = 5;
+
+async function sendCategoryList(ctx) {
+    const categories = listNonEmptyCategories();
+    if (categories.length === 0) {
+        await ctx.reply('📂 No VIP categories are available yet — check back soon!');
+        return;
+    }
+    const rows = categories.slice(0, 30).map(c => [{ text: `📁 ${c.name} (${c.videos.length})`, callback_data: `catv_open:${c.id}:0` }]);
+    await ctx.reply('📂 *VIP Categories* — tap one to browse:', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+bot.action('user_categories', async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id;
+    const isAdminUser = isAdmin(userId);
+    const config = loadConfig();
+
+    if (!isAdminUser && config.forceSubGroupIds.length > 0) {
+        const unjoined = await getUnjoinedGroups(ctx, config.forceSubGroupIds, userId);
+        if (unjoined.length > 0) {
+            await sendJoinPrompt(ctx, unjoined);
+            return;
+        }
+    }
+
+    if (!isAdminUser && !isUserVip(userId)) {
+        const keyboard = { inline_keyboard: [] };
+        if (config.vipChannelLink) keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', callback_data: 'vip_info' }]);
+        await ctx.reply(
+            '🔒 *VIP Categories* are exclusive to active VIP members.\n\n' +
+            'Upgrade to VIP to unlock curated video categories not available through 🎬 Free Video.',
+            { parse_mode: 'Markdown', ...(keyboard.inline_keyboard.length ? { reply_markup: keyboard } : {}) }
+        );
+        return;
+    }
+
+    await sendCategoryList(ctx);
+});
+
+// Delivers up to CAT_BROWSE_BATCH_SIZE videos starting at `offset`, then a
+// small control message with ▶️ Next (if more remain) and a way back.
+bot.action(/^catv_open:(.+):(\d+)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const isAdminUser = isAdmin(userId);
+    const config = loadConfig();
+
+    if (!isAdminUser && config.forceSubGroupIds.length > 0) {
+        const unjoined = await getUnjoinedGroups(ctx, config.forceSubGroupIds, userId);
+        if (unjoined.length > 0) {
+            await ctx.answerCbQuery();
+            await sendJoinPrompt(ctx, unjoined);
+            return;
+        }
+    }
+    if (!isAdminUser && !isUserVip(userId)) {
+        await ctx.answerCbQuery('🔒 VIP members only.', { show_alert: true });
+        return;
+    }
+
+    const categoryId = ctx.match[1];
+    const offset = parseInt(ctx.match[2], 10);
+    const category = getCategory(categoryId);
+    if (!category || category.videos.length === 0) {
+        await ctx.answerCbQuery('⚠️ Category unavailable.', { show_alert: true });
+        return;
+    }
+    await ctx.answerCbQuery();
+
+    const videos = category.videos;
+    const batch = videos.slice(offset, offset + CAT_BROWSE_BATCH_SIZE);
+    if (batch.length === 0) {
+        // Category shrank (videos removed) between page taps — nothing left
+        // at this offset. Send them back to the start rather than a
+        // confusing empty/blank result.
+        await ctx.reply('📁 No more videos here — back to the start.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔄 Restart Category', callback_data: `catv_open:${category.id}:0` }, { text: '📂 All Categories', callback_data: 'user_categories' }]] }
+        });
+        return;
+    }
+    const sendOpts = config.protectContent ? { protect_content: true } : {};
+
+    for (const v of batch) {
+        try {
+            if (v.chat_id && v.message_id) {
+                // Normal path: copy the archived post from the storage
+                // channel — no re-upload, no "Forwarded from" tag. Caption
+                // is explicitly overridden with the ORIGINAL caption we
+                // recorded (not the "🏷 Category" tag added on the storage
+                // copy for the admin's own browsing) so VIP users never see
+                // that internal tag; passing '' when there was none clears
+                // it instead of inheriting the tagged one. Self-heals below
+                // if the storage post was ever removed.
+                await ctx.telegram.copyMessage(ctx.chat.id, v.chat_id, v.message_id, { ...sendOpts, caption: v.caption || '' });
+            } else if (v.file_id) {
+                // Legacy fallback for videos added before the storage
+                // channel existed (raw file_id, no channel pointer).
+                if (v.type === 'photo') {
+                    await ctx.telegram.sendPhoto(ctx.chat.id, v.file_id, { ...sendOpts, caption: v.caption || undefined });
+                } else if (v.type === 'animation') {
+                    await ctx.telegram.sendAnimation(ctx.chat.id, v.file_id, { ...sendOpts, caption: v.caption || undefined });
+                } else {
+                    await ctx.telegram.sendVideo(ctx.chat.id, v.file_id, { ...sendOpts, caption: v.caption || undefined });
+                }
+            }
+        } catch (error) {
+            console.error(`Failed to deliver category video ${v.id} in "${category.name}":`, error.message);
+            // Storage channel post is gone (deleted) — self-heal by
+            // forgetting this entry so it's never picked again.
+            if (v.chat_id && v.message_id && error.message && error.message.includes('message to copy not found')) {
+                removeCategoryVideoByMessage(v.chat_id, v.message_id);
+            }
+        }
+    }
+
+    const nextOffset = offset + CAT_BROWSE_BATCH_SIZE;
+    const nav = [];
+    if (nextOffset < videos.length) {
+        nav.push({ text: `▶️ Next ${Math.min(CAT_BROWSE_BATCH_SIZE, videos.length - nextOffset)}`, callback_data: `catv_open:${category.id}:${nextOffset}` });
+    }
+    nav.push({ text: '📂 All Categories', callback_data: 'user_categories' });
+
+    await ctx.reply(`📁 *${escapeMd(category.name)}* — showing ${Math.min(offset + batch.length, videos.length)}/${videos.length}`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [nav] }
     });
 });
 
@@ -2096,6 +2251,7 @@ async function renderFileSharePanel(ctx) {
             [{ text: '🛠 Maintenance Mode', callback_data: 'mm_menu' }],
             [{ text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
             [{ text: '👤 About/Start Message', callback_data: 'about_menu' }],
+            [{ text: '📂 VIP Categories', callback_data: 'cat_menu' }],
             [{ text: '💎 VIP Promotion', callback_data: 'vip_menu' }],
             [{ text: '🎟 Promo Codes', callback_data: 'promo_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
@@ -2275,6 +2431,296 @@ bot.action('promo_delete_menu', async (ctx) => {
     await ctx.editMessageText('🗑 Send the code to delete, or /cancel.', {
         reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
     });
+});
+
+// --- VIP Categories (admin-curated, VIP-only video categories) ---
+// Fully separate storage from the free /random pool (see fileShare.js) —
+// nothing added here ever reaches a free user through /random, deep links,
+// or auto-post. The only delivery path is the VIP-gated browser above.
+//
+// Every video added to a category is first archived into a dedicated
+// Category Storage Channel (config.categoryStorageChannelId) — one channel
+// shared by all categories, each post tagged with its category name in the
+// caption so it's readable at a glance if an admin opens the channel
+// directly. Delivery to VIP users then uses copyMessage from that channel,
+// same proven pattern as the free pool, instead of relying on a raw file_id
+// or an admin's own DM history staying intact.
+async function renderCategoriesPanel(ctx) {
+    const categories = listCategories();
+    const stats = getCategoryStats();
+    const config = loadConfig();
+    const channelLabel = config.categoryStorageChannelId
+        ? (getKnownChats().find(c => String(c.id) === String(config.categoryStorageChannelId))?.title || config.categoryStorageChannelId)
+        : null;
+
+    let text = '📂 *VIP Categories*\n\n' +
+        `Storage channel: ${channelLabel ? `✅ ${channelLabel}` : '⚠️ Not set'}\n` +
+        `${stats.totalCategories} categor${stats.totalCategories === 1 ? 'y' : 'ies'}, ${stats.totalVideos} video(s) total.\n\n` +
+        '_Videos placed in a category are completely hidden from free users and never enter the /random pool — only active VIP members can open them (💎 Buy VIP → 📂 VIP Categories)._';
+
+    if (!channelLabel) {
+        text += '\n\n⚠️ *Set a storage channel below before adding videos* — every category video is archived there first, so delivery stays reliable even if the original source disappears.';
+    }
+
+    const shown = categories.slice(0, 25);
+    const rows = shown.map(c => [{ text: `📁 ${c.name} (${c.videos.length})`, callback_data: `cat_admin:${c.id}` }]);
+    if (categories.length > shown.length) {
+        text += `\n\n_...and ${categories.length - shown.length} more (showing first ${shown.length}, A–Z)._`;
+    }
+    rows.push([{ text: '➕ Create Category', callback_data: 'cat_create' }]);
+    rows.push([{ text: `🎯 ${channelLabel ? 'Change' : 'Set'} Storage Channel`, callback_data: 'cat_setchannel_menu' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'menu_fileshare' }]);
+
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+// --- Category Storage Channel setup (tap-to-pick or manual ID/@username) ---
+bot.action('cat_setchannel_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    const { rows, truncated, total } = knownChatPickerKeyboard([], 'cat_setchannel', 'cat_menu', ctx.from.id);
+    const note = total === 0
+        ? '_I haven\'t seen any channels yet — add me to your storage channel as admin (with "Post Messages" permission) first, or type an ID/@username._'
+        : truncated ? `_Showing 20 of ${total} known chats._` : '';
+    await ctx.editMessageText(
+        `🎯 *Set Category Storage Channel*\n\nAll VIP category videos get archived here. I must be admin there with permission to post messages.\n\n${note}`,
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } }
+    );
+});
+
+bot.action(/^cat_setchannel:(-?\d+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const chatId = Number(ctx.match[1]);
+    try {
+        await ctx.telegram.getChatMember(chatId, ctx.botInfo.id);
+    } catch (error) {
+        await ctx.answerCbQuery('⚠️ Could not verify — try again.');
+        return;
+    }
+    const config = loadConfig();
+    config.categoryStorageChannelId = chatId;
+    saveConfig(config);
+    const chat = getKnownChats().find(c => String(c.id) === String(chatId));
+    await ctx.answerCbQuery('✅ Storage channel set');
+    await ctx.editMessageText(`✅ VIP category videos will now be archived in "${chat ? chat.title : chatId}".`, {
+        reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'cat_menu' }]] }
+    });
+});
+
+bot.action('cat_setchannel_manual', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'cat_setchannel_manual' };
+    await ctx.editMessageText('⌨️ Send the channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there with permission to post. Send /cancel to abort.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'cat_menu' }]] }
+    });
+});
+
+bot.action('cat_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderCategoriesPanel(ctx);
+});
+
+bot.action('cat_create', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'cat_create_name' };
+    await ctx.editMessageText(
+        '➕ *Create Category*\n\nSend a name for the new category (max 64 characters), or /cancel.',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'cat_menu' }]] } }
+    );
+});
+
+async function renderCategoryAdminPanel(ctx, categoryId) {
+    const category = getCategory(categoryId);
+    if (!category) {
+        await ctx.editMessageText('⚠️ That category no longer exists.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'cat_menu' }]] }
+        });
+        return;
+    }
+    const created = new Date(category.createdAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const text = `📁 *${escapeMd(category.name)}*\n\n` +
+        `Videos: ${category.videos.length}\n` +
+        `Created: ${created}\n\n` +
+        '_VIP-only — free users never see this category or its content, in the list or through /random._';
+
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: '➕ Add Video(s)', callback_data: `cat_addvideo:${category.id}` }],
+            [{ text: '📋 List / Remove Videos', callback_data: `cat_listvideos:${category.id}:0` }],
+            [{ text: '✏️ Rename', callback_data: `cat_rename:${category.id}` }],
+            [{ text: '🗑 Delete Category', callback_data: `cat_delconfirm:${category.id}` }],
+            [{ text: '🔙 Back', callback_data: 'cat_menu' }]
+        ]
+    };
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.action(/^cat_admin:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderCategoryAdminPanel(ctx, ctx.match[1]);
+});
+
+bot.action(/^cat_addvideo:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const category = getCategory(ctx.match[1]);
+    if (!category) {
+        await ctx.answerCbQuery('⚠️ Category not found.');
+        await renderCategoriesPanel(ctx);
+        return;
+    }
+    const config = loadConfig();
+    if (!config.categoryStorageChannelId) {
+        await ctx.answerCbQuery('⚠️ Set a storage channel first.');
+        await ctx.editMessageText(
+            '⚠️ *No storage channel set yet*\n\nEvery category video is archived into a dedicated channel first, so delivery stays reliable. Set one before adding videos.',
+            {
+                parse_mode: 'Markdown',
+                reply_markup: { inline_keyboard: [[{ text: '🎯 Set Storage Channel', callback_data: 'cat_setchannel_menu' }], [{ text: '🔙 Back', callback_data: `cat_admin:${category.id}` }]] }
+            }
+        );
+        return;
+    }
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'cat_add_video', categoryId: category.id };
+    await ctx.editMessageText(
+        `➕ *Adding videos to "${escapeMd(category.name)}"*\n\n` +
+        'Send or forward video(s) now — one at a time or several in a row, each gets archived into the storage channel and added immediately. ' +
+        'Duplicates (the same clip twice) are auto-skipped. Tap ✅ Done when finished, or /cancel to stop.',
+        {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [[{ text: '✅ Done', callback_data: `cat_adddone:${category.id}` }]] }
+        }
+    );
+});
+
+bot.action(/^cat_adddone:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    delete pendingAction[ctx.from.id];
+    await ctx.answerCbQuery('✅ Done adding videos');
+    await renderCategoryAdminPanel(ctx, ctx.match[1]);
+});
+
+const CAT_VIDEOS_PER_PAGE = 8;
+
+async function renderCategoryVideoList(ctx, categoryId, offset) {
+    const category = getCategory(categoryId);
+    if (!category) {
+        await ctx.editMessageText('⚠️ That category no longer exists.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'cat_menu' }]] }
+        });
+        return;
+    }
+    const videos = category.videos;
+    if (videos.length === 0) {
+        await ctx.editMessageText(`📋 *${escapeMd(category.name)}* has no videos yet.`, {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [[{ text: '➕ Add Video(s)', callback_data: `cat_addvideo:${category.id}` }], [{ text: '🔙 Back', callback_data: `cat_admin:${category.id}` }]] }
+        });
+        return;
+    }
+    const safeOffset = Math.max(0, Math.min(offset, Math.max(0, videos.length - 1)));
+    const page = videos.slice(safeOffset, safeOffset + CAT_VIDEOS_PER_PAGE);
+
+    const rows = page.map((v, i) => {
+        const num = safeOffset + i + 1;
+        const date = new Date(v.added_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
+        return [{ text: `❌ #${num} — ${v.type} — ${date}`, callback_data: `cat_delvideo:${category.id}:${v.id}:${safeOffset}` }];
+    });
+
+    const navRow = [];
+    if (safeOffset > 0) navRow.push({ text: '◀️ Prev', callback_data: `cat_listvideos:${category.id}:${Math.max(0, safeOffset - CAT_VIDEOS_PER_PAGE)}` });
+    if (safeOffset + CAT_VIDEOS_PER_PAGE < videos.length) navRow.push({ text: 'Next ▶️', callback_data: `cat_listvideos:${category.id}:${safeOffset + CAT_VIDEOS_PER_PAGE}` });
+    if (navRow.length) rows.push(navRow);
+    rows.push([{ text: '🔙 Back', callback_data: `cat_admin:${category.id}` }]);
+
+    const text = `📋 *${escapeMd(category.name)}* — ${videos.length} video(s)\n\n` +
+        `Showing #${safeOffset + 1}–#${safeOffset + page.length}. Tap ❌ to remove one.`;
+    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+bot.action(/^cat_listvideos:(.+):(\d+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderCategoryVideoList(ctx, ctx.match[1], parseInt(ctx.match[2], 10));
+});
+
+bot.action(/^cat_delvideo:(.+):(.+):(\d+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const [, categoryId, videoId, offsetStr] = ctx.match;
+    const category = getCategory(categoryId);
+    const video = category ? category.videos.find(v => v.id === videoId) : null;
+    const removed = removeVideoFromCategory(categoryId, videoId);
+    if (removed && video && video.chat_id && video.message_id) {
+        // Best-effort — the video reference is already gone either way,
+        // this just keeps the storage channel from accumulating orphans.
+        try { await ctx.telegram.deleteMessage(video.chat_id, video.message_id); } catch (e) { /* already gone / inaccessible */ }
+    }
+    await ctx.answerCbQuery(removed ? '✅ Removed' : '⚠️ Already gone');
+    await renderCategoryVideoList(ctx, categoryId, parseInt(offsetStr, 10));
+});
+
+bot.action(/^cat_rename:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const category = getCategory(ctx.match[1]);
+    if (!category) {
+        await ctx.answerCbQuery('⚠️ Category not found.');
+        await renderCategoriesPanel(ctx);
+        return;
+    }
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'cat_rename', categoryId: category.id };
+    await ctx.editMessageText(`✏️ Send a new name for "${escapeMd(category.name)}", or /cancel.`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `cat_admin:${category.id}` }]] }
+    });
+});
+
+bot.action(/^cat_delconfirm:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const category = getCategory(ctx.match[1]);
+    if (!category) {
+        await ctx.answerCbQuery('⚠️ Category not found.');
+        await renderCategoriesPanel(ctx);
+        return;
+    }
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(
+        `⚠️ *Delete "${escapeMd(category.name)}"?*\n\n` +
+        `This removes the category and deletes its ${category.videos.length} archived video(s) from the storage channel too. This can't be undone.`,
+        {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [[
+                    { text: '✅ Yes, Delete', callback_data: `cat_delete:${category.id}` },
+                    { text: '❌ Cancel', callback_data: `cat_admin:${category.id}` }
+                ]]
+            }
+        }
+    );
+});
+
+bot.action(/^cat_delete:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const category = getCategory(ctx.match[1]);
+    const videos = category ? category.videos : [];
+    const deleted = deleteCategory(ctx.match[1]);
+    if (deleted) {
+        // Best-effort cleanup of the storage channel — the category record
+        // is already gone either way, so a failure here just leaves an
+        // orphaned post rather than blocking the deletion.
+        for (const v of videos) {
+            if (v.chat_id && v.message_id) {
+                try { await ctx.telegram.deleteMessage(v.chat_id, v.message_id); } catch (e) { /* already gone / inaccessible */ }
+            }
+        }
+    }
+    await ctx.answerCbQuery(deleted ? '🗑 Deleted' : '⚠️ Already gone');
+    await renderCategoriesPanel(ctx);
 });
 
 // --- Maintenance mode ---
@@ -3562,7 +4008,78 @@ bot.on(['photo', 'video', 'animation'], async (ctx) => {
         const fileId = ctx.message.animation ? ctx.message.animation.file_id
             : ctx.message.video ? ctx.message.video.file_id
             : ctx.message.photo[ctx.message.photo.length - 1].file_id;
+        const fileUniqueId = ctx.message.animation ? ctx.message.animation.file_unique_id
+            : ctx.message.video ? ctx.message.video.file_unique_id
+            : ctx.message.photo[ctx.message.photo.length - 1].file_unique_id;
         const caption = ctx.message.caption || '';
+
+        // (d) VIP Category "Add Video" mode — every media message while this
+        // is active gets archived into the Category Storage Channel first,
+        // then recorded by pointing at that channel post (chat_id +
+        // message_id) — the same durable pattern the free pool uses,
+        // instead of trusting a raw file_id or this DM's own message
+        // history to stay intact. The mode STAYS active (pendingAction
+        // isn't cleared) so several videos can be added back-to-back
+        // without re-tapping "➕ Add Video(s)" each time. Only ✅ Done or
+        // /cancel exits it.
+        if (pendingAction[ctx.from.id]?.type === 'cat_add_video') {
+            const categoryId = pendingAction[ctx.from.id].categoryId;
+            const category = getCategory(categoryId);
+            if (!category) {
+                delete pendingAction[ctx.from.id];
+                await ctx.reply('⚠️ That category no longer exists — stopped adding.', {
+                    reply_markup: { inline_keyboard: [[{ text: '📂 Categories', callback_data: 'cat_menu' }]] }
+                });
+                return;
+            }
+            const config = loadConfig();
+            const storageChannelId = config.categoryStorageChannelId;
+            if (!storageChannelId) {
+                delete pendingAction[ctx.from.id];
+                await ctx.reply('⚠️ No storage channel is set anymore — stopped adding. Set one from the Categories menu and try again.', {
+                    reply_markup: { inline_keyboard: [[{ text: '🎯 Set Storage Channel', callback_data: 'cat_setchannel_menu' }]] }
+                });
+                return;
+            }
+
+            const doneButton = { inline_keyboard: [[{ text: '✅ Done', callback_data: `cat_adddone:${categoryId}` }]] };
+
+            // Tag the archived copy with the category name in its caption
+            // (not the original) so browsing the storage channel directly
+            // in Telegram is self-explanatory at a glance.
+            const taggedCaption = caption ? `${caption}\n\n🏷 ${category.name}` : `🏷 ${category.name}`;
+            let archived;
+            try {
+                archived = await ctx.telegram.copyMessage(storageChannelId, ctx.chat.id, ctx.message.message_id, { caption: taggedCaption });
+            } catch (error) {
+                console.error('Failed to archive category video to storage channel:', error.message);
+                await ctx.reply(
+                    `❌ Couldn't save that to the storage channel (${error.message}). ` +
+                    'Make sure I\'m still admin there with permission to post, then send it again, or /cancel.',
+                    { reply_markup: doneButton }
+                );
+                return;
+            }
+
+            const result = addVideoToCategory(categoryId, {
+                chatId: storageChannelId,
+                messageId: archived.message_id,
+                fileUniqueId,
+                type: kind,
+                addedBy: ctx.from.id,
+                caption
+            });
+            if (!result.success) {
+                // Duplicate of a video already in this category — clean up the
+                // copy we just archived so the storage channel doesn't fill up
+                // with unreferenced duplicates.
+                try { await ctx.telegram.deleteMessage(storageChannelId, archived.message_id); } catch (e) { /* best-effort */ }
+                await ctx.reply(`⚠️ Already in "${category.name}" — skipped (duplicate). Send another, or tap ✅ Done.`, { reply_markup: doneButton });
+                return;
+            }
+            await ctx.reply(`✅ Added to "${category.name}" — ${result.count} video(s) now. Send more, or tap ✅ Done.`, { reply_markup: doneButton });
+            return;
+        }
 
         // (c) Auto-post custom thumbnail upload — only photos accepted
         if (pendingAction[ctx.from.id]?.type === 'autopost_thumbnail') {
@@ -4128,6 +4645,80 @@ async function handlePendingAction(ctx, text) {
         saveConfig(config);
         delete pendingAction[userId];
         await ctx.reply('✅ Promo text saved.');
+        return;
+    }
+
+    if (action.type === 'cat_setchannel_manual') {
+        const identifier = text.trim();
+        if (!identifier) {
+            await ctx.reply('⚠️ Send a chat ID (e.g. -1001234567890) or @username, or /cancel.');
+            return;
+        }
+        let chat;
+        try {
+            const target = identifier.startsWith('@') || isNaN(identifier) ? identifier : Number(identifier);
+            chat = await ctx.telegram.getChat(target);
+        } catch (error) {
+            await ctx.reply(`❌ Couldn't find that chat (${error.message}). Make sure I'm added there, then try again, or /cancel.`);
+            return;
+        }
+        try {
+            await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
+        } catch (error) {
+            await ctx.reply(`⚠️ Found "${chat.title}" but I don't seem to be a member/admin there. Add me first, then try again, or /cancel.`);
+            return;
+        }
+        recordKnownChat(chat.id, chat.title, chat.type);
+        const config = loadConfig();
+        config.categoryStorageChannelId = chat.id;
+        saveConfig(config);
+        delete pendingAction[userId];
+        await ctx.reply(`✅ VIP category videos will now be archived in "${chat.title}".`, {
+            reply_markup: { inline_keyboard: [[{ text: '📂 Categories', callback_data: 'cat_menu' }]] }
+        });
+        return;
+    }
+
+    if (action.type === 'cat_create_name') {
+        const result = createCategory(text, userId);
+        delete pendingAction[userId];
+        if (!result.success) {
+            const reason = result.reason === 'exists' ? 'A category with that name already exists.'
+                : result.reason === 'too_long' ? 'That name is too long (max 64 characters).'
+                : 'Please send a non-empty name.';
+            await ctx.reply(`⚠️ ${reason} Try again from the Categories menu.`, {
+                reply_markup: { inline_keyboard: [[{ text: '📂 Categories', callback_data: 'cat_menu' }]] }
+            });
+            return;
+        }
+        await ctx.reply(`✅ Category "${result.category.name}" created.`, {
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '➕ Add Videos Now', callback_data: `cat_addvideo:${result.category.id}` }],
+                    [{ text: '📂 Categories', callback_data: 'cat_menu' }]
+                ]
+            }
+        });
+        return;
+    }
+
+    if (action.type === 'cat_rename') {
+        const { categoryId } = action;
+        const result = renameCategory(categoryId, text);
+        delete pendingAction[userId];
+        if (!result.success) {
+            const reason = result.reason === 'exists' ? 'A category with that name already exists.'
+                : result.reason === 'too_long' ? 'That name is too long (max 64 characters).'
+                : result.reason === 'not_found' ? 'That category no longer exists.'
+                : 'Please send a non-empty name.';
+            await ctx.reply(`⚠️ ${reason}`, {
+                reply_markup: { inline_keyboard: [[{ text: '📂 Categories', callback_data: 'cat_menu' }]] }
+            });
+            return;
+        }
+        await ctx.reply(`✅ Renamed to "${result.category.name}".`, {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Category', callback_data: `cat_admin:${categoryId}` }]] }
+        });
         return;
     }
 

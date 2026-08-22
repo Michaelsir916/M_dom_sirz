@@ -91,6 +91,9 @@ const queue = require('./queue');
 
 const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: Infinity });
 
+// "Buy VIP" always opens this chat directly — no intermediate promo screen.
+const VIP_CONTACT_URL = 'https://t.me/mr_boomsir';
+
 // Runs before every single handler. When maintenance mode is ON, only admins
 // and whitelisted users pass through — everyone else gets a plain notice.
 // Channel posts are anonymous (no ctx.from), so they're left alone here;
@@ -1129,10 +1132,7 @@ async function sendJoinPrompt(ctx, groupIds) {
         return;
     }
 
-    const config = loadConfig();
-    if (config.vipChannelLink) {
-        buttons.push([{ text: '💎 Skip — Get VIP Instead', callback_data: 'vip_info' }]);
-    }
+    buttons.push([{ text: '💎 Skip — Get VIP Instead', url: VIP_CONTACT_URL }]);
     buttons.push([{ text: '✅ I\'ve Joined — Verify', callback_data: 'recheck_sub' }]);
 
     await ctx.reply('🔒 *Tap below to request access — then tap Verify*', {
@@ -1255,7 +1255,7 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
                     await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
                 } else {
                     await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                        config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
+                        { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', url: VIP_CONTACT_URL }]] } });
                 }
                 return;
             }
@@ -1286,7 +1286,7 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
 // --- User-facing: My Stats & Referrals ---
 const MY_STATS_KEYBOARD = {
     inline_keyboard: [
-        [{ text: '💎 Buy VIP', callback_data: 'vip_info' }, { text: '🎬 Free Video', callback_data: 'user_random' }],
+        [{ text: '💎 Buy VIP', url: VIP_CONTACT_URL }, { text: '🎬 Free Video', callback_data: 'user_random' }],
         [{ text: '📂 VIP Categories', callback_data: 'user_categories' }, { text: '📊 My Stats', callback_data: 'user_mystats' }],
         [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }, { text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
         [{ text: 'ℹ️ About', callback_data: 'user_about' }]
@@ -1356,9 +1356,7 @@ bot.action('user_about', async (ctx) => {
     }
 
     const keyboard = { inline_keyboard: [] };
-    if (config.vipChannelLink) {
-        keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', callback_data: 'vip_info' }]);
-    }
+    keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', url: VIP_CONTACT_URL }]);
     if (config.aboutJoinGroupLink) {
         keyboard.inline_keyboard.push([{ text: '👥 Join Group', url: config.aboutJoinGroupLink }]);
     }
@@ -1405,8 +1403,7 @@ bot.action('user_categories', async (ctx) => {
     }
 
     if (!isAdminUser && !isUserVip(userId)) {
-        const keyboard = { inline_keyboard: [] };
-        if (config.vipChannelLink) keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', callback_data: 'vip_info' }]);
+        const keyboard = { inline_keyboard: [[{ text: '💎 Buy VIP', url: VIP_CONTACT_URL }]] };
         await ctx.reply(
             '🔒 *VIP Categories* are exclusive to active VIP members.\n\n' +
             'Upgrade to VIP to unlock curated video categories not available through 🎬 Free Video.',
@@ -2118,7 +2115,7 @@ async function handleRandomRequest(ctx) {
                 await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
             } else {
                 await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                    config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
+                    { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', url: VIP_CONTACT_URL }]] } });
             }
             return;
         }
@@ -2170,7 +2167,7 @@ bot.action('recheck_sub', async (ctx) => {
                 await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
             } else {
                 await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                    config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
+                    { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', url: VIP_CONTACT_URL }]] } });
             }
             return;
         }

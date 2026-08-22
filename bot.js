@@ -25,6 +25,7 @@ const {
     getUsersJoinedSince,
     getFilesAddedSince,
     getTopReferrers,
+    getReferrerRank,
     getUserStats,
     isNewUser,
     registerReferral,
@@ -88,7 +89,7 @@ const {
 } = require('./fileShare');
 const queue = require('./queue');
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: Infinity });
 
 // Runs before every single handler. When maintenance mode is ON, only admins
 // and whitelisted users pass through — everyone else gets a plain notice.
@@ -1285,12 +1286,9 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
 // --- User-facing: My Stats & Referrals ---
 const MY_STATS_KEYBOARD = {
     inline_keyboard: [
-        [{ text: '💎 Buy VIP', callback_data: 'vip_info' }],
-        [{ text: '🎬 Free Video', callback_data: 'user_random' }],
-        [{ text: '📂 VIP Categories', callback_data: 'user_categories' }],
-        [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
-        [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
-        [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
+        [{ text: '💎 Buy VIP', callback_data: 'vip_info' }, { text: '🎬 Free Video', callback_data: 'user_random' }],
+        [{ text: '📂 VIP Categories', callback_data: 'user_categories' }, { text: '📊 My Stats', callback_data: 'user_mystats' }],
+        [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }, { text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
         [{ text: 'ℹ️ About', callback_data: 'user_about' }]
     ]
 };
@@ -1336,7 +1334,7 @@ bot.action('vip_info', async (ctx) => {
     await ctx.reply(text, {
         parse_mode: 'HTML',
         disable_web_page_preview: true,
-        reply_markup: { inline_keyboard: [[{ text: '💎 Join VIP Channel', url: config.vipChannelLink }]] }
+        reply_markup: { inline_keyboard: [[{ text: '🛒 BUY NOW', url: config.vipChannelLink }]] }
     });
 });
 
@@ -1562,7 +1560,10 @@ async function formatMyReferral(ctx) {
 
     const shareText = `🎁 Get free files! Join via my link:`;
     const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(shareText)}`;
-    const replyMarkup = { inline_keyboard: [[{ text: '📤 Share with Friends', url: shareUrl }]] };
+    const replyMarkup = { inline_keyboard: [
+        [{ text: '📤 Share with Friends', url: shareUrl }],
+        [{ text: '🏆 Leaderboard', callback_data: 'user_leaderboard' }]
+    ] };
 
     return { text, replyMarkup };
 }
@@ -1610,6 +1611,37 @@ bot.action('user_referral', async (ctx) => {
     await ctx.answerCbQuery();
     const { text, replyMarkup } = await formatMyReferral(ctx);
     await ctx.reply(text, { parse_mode: 'HTML', reply_markup: replyMarkup });
+});
+
+// Anonymized all-time referral leaderboard — shows last 4 digits of each
+// top referrer's Telegram ID (never username/name), plus the viewer's own
+// rank so it stays motivating without exposing anyone's identity.
+bot.action('user_leaderboard', async (ctx) => {
+    await ctx.answerCbQuery();
+    const top = getTopReferrers(10);
+    const medal = ['🥇', '🥈', '🥉'];
+    let text = '🏆 <b>Top Referrers</b>\n\n';
+
+    if (top.length === 0) {
+        text += '_No referrals yet — be the first!_';
+    } else {
+        text += top.map((r, i) => {
+            const rank = medal[i] || `${i + 1}.`;
+            const last4 = String(r.id).slice(-4);
+            return `${rank} User ****${last4} — ${r.count} referral(s)`;
+        }).join('\n');
+    }
+
+    const mine = getReferrerRank(ctx.from.id);
+    text += '\n\n';
+    text += mine.rank
+        ? `👤 Your rank: #${mine.rank} (${mine.count} referral(s))`
+        : `👤 You haven't referred anyone yet — share your link to get on the board!`;
+
+    await ctx.reply(text, {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: [[{ text: '🎁 Back to Invite & Earn', callback_data: 'user_referral' }]] }
+    });
 });
 
 // --- Admin: force-sub group management ---
@@ -2156,8 +2188,7 @@ bot.action('recheck_sub', async (ctx) => {
 const ADMIN_START_TEXT = 'Welcome, Admin!\n\nChoose a section to manage:';
 const ADMIN_START_KEYBOARD = {
     inline_keyboard: [
-        [{ text: '📦 Mega Management', callback_data: 'menu_mega' }],
-        [{ text: '🎬 File Sharing', callback_data: 'menu_fileshare' }]
+        [{ text: '📦 Mega Management', callback_data: 'menu_mega' }, { text: '🎬 File Sharing', callback_data: 'menu_fileshare' }]
     ]
 };
 
@@ -2239,21 +2270,14 @@ async function renderFileSharePanel(ctx) {
     const keyboard = {
         inline_keyboard: [
             [{ text: '➕ Add Force-Sub', callback_data: 'fs_addfs_menu' }, { text: '📋 Force-Sub List', callback_data: 'fs_listforcesub' }],
-            [{ text: '🎯 Set Source', callback_data: 'fs_setsrc_menu' }],
-            [{ text: '📁 List Files', callback_data: 'fs_listfiles' }, { text: '📊 Stats', callback_data: 'fs_stats' }],
-            [{ text: `🔢 Per Request: ${config.shareCount}`, callback_data: 'fs_count_menu' }],
-            [{ text: `⏱ Cooldown: ${config.cooldownSeconds}s`, callback_data: 'fs_cooldown_menu' }],
-            [{ text: `📆 Daily Limit: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}`, callback_data: 'fs_dailylimit_menu' }],
-            [{ text: `🗑 Auto-Delete: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + 'm'}`, callback_data: 'fs_autodelete_menu' }],
-            [{ text: `🔐 Forward Protection: ${config.protectContent ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_protect' }],
-            [{ text: '📢 Broadcast', callback_data: 'fs_broadcast_menu' }],
-            [{ text: '🖼 Auto-Post', callback_data: 'ap_menu' }],
-            [{ text: '🛠 Maintenance Mode', callback_data: 'mm_menu' }],
-            [{ text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
-            [{ text: '👤 About/Start Message', callback_data: 'about_menu' }],
-            [{ text: '📂 VIP Categories', callback_data: 'cat_menu' }],
-            [{ text: '💎 VIP Promotion', callback_data: 'vip_menu' }],
-            [{ text: '🎟 Promo Codes', callback_data: 'promo_menu' }],
+            [{ text: '🎯 Set Source', callback_data: 'fs_setsrc_menu' }, { text: '📁 List Files', callback_data: 'fs_listfiles' }],
+            [{ text: '📊 Stats', callback_data: 'fs_stats' }, { text: `🔢 Per Request: ${config.shareCount}`, callback_data: 'fs_count_menu' }],
+            [{ text: `⏱ Cooldown: ${config.cooldownSeconds}s`, callback_data: 'fs_cooldown_menu' }, { text: `📆 Daily Limit: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}`, callback_data: 'fs_dailylimit_menu' }],
+            [{ text: `🗑 Auto-Delete: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + 'm'}`, callback_data: 'fs_autodelete_menu' }, { text: `🔐 Forward Protection: ${config.protectContent ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_protect' }],
+            [{ text: '📢 Broadcast', callback_data: 'fs_broadcast_menu' }, { text: '🖼 Auto-Post', callback_data: 'ap_menu' }],
+            [{ text: '🛠 Maintenance Mode', callback_data: 'mm_menu' }, { text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
+            [{ text: '👤 About/Start Message', callback_data: 'about_menu' }, { text: '📂 VIP Categories', callback_data: 'cat_menu' }],
+            [{ text: '💎 VIP Promotion', callback_data: 'vip_menu' }, { text: '🎟 Promo Codes', callback_data: 'promo_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
@@ -2281,8 +2305,7 @@ async function renderAboutPanel(ctx) {
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '👥 Set Join Group Link', callback_data: 'about_setjoin' }],
-            [{ text: '✏️ Set Link Text', callback_data: 'about_settext' }],
+            [{ text: '👥 Set Join Group Link', callback_data: 'about_setjoin' }, { text: '✏️ Set Link Text', callback_data: 'about_settext' }],
             [{ text: '🔗 Set Link URL', callback_data: 'about_seturl' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
@@ -2341,8 +2364,7 @@ async function renderVipPanel(ctx) {
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '🔗 Set Channel Link', callback_data: 'vip_setlink' }],
-            [{ text: '✏️ Set Promo Text', callback_data: 'vip_settext' }],
+            [{ text: '🔗 Set Channel Link', callback_data: 'vip_setlink' }, { text: '✏️ Set Promo Text', callback_data: 'vip_settext' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
@@ -2392,8 +2414,7 @@ async function renderPromoPanel(ctx) {
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '➕ Create Code', callback_data: 'promo_create_menu' }],
-            [{ text: '🗑 Delete Code', callback_data: 'promo_delete_menu' }],
+            [{ text: '➕ Create Code', callback_data: 'promo_create_menu' }, { text: '🗑 Delete Code', callback_data: 'promo_delete_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
@@ -2549,10 +2570,8 @@ async function renderCategoryAdminPanel(ctx, categoryId) {
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '➕ Add Video(s)', callback_data: `cat_addvideo:${category.id}` }],
-            [{ text: '📋 List / Remove Videos', callback_data: `cat_listvideos:${category.id}:0` }],
-            [{ text: '✏️ Rename', callback_data: `cat_rename:${category.id}` }],
-            [{ text: '🗑 Delete Category', callback_data: `cat_delconfirm:${category.id}` }],
+            [{ text: '➕ Add Video(s)', callback_data: `cat_addvideo:${category.id}` }, { text: '📋 List / Remove Videos', callback_data: `cat_listvideos:${category.id}:0` }],
+            [{ text: '✏️ Rename', callback_data: `cat_rename:${category.id}` }, { text: '🗑 Delete Category', callback_data: `cat_delconfirm:${category.id}` }],
             [{ text: '🔙 Back', callback_data: 'cat_menu' }]
         ]
     };
@@ -3151,8 +3170,7 @@ async function renderBroadcastMenu(ctx) {
         'Use `/schedulebroadcast YYYY-MM-DD HH:MM text` for scheduled text broadcasts, and `/broadcasthistory` to review past sends.';
     const keyboard = {
         inline_keyboard: [
-            [{ text: '📤 Send Now', callback_data: 'fs_broadcast_send' }],
-            [{ text: `🔁 Forward: ${config.broadcastForwardMode ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_forward' }],
+            [{ text: '📤 Send Now', callback_data: 'fs_broadcast_send' }, { text: `🔁 Forward: ${config.broadcastForwardMode ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_forward' }],
             [{ text: '📜 History', callback_data: 'fs_broadcast_history' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
@@ -3564,14 +3582,10 @@ async function renderAutopostPanel(ctx) {
     const keyboard = {
         inline_keyboard: [
             [{ text: '➕ Add Source Channel', callback_data: 'ap_setsource_menu' }, { text: '➖ Remove Source Channel', callback_data: 'ap_removesource_menu' }],
-            [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }],
-            [{ text: '🔍 Verify Destination (sends a test message)', callback_data: 'ap_verify_dest' }],
-            [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }],
-            [{ text: '✏️ Set Caption', callback_data: 'ap_caption' }],
-            [{ text: `🖼 Thumbnail Source: ${cfg.thumbnailMode === 'custom' ? 'Custom' : 'Video'}`, callback_data: 'ap_thumb_toggle' }],
-            [{ text: '📤 Upload Custom Thumbnail', callback_data: 'ap_thumb_upload' }],
-            [{ text: `🔵 Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}`, callback_data: 'ap_blur_toggle' }],
-            [{ text: cfg.enabled ? '⏸ Pause' : '▶️ Enable', callback_data: 'ap_toggle_enabled' }],
+            [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }, { text: '🔍 Verify Destination', callback_data: 'ap_verify_dest' }],
+            [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }, { text: '✏️ Set Caption', callback_data: 'ap_caption' }],
+            [{ text: `🖼 Thumbnail: ${cfg.thumbnailMode === 'custom' ? 'Custom' : 'Video'}`, callback_data: 'ap_thumb_toggle' }, { text: '📤 Upload Thumbnail', callback_data: 'ap_thumb_upload' }],
+            [{ text: `🔵 Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}`, callback_data: 'ap_blur_toggle' }, { text: cfg.enabled ? '⏸ Pause' : '▶️ Enable', callback_data: 'ap_toggle_enabled' }],
             [{ text: '🧪 Test Preview', callback_data: 'ap_test' }, { text: '📊 Stats', callback_data: 'ap_stats' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]

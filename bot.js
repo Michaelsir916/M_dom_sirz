@@ -25,7 +25,6 @@ const {
     getUsersJoinedSince,
     getFilesAddedSince,
     getTopReferrers,
-    getReferrerRank,
     getUserStats,
     isNewUser,
     registerReferral,
@@ -85,14 +84,23 @@ const {
     addVideoToCategory,
     removeVideoFromCategory,
     removeCategoryVideoByMessage,
-    getCategoryStats
+    getCategoryStats,
+    getMegaAccounts,
+    addMegaAccount,
+    removeMegaAccount,
+    setMegaAccountCooldown,
+    createFolderJob,
+    updateFolderJob,
+    getFolderJob,
+    listRunningFolderJobs,
+    deleteFolderJob,
+    findFolderUpload,
+    recordFolderUpload
 } = require('./fileShare');
 const queue = require('./queue');
+const mfu = require('./megaFolderUpload');
 
-const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: Infinity });
-
-// "Buy VIP" always opens this chat directly — no intermediate promo screen.
-const VIP_CONTACT_URL = 'https://t.me/mr_boomsir';
+const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // Runs before every single handler. When maintenance mode is ON, only admins
 // and whitelisted users pass through — everyone else gets a plain notice.
@@ -242,6 +250,14 @@ async function requireAdmin(ctx, viaAction = false) {
 // values) can ask the admin to send one plain message instead of a slash
 // command. Cleared on use, on /cancel, or lost on restart (admin just retaps).
 const pendingAction = {};
+
+// In-memory browse state for the "📂 Folder Upload" flow, keyed by admin
+// user id. Holds the live megajs folder tree the admin is currently
+// navigating (folders only — files aren't buffered, just listed). Lost on
+// restart, same as pendingAction — browsing state doesn't need to survive
+// that, only a job already in progress does (see mega_folder_jobs.json via
+// fileShare.js, resumed at startup).
+const folderBrowseState = {};
 
 // In-memory holder for an auto-post "test preview" awaiting the admin's
 // ✅ Post / ❌ Skip tap (setup-time confirm only — scheduled runs never wait
@@ -1132,7 +1148,10 @@ async function sendJoinPrompt(ctx, groupIds) {
         return;
     }
 
-    buttons.push([{ text: '💎 Skip — Get VIP Instead', url: VIP_CONTACT_URL }]);
+    const config = loadConfig();
+    if (config.vipChannelLink) {
+        buttons.push([{ text: '💎 Skip — Get VIP Instead', callback_data: 'vip_info' }]);
+    }
     buttons.push([{ text: '✅ I\'ve Joined — Verify', callback_data: 'recheck_sub' }]);
 
     await ctx.reply('🔒 *Tap below to request access — then tap Verify*', {
@@ -1255,7 +1274,7 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
                     await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
                 } else {
                     await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                        { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', url: VIP_CONTACT_URL }]] } });
+                        config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
                 }
                 return;
             }
@@ -1286,9 +1305,12 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
 // --- User-facing: My Stats & Referrals ---
 const MY_STATS_KEYBOARD = {
     inline_keyboard: [
-        [{ text: '💎 Buy VIP', url: VIP_CONTACT_URL }, { text: '🎬 Free Video', callback_data: 'user_random' }],
-        [{ text: '📂 VIP Categories', callback_data: 'user_categories' }, { text: '📊 My Stats', callback_data: 'user_mystats' }],
-        [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }, { text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
+        [{ text: '💎 Buy VIP', callback_data: 'vip_info' }],
+        [{ text: '🎬 Free Video', callback_data: 'user_random' }],
+        [{ text: '📂 VIP Categories', callback_data: 'user_categories' }],
+        [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
+        [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
+        [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
         [{ text: 'ℹ️ About', callback_data: 'user_about' }]
     ]
 };
@@ -1334,7 +1356,7 @@ bot.action('vip_info', async (ctx) => {
     await ctx.reply(text, {
         parse_mode: 'HTML',
         disable_web_page_preview: true,
-        reply_markup: { inline_keyboard: [[{ text: '🛒 BUY NOW', url: config.vipChannelLink }]] }
+        reply_markup: { inline_keyboard: [[{ text: '💎 Join VIP Channel', url: config.vipChannelLink }]] }
     });
 });
 
@@ -1356,7 +1378,9 @@ bot.action('user_about', async (ctx) => {
     }
 
     const keyboard = { inline_keyboard: [] };
-    keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', url: VIP_CONTACT_URL }]);
+    if (config.vipChannelLink) {
+        keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', callback_data: 'vip_info' }]);
+    }
     if (config.aboutJoinGroupLink) {
         keyboard.inline_keyboard.push([{ text: '👥 Join Group', url: config.aboutJoinGroupLink }]);
     }
@@ -1403,7 +1427,8 @@ bot.action('user_categories', async (ctx) => {
     }
 
     if (!isAdminUser && !isUserVip(userId)) {
-        const keyboard = { inline_keyboard: [[{ text: '💎 Buy VIP', url: VIP_CONTACT_URL }]] };
+        const keyboard = { inline_keyboard: [] };
+        if (config.vipChannelLink) keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', callback_data: 'vip_info' }]);
         await ctx.reply(
             '🔒 *VIP Categories* are exclusive to active VIP members.\n\n' +
             'Upgrade to VIP to unlock curated video categories not available through 🎬 Free Video.',
@@ -1557,10 +1582,7 @@ async function formatMyReferral(ctx) {
 
     const shareText = `🎁 Get free files! Join via my link:`;
     const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(shareText)}`;
-    const replyMarkup = { inline_keyboard: [
-        [{ text: '📤 Share with Friends', url: shareUrl }],
-        [{ text: '🏆 Leaderboard', callback_data: 'user_leaderboard' }]
-    ] };
+    const replyMarkup = { inline_keyboard: [[{ text: '📤 Share with Friends', url: shareUrl }]] };
 
     return { text, replyMarkup };
 }
@@ -1608,37 +1630,6 @@ bot.action('user_referral', async (ctx) => {
     await ctx.answerCbQuery();
     const { text, replyMarkup } = await formatMyReferral(ctx);
     await ctx.reply(text, { parse_mode: 'HTML', reply_markup: replyMarkup });
-});
-
-// Anonymized all-time referral leaderboard — shows last 4 digits of each
-// top referrer's Telegram ID (never username/name), plus the viewer's own
-// rank so it stays motivating without exposing anyone's identity.
-bot.action('user_leaderboard', async (ctx) => {
-    await ctx.answerCbQuery();
-    const top = getTopReferrers(10);
-    const medal = ['🥇', '🥈', '🥉'];
-    let text = '🏆 <b>Top Referrers</b>\n\n';
-
-    if (top.length === 0) {
-        text += '_No referrals yet — be the first!_';
-    } else {
-        text += top.map((r, i) => {
-            const rank = medal[i] || `${i + 1}.`;
-            const last4 = String(r.id).slice(-4);
-            return `${rank} User ****${last4} — ${r.count} referral(s)`;
-        }).join('\n');
-    }
-
-    const mine = getReferrerRank(ctx.from.id);
-    text += '\n\n';
-    text += mine.rank
-        ? `👤 Your rank: #${mine.rank} (${mine.count} referral(s))`
-        : `👤 You haven't referred anyone yet — share your link to get on the board!`;
-
-    await ctx.reply(text, {
-        parse_mode: 'HTML',
-        reply_markup: { inline_keyboard: [[{ text: '🎁 Back to Invite & Earn', callback_data: 'user_referral' }]] }
-    });
 });
 
 // --- Admin: force-sub group management ---
@@ -2115,7 +2106,7 @@ async function handleRandomRequest(ctx) {
                 await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
             } else {
                 await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                    { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', url: VIP_CONTACT_URL }]] } });
+                    config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
             }
             return;
         }
@@ -2167,7 +2158,7 @@ bot.action('recheck_sub', async (ctx) => {
                 await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
             } else {
                 await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                    { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', url: VIP_CONTACT_URL }]] } });
+                    config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
             }
             return;
         }
@@ -2185,7 +2176,8 @@ bot.action('recheck_sub', async (ctx) => {
 const ADMIN_START_TEXT = 'Welcome, Admin!\n\nChoose a section to manage:';
 const ADMIN_START_KEYBOARD = {
     inline_keyboard: [
-        [{ text: '📦 Mega Management', callback_data: 'menu_mega' }, { text: '🎬 File Sharing', callback_data: 'menu_fileshare' }]
+        [{ text: '📦 Mega Management', callback_data: 'menu_mega' }],
+        [{ text: '🎬 File Sharing', callback_data: 'menu_fileshare' }]
     ]
 };
 
@@ -2249,7 +2241,13 @@ bot.action('menu_mega', async (ctx) => {
         '_This feature is available to admins only._',
         {
             parse_mode: 'Markdown',
-            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_back' }]] }
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '📂 Folder Upload (Advanced)', callback_data: 'mfu_menu' }],
+                    [{ text: '🔄 MEGA Accounts', callback_data: 'mfu_accounts_menu' }],
+                    [{ text: '🔙 Back', callback_data: 'menu_back' }]
+                ]
+            }
         }
     );
 });
@@ -2267,14 +2265,21 @@ async function renderFileSharePanel(ctx) {
     const keyboard = {
         inline_keyboard: [
             [{ text: '➕ Add Force-Sub', callback_data: 'fs_addfs_menu' }, { text: '📋 Force-Sub List', callback_data: 'fs_listforcesub' }],
-            [{ text: '🎯 Set Source', callback_data: 'fs_setsrc_menu' }, { text: '📁 List Files', callback_data: 'fs_listfiles' }],
-            [{ text: '📊 Stats', callback_data: 'fs_stats' }, { text: `🔢 Per Request: ${config.shareCount}`, callback_data: 'fs_count_menu' }],
-            [{ text: `⏱ Cooldown: ${config.cooldownSeconds}s`, callback_data: 'fs_cooldown_menu' }, { text: `📆 Daily Limit: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}`, callback_data: 'fs_dailylimit_menu' }],
-            [{ text: `🗑 Auto-Delete: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + 'm'}`, callback_data: 'fs_autodelete_menu' }, { text: `🔐 Forward Protection: ${config.protectContent ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_protect' }],
-            [{ text: '📢 Broadcast', callback_data: 'fs_broadcast_menu' }, { text: '🖼 Auto-Post', callback_data: 'ap_menu' }],
-            [{ text: '🛠 Maintenance Mode', callback_data: 'mm_menu' }, { text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
-            [{ text: '👤 About/Start Message', callback_data: 'about_menu' }, { text: '📂 VIP Categories', callback_data: 'cat_menu' }],
-            [{ text: '💎 VIP Promotion', callback_data: 'vip_menu' }, { text: '🎟 Promo Codes', callback_data: 'promo_menu' }],
+            [{ text: '🎯 Set Source', callback_data: 'fs_setsrc_menu' }],
+            [{ text: '📁 List Files', callback_data: 'fs_listfiles' }, { text: '📊 Stats', callback_data: 'fs_stats' }],
+            [{ text: `🔢 Per Request: ${config.shareCount}`, callback_data: 'fs_count_menu' }],
+            [{ text: `⏱ Cooldown: ${config.cooldownSeconds}s`, callback_data: 'fs_cooldown_menu' }],
+            [{ text: `📆 Daily Limit: ${config.dailyLimit === 0 ? 'Unlimited' : config.dailyLimit}`, callback_data: 'fs_dailylimit_menu' }],
+            [{ text: `🗑 Auto-Delete: ${config.autoDeleteMinutes === 0 ? 'Off' : config.autoDeleteMinutes + 'm'}`, callback_data: 'fs_autodelete_menu' }],
+            [{ text: `🔐 Forward Protection: ${config.protectContent ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_protect' }],
+            [{ text: '📢 Broadcast', callback_data: 'fs_broadcast_menu' }],
+            [{ text: '🖼 Auto-Post', callback_data: 'ap_menu' }],
+            [{ text: '🛠 Maintenance Mode', callback_data: 'mm_menu' }],
+            [{ text: '📦 MEGA Upload Destination', callback_data: 'mud_menu' }],
+            [{ text: '👤 About/Start Message', callback_data: 'about_menu' }],
+            [{ text: '📂 VIP Categories', callback_data: 'cat_menu' }],
+            [{ text: '💎 VIP Promotion', callback_data: 'vip_menu' }],
+            [{ text: '🎟 Promo Codes', callback_data: 'promo_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_back' }]
         ]
     };
@@ -2302,7 +2307,8 @@ async function renderAboutPanel(ctx) {
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '👥 Set Join Group Link', callback_data: 'about_setjoin' }, { text: '✏️ Set Link Text', callback_data: 'about_settext' }],
+            [{ text: '👥 Set Join Group Link', callback_data: 'about_setjoin' }],
+            [{ text: '✏️ Set Link Text', callback_data: 'about_settext' }],
             [{ text: '🔗 Set Link URL', callback_data: 'about_seturl' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
@@ -2361,7 +2367,8 @@ async function renderVipPanel(ctx) {
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '🔗 Set Channel Link', callback_data: 'vip_setlink' }, { text: '✏️ Set Promo Text', callback_data: 'vip_settext' }],
+            [{ text: '🔗 Set Channel Link', callback_data: 'vip_setlink' }],
+            [{ text: '✏️ Set Promo Text', callback_data: 'vip_settext' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
@@ -2411,7 +2418,8 @@ async function renderPromoPanel(ctx) {
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '➕ Create Code', callback_data: 'promo_create_menu' }, { text: '🗑 Delete Code', callback_data: 'promo_delete_menu' }],
+            [{ text: '➕ Create Code', callback_data: 'promo_create_menu' }],
+            [{ text: '🗑 Delete Code', callback_data: 'promo_delete_menu' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
@@ -2567,8 +2575,10 @@ async function renderCategoryAdminPanel(ctx, categoryId) {
 
     const keyboard = {
         inline_keyboard: [
-            [{ text: '➕ Add Video(s)', callback_data: `cat_addvideo:${category.id}` }, { text: '📋 List / Remove Videos', callback_data: `cat_listvideos:${category.id}:0` }],
-            [{ text: '✏️ Rename', callback_data: `cat_rename:${category.id}` }, { text: '🗑 Delete Category', callback_data: `cat_delconfirm:${category.id}` }],
+            [{ text: '➕ Add Video(s)', callback_data: `cat_addvideo:${category.id}` }],
+            [{ text: '📋 List / Remove Videos', callback_data: `cat_listvideos:${category.id}:0` }],
+            [{ text: '✏️ Rename', callback_data: `cat_rename:${category.id}` }],
+            [{ text: '🗑 Delete Category', callback_data: `cat_delconfirm:${category.id}` }],
             [{ text: '🔙 Back', callback_data: 'cat_menu' }]
         ]
     };
@@ -2916,6 +2926,555 @@ function knownChatPickerKeyboard(excludeIds, prefix, backCallback, adminId) {
     return { rows, truncated: chats.length > 20, total: chats.length };
 }
 
+// ================= Folder Upload (Advanced) =================
+// Browse into a MEGA folder link, pick exactly one subfolder, choose where
+// its photo/video files go (a public channel or a VIP category), then
+// download + deliver with multi-account rotation, corrupt-file skipping,
+// and crash-safe resume. See megaFolderUpload.js for the MEGA-side engine.
+
+// In-progress "which folder + which files did the admin just pick" state,
+// keyed by admin user id — bridges folder browsing (mfu_nav/mfu_select) to
+// the destination-picking steps (mfu_dest_channel/mfu_dest_category) below.
+// Once mfu_confirm fires, this is copied into a durable job (see
+// createFolderJob) and cleared — from that point on, a restart can resume
+// from disk without needing this in-memory state at all.
+const folderSelection = {};
+
+// Works whether called from a button tap (edits the existing message) or
+// from a plain text reply (sends a new message) — both happen in this flow,
+// since a MEGA link / category name / channel ID can arrive as free text.
+async function sendOrEdit(ctx, text, extra) {
+    if (ctx.callbackQuery) {
+        try {
+            await ctx.editMessageText(text, extra);
+            return;
+        } catch (e) {
+            if (isMessageNotModifiedError(e)) return;
+            // fall through to reply
+        }
+    }
+    await ctx.reply(text, extra);
+}
+
+async function renderFolderBrowse(ctx, adminId) {
+    const state = folderBrowseState[adminId];
+    if (!state) {
+        await sendOrEdit(ctx, '⚠️ Folder browsing session expired. Send the MEGA folder link again.', {
+            reply_markup: { inline_keyboard: [[{ text: '📂 Folder Upload', callback_data: 'mfu_menu' }]] }
+        });
+        return;
+    }
+    const currentNode = state.nodeStack[state.nodeStack.length - 1];
+    const { folders, files } = mfu.splitChildren(currentNode);
+    const mediaFiles = files.filter(f => isVideoFile(f.name) || isImageFile(f.name));
+    const breadcrumb = state.pathNames.length ? state.pathNames.join(' / ') : '(root)';
+
+    let text = `📂 *Folder Upload*\n\n📍 ${escapeMd(breadcrumb)}\n\n` +
+        `Subfolders: ${folders.length}\n` +
+        `Files here: ${files.length}` + (files.length ? ` (📸🎬 ${mediaFiles.length} usable)` : '') + '\n\n' +
+        (folders.length ? '_Tap a subfolder to open it, or select this folder if it has what you want._' : '_No subfolders here._');
+
+    const shown = folders.slice(0, 30);
+    const rows = shown.map((f, i) => [{ text: `📁 ${f.name}`, callback_data: `mfu_nav:${i}` }]);
+    if (folders.length > shown.length) text += `\n\n_...and ${folders.length - shown.length} more (showing first ${shown.length})._`;
+
+    const actionRow = [];
+    if (mediaFiles.length > 0) actionRow.push({ text: `✅ Select This Folder (${mediaFiles.length})`, callback_data: 'mfu_select' });
+    if (state.pathNames.length > 0) actionRow.push({ text: '⬆️ Up', callback_data: 'mfu_up' });
+    if (actionRow.length) rows.push(actionRow);
+    rows.push([{ text: '❌ Cancel', callback_data: 'mfu_cancel' }]);
+
+    await sendOrEdit(ctx, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+bot.action('mfu_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'mfu_awaiting_link' };
+    await ctx.editMessageText(
+        '📂 *Folder Upload*\n\n' +
+        'Send a MEGA *folder* link — I\'ll let you browse into it and pick exactly which subfolder to upload.\n\n' +
+        '`https://mega.nz/folder/ID#KEY`',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu_mega' }]] } }
+    );
+});
+
+bot.action(/^mfu_nav:(\d+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const state = folderBrowseState[ctx.from.id];
+    if (!state) { await ctx.answerCbQuery('⚠️ Session expired.'); return; }
+    const currentNode = state.nodeStack[state.nodeStack.length - 1];
+    const { folders } = mfu.splitChildren(currentNode);
+    const next = folders[parseInt(ctx.match[1], 10)];
+    if (!next) { await ctx.answerCbQuery('⚠️ Not found — list may have changed, reopen the folder.'); return; }
+    state.nodeStack.push(next);
+    state.pathNames.push(next.name);
+    await ctx.answerCbQuery();
+    await renderFolderBrowse(ctx, ctx.from.id);
+});
+
+bot.action('mfu_up', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const state = folderBrowseState[ctx.from.id];
+    if (!state) { await ctx.answerCbQuery('⚠️ Session expired.'); return; }
+    if (state.nodeStack.length > 1) { state.nodeStack.pop(); state.pathNames.pop(); }
+    await ctx.answerCbQuery();
+    await renderFolderBrowse(ctx, ctx.from.id);
+});
+
+bot.action('mfu_select', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const state = folderBrowseState[ctx.from.id];
+    if (!state) { await ctx.answerCbQuery('⚠️ Session expired.'); return; }
+    const currentNode = state.nodeStack[state.nodeStack.length - 1];
+    const { files } = mfu.splitChildren(currentNode);
+    const mediaFiles = files.filter(f => isVideoFile(f.name) || isImageFile(f.name));
+    if (mediaFiles.length === 0) { await ctx.answerCbQuery('⚠️ No photo/video files here.'); return; }
+
+    const folderName = state.pathNames.length ? state.pathNames[state.pathNames.length - 1] : (currentNode.name || 'root');
+    folderSelection[ctx.from.id] = {
+        url: state.url,
+        pathNames: [...state.pathNames],
+        folderName,
+        files: mediaFiles.map(f => ({ name: f.name, size: f.size || 0 })),
+        totalSize: mediaFiles.reduce((s, f) => s + (f.size || 0), 0),
+        skippedNonMedia: files.length - mediaFiles.length
+    };
+    delete folderBrowseState[ctx.from.id];
+    await ctx.answerCbQuery();
+    await renderFolderDestinationPicker(ctx);
+});
+
+async function renderFolderDestinationPicker(ctx) {
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) {
+        await sendOrEdit(ctx, '⚠️ Selection expired. Start again from Folder Upload.', {
+            reply_markup: { inline_keyboard: [[{ text: '📂 Folder Upload', callback_data: 'mfu_menu' }]] }
+        });
+        return;
+    }
+    const text = `📁 *${escapeMd(sel.folderName)}*\n\n` +
+        `Files to upload: ${sel.files.length}\n` +
+        `Total size: ${mfu.formatBytes(sel.totalSize)}\n` +
+        (sel.skippedNonMedia > 0 ? `Skipping ${sel.skippedNonMedia} non-photo/video file(s)\n` : '') +
+        `\nWhere should these go?`;
+    await sendOrEdit(ctx, text, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '📢 Public Channel', callback_data: 'mfu_dest_channel' }],
+                [{ text: '💎 VIP Category', callback_data: 'mfu_dest_category' }],
+                [{ text: '❌ Cancel', callback_data: 'mfu_cancel' }]
+            ]
+        }
+    });
+}
+
+bot.action('mfu_reselect_dest', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderFolderDestinationPicker(ctx);
+});
+
+bot.action('mfu_dest_channel', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    if (!folderSelection[ctx.from.id]) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    await ctx.answerCbQuery();
+    const { rows, truncated, total } = knownChatPickerKeyboard([], 'mfu_ch', 'mfu_reselect_dest', ctx.from.id);
+    const note = total === 0
+        ? '_No known channels yet — add me as admin somewhere first, or type an ID/@username._'
+        : truncated ? `_Showing 20 of ${total} known chats._` : '';
+    await ctx.editMessageText(`🎯 *Choose Destination Channel*\n\n${note}`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+});
+
+bot.action('mfu_ch_manual', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    if (!folderSelection[ctx.from.id]) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'mfu_ch_manual' };
+    await ctx.editMessageText('⌨️ Send the channel ID (e.g. `-1001234567890`) or `@username`.\n\nI must already be admin there. Send /cancel to abort.', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mfu_dest_channel' }]] }
+    });
+});
+
+bot.action(/^mfu_ch:(-?\d+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    const chatId = Number(ctx.match[1]);
+    try {
+        await ctx.telegram.getChatMember(chatId, ctx.botInfo.id);
+    } catch (error) {
+        await ctx.answerCbQuery('⚠️ Could not verify — try again.');
+        return;
+    }
+    const chat = getKnownChats().find(c => String(c.id) === String(chatId));
+    sel.destinationType = 'channel';
+    sel.destinationId = chatId;
+    sel.destinationLabel = chat ? chat.title : String(chatId);
+    await ctx.answerCbQuery('✅ Channel set');
+    await renderFolderConfirm(ctx);
+});
+
+bot.action('mfu_dest_category', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    if (!folderSelection[ctx.from.id]) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    await ctx.answerCbQuery();
+    await renderFolderCategoryPicker(ctx);
+});
+
+async function renderFolderCategoryPicker(ctx) {
+    const config = loadConfig();
+    if (!config.categoryStorageChannelId) {
+        await sendOrEdit(ctx, '⚠️ *No VIP storage channel set yet*\n\nEvery category video archives there first — set one from the VIP Categories menu, then come back.', {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [[{ text: '🎯 Set Storage Channel', callback_data: 'cat_setchannel_menu' }], [{ text: '🔙 Back', callback_data: 'mfu_reselect_dest' }]] }
+        });
+        return;
+    }
+    const categories = listCategories();
+    const rows = categories.slice(0, 25).map(c => [{ text: `📁 ${c.name} (${c.videos.length})`, callback_data: `mfu_cat:${c.id}` }]);
+    rows.push([{ text: '➕ New Category', callback_data: 'mfu_cat_new' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'mfu_reselect_dest' }]);
+    await sendOrEdit(ctx, '💎 *Choose VIP Category*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+bot.action(/^mfu_cat:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    const category = getCategory(ctx.match[1]);
+    if (!category) { await ctx.answerCbQuery('⚠️ Category not found.'); return; }
+    sel.destinationType = 'category';
+    sel.destinationId = category.id;
+    sel.destinationLabel = category.name;
+    await ctx.answerCbQuery();
+    await renderFolderConfirm(ctx);
+});
+
+bot.action('mfu_cat_new', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    if (!folderSelection[ctx.from.id]) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'mfu_cat_new_name' };
+    await ctx.editMessageText('➕ Send a name for the new category (max 64 characters), or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mfu_dest_category' }]] }
+    });
+});
+
+async function renderFolderConfirm(ctx) {
+    const sel = folderSelection[ctx.from.id];
+    if (!sel || !sel.destinationType) {
+        await sendOrEdit(ctx, '⚠️ Selection expired. Start again from Folder Upload.', {
+            reply_markup: { inline_keyboard: [[{ text: '📂 Folder Upload', callback_data: 'mfu_menu' }]] }
+        });
+        return;
+    }
+    const folderKey = `${sel.url}::${sel.pathNames.join('/')}`;
+    const prevUpload = findFolderUpload(folderKey, sel.destinationType, sel.destinationId);
+
+    let text = `🚀 *Ready to Upload*\n\n` +
+        `📁 Folder: ${escapeMd(sel.folderName)}\n` +
+        `📊 Files: ${sel.files.length}\n` +
+        `💾 Size: ${mfu.formatBytes(sel.totalSize)}\n` +
+        `📤 Destination: ${sel.destinationType === 'channel' ? '📢' : '💎'} ${escapeMd(sel.destinationLabel)}\n`;
+
+    if (prevUpload) {
+        const when = new Date(prevUpload.uploadedAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
+        text += `\n⚠️ *This exact folder was already uploaded here* on ${when} (${prevUpload.fileCount} file(s)). Upload again anyway?`;
+    }
+
+    await sendOrEdit(ctx, text, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '🚀 Start Upload', callback_data: 'mfu_confirm' }], [{ text: '❌ Cancel', callback_data: 'mfu_cancel' }]] }
+    });
+}
+
+bot.action('mfu_cancel', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    delete folderBrowseState[ctx.from.id];
+    delete folderSelection[ctx.from.id];
+    delete pendingAction[ctx.from.id];
+    await ctx.answerCbQuery('❌ Cancelled');
+    await ctx.editMessageText('❌ Cancelled.', { reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_mega' }]] } });
+});
+
+bot.action('mfu_confirm', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel || !sel.destinationType) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    await ctx.answerCbQuery('🚀 Starting...');
+    delete folderSelection[ctx.from.id];
+
+    const jobId = `fj_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const job = {
+        id: jobId,
+        adminId: ctx.from.id,
+        chatId: ctx.chat.id,
+        status: 'running',
+        url: sel.url,
+        pathNames: sel.pathNames,
+        folderName: sel.folderName,
+        destinationType: sel.destinationType,
+        destinationId: sel.destinationId,
+        destinationLabel: sel.destinationLabel,
+        files: sel.files.map(f => ({ name: f.name, size: f.size, status: 'pending' })),
+        createdAt: new Date().toISOString(),
+        sentCount: 0,
+        failedCount: 0,
+        skippedCount: 0
+    };
+    createFolderJob(job);
+
+    try {
+        await ctx.reply(`🚀 *Upload started*\n\n📁 ${escapeMd(sel.folderName)} → ${escapeMd(sel.destinationLabel)}\n\nI'll post progress here.`, { parse_mode: 'Markdown' });
+    } catch (e) { /* best-effort */ }
+
+    queue.add(() => runFolderUploadJob(jobId)).catch(err => logError('Folder upload job', err));
+});
+
+// Sends a file straight to a chat via MTProto without needing a live ctx —
+// used by the job runner so a resumed-after-restart job (no original
+// message/ctx to hang off) can still deliver files. Video files send as
+// video, images as photo (never as a generic document), and never carry a
+// caption — mirrors sendTelegramFile()'s behavior for the regular MEGA flow.
+async function sendFileToChatDirect(filePath, fileName, chatId) {
+    await startMtproto();
+    const forceDocument = !isVideoFile(fileName) && !isImageFile(fileName);
+    return await client.sendFile(chatId, {
+        file: filePath,
+        caption: '',
+        forceDocument
+    });
+}
+
+// (Re)loads the job's folder tree — anonymously, or through an authenticated
+// account's session if one is picked — and walks down to the saved
+// pathNames. Called once at job start and again every time rotation swaps
+// to a different account.
+async function getFolderNodeForJob(job, excludeAccountIds) {
+    const accounts = getMegaAccounts();
+    const account = mfu.pickAccount(accounts, excludeAccountIds);
+    const storage = account ? await mfu.ensureAccountStorage(account) : null;
+    const root = await mfu.loadFolderTree(job.url, storage);
+    const target = mfu.walkPath(root, job.pathNames) || root;
+    return { target, account };
+}
+
+// The actual worker. Downloads each pending file in the job (skipping ones
+// already marked done/failed/skipped from a previous run — that's the
+// resume mechanism), rotating MEGA accounts on quota errors and skipping
+// files that come down corrupt, then delivers each successfully-downloaded
+// file straight to the destination and persists progress to disk after
+// every single file so a crash mid-job loses at most the one in-flight file.
+async function runFolderUploadJob(jobId) {
+    let job = getFolderJob(jobId);
+    if (!job) return;
+
+    const tempDir = path.join(os.tmpdir(), 'mega-folder-jobs', jobId);
+    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+
+    const triedAccountIds = [];
+    let folderNode = null;
+    let currentAccount = null;
+
+    async function reloadTree() {
+        const { target, account } = await getFolderNodeForJob(job, triedAccountIds);
+        folderNode = target;
+        currentAccount = account;
+    }
+
+    try {
+        await reloadTree();
+    } catch (error) {
+        updateFolderJob(jobId, { status: 'failed', error: error.message });
+        await sendToLogChannel(`❌ *Folder Upload Failed to Start*\n\n📁 ${job.folderName}\n*Error:* \`${error.message}\``);
+        try { await bot.telegram.sendMessage(job.chatId, `❌ Couldn't start the folder upload: ${error.message}`); } catch (e) { /* best-effort */ }
+        return;
+    }
+
+    let progressMsgId = null;
+    let lastProgressEdit = 0;
+    try {
+        const msg = await bot.telegram.sendMessage(job.chatId,
+            `📤 *Uploading Folder*\n\n📁 ${escapeMd(job.folderName)}\n✅ Sent: 0/${job.files.length}`, { parse_mode: 'Markdown' });
+        progressMsgId = msg.message_id;
+    } catch (e) { /* continue without a live progress message */ }
+
+    async function editProgress() {
+        if (!progressMsgId) return;
+        const now = Date.now();
+        if (now - lastProgressEdit < 3000) return;
+        lastProgressEdit = now;
+        try {
+            await bot.telegram.editMessageText(job.chatId, progressMsgId, null,
+                `📤 *Uploading Folder*\n\n📁 ${escapeMd(job.folderName)}\n✅ Sent: ${job.sentCount}/${job.files.length}\n❌ Failed: ${job.failedCount}\n⏭ Skipped: ${job.skippedCount}`,
+                { parse_mode: 'Markdown' }
+            ).catch(() => {});
+        } catch (e) { /* ignore */ }
+    }
+
+    for (let i = 0; i < job.files.length; i++) {
+        const fileEntry = job.files[i];
+        if (fileEntry.status !== 'pending') continue; // already handled in a previous run — resume skips these
+
+        const destPath = path.join(tempDir, `${i}_${mfu.sanitizeFilename(fileEntry.name)}`);
+        let result = null;
+        const maxAttempts = Math.max(1, getMegaAccounts().length) + 1;
+        let attempts = 0;
+
+        while (attempts < maxAttempts && !result) {
+            attempts++;
+            const { files: availableFiles } = mfu.splitChildren(folderNode);
+            const node = availableFiles.find(f => f.name === fileEntry.name);
+            if (!node) {
+                fileEntry.status = 'failed';
+                fileEntry.error = 'File no longer found in the MEGA folder';
+                break;
+            }
+            try {
+                result = await mfu.downloadFileNode(node, destPath);
+            } catch (error) {
+                if (mfu.isQuotaError(error) && currentAccount) {
+                    setMegaAccountCooldown(currentAccount.id, Date.now() + 6 * 60 * 60 * 1000); // 6h cooldown
+                    triedAccountIds.push(currentAccount.id);
+                    try {
+                        await reloadTree();
+                        continue; // retry this same file through the next account
+                    } catch (reloadErr) {
+                        fileEntry.status = 'failed';
+                        fileEntry.error = reloadErr.message;
+                        break;
+                    }
+                } else if (/corrupt/i.test(error.message)) {
+                    fileEntry.status = 'skipped_corrupt';
+                    fileEntry.error = error.message;
+                    break;
+                } else {
+                    fileEntry.status = 'failed';
+                    fileEntry.error = error.message;
+                    break;
+                }
+            }
+        }
+
+        if (result) {
+            try {
+                let sentMsg;
+                if (job.destinationType === 'category') {
+                    const storageChannelId = loadConfig().categoryStorageChannelId;
+                    sentMsg = await sendFileToChatDirect(result.path, fileEntry.name, storageChannelId);
+                    addVideoToCategory(job.destinationId, {
+                        chatId: storageChannelId,
+                        messageId: sentMsg.id,
+                        fileUniqueId: null,
+                        type: isVideoFile(fileEntry.name) ? 'video' : 'photo',
+                        addedBy: job.adminId,
+                        caption: null
+                    });
+                } else {
+                    sentMsg = await sendFileToChatDirect(result.path, fileEntry.name, job.destinationId);
+                }
+                fileEntry.status = 'done';
+                job.sentCount++;
+            } catch (sendError) {
+                fileEntry.status = 'failed';
+                fileEntry.error = `Upload failed: ${sendError.message}`;
+            }
+            cleanupFile(result.path);
+        }
+
+        if (fileEntry.status === 'pending') {
+            fileEntry.status = 'failed';
+            fileEntry.error = fileEntry.error || 'Exhausted retries';
+        }
+        if (fileEntry.status === 'skipped_corrupt') job.skippedCount++;
+        else if (fileEntry.status === 'failed') job.failedCount++;
+
+        job = updateFolderJob(jobId, { files: job.files, sentCount: job.sentCount, failedCount: job.failedCount, skippedCount: job.skippedCount }) || job;
+        await editProgress();
+        await new Promise(r => setTimeout(r, 800));
+    }
+
+    job = updateFolderJob(jobId, { status: 'done', finishedAt: new Date().toISOString() }) || job;
+
+    const folderKey = `${job.url}::${job.pathNames.join('/')}`;
+    recordFolderUpload(folderKey, job.destinationType, job.destinationId, { fileCount: job.sentCount, folderName: job.folderName });
+
+    const summary = `✅ *Folder Upload Complete*\n\n` +
+        `📁 ${escapeMd(job.folderName)}\n` +
+        `📤 Destination: ${job.destinationType === 'channel' ? '📢' : '💎'} ${escapeMd(job.destinationLabel)}\n` +
+        `✅ Sent: ${job.sentCount}\n` +
+        (job.failedCount > 0 ? `❌ Failed: ${job.failedCount}\n` : '') +
+        (job.skippedCount > 0 ? `⏭ Skipped (corrupt/other): ${job.skippedCount}\n` : '');
+
+    try {
+        if (progressMsgId) await bot.telegram.deleteMessage(job.chatId, progressMsgId).catch(() => {});
+        await bot.telegram.sendMessage(job.chatId, summary, { parse_mode: 'Markdown' });
+    } catch (e) { /* best-effort */ }
+
+    await sendToLogChannel(`📦 *Folder Upload Report*\n\n${summary}`);
+    cleanupFolder(tempDir);
+}
+
+// Called once at startup — any job still marked 'running' means the bot
+// went down mid-upload (crash, VPS restart, pm2 respawn). Resuming just
+// re-runs the same worker; already-'done'/'failed'/'skipped_corrupt' files
+// are skipped automatically since only 'pending' entries get processed.
+async function resumeFolderJobs() {
+    const jobs = listRunningFolderJobs();
+    for (const job of jobs) {
+        console.log(`🔁 Resuming folder upload job ${job.id} (${job.folderName})`);
+        queue.add(() => runFolderUploadJob(job.id)).catch(err => logError('Resumed folder upload job', err));
+    }
+}
+
+// ===== MEGA Accounts admin panel =====
+async function renderMegaAccountsPanel(ctx) {
+    const accounts = getMegaAccounts();
+    const now = Date.now();
+    let text = '🔄 *MEGA Accounts*\n\n' +
+        'Multiple accounts let Folder Upload rotate to a fresh one when the current one hits its bandwidth limit, instead of stalling.\n\n';
+    if (accounts.length === 0) {
+        text += '_No accounts added yet — Folder Upload falls back to anonymous access (slower, shared quota) until you add at least one._';
+    } else {
+        text += accounts.map(a => {
+            const status = a.disabledUntil && a.disabledUntil > now
+                ? `⏳ cooldown until ${new Date(a.disabledUntil).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+                : '✅ ready';
+            return `• ${escapeMd(a.label)} — ${status}`;
+        }).join('\n');
+    }
+    const rows = accounts.map(a => [{ text: `❌ Remove ${a.label}`, callback_data: `mfu_acc_del:${a.id}` }]);
+    rows.push([{ text: '➕ Add Account', callback_data: 'mfu_acc_add' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'menu_mega' }]);
+    await sendOrEdit(ctx, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+bot.action('mfu_accounts_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderMegaAccountsPanel(ctx);
+});
+
+bot.action('mfu_acc_add', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'mfu_acc_add_email' };
+    await ctx.editMessageText('📧 Send the MEGA account email to add, or /cancel.', {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mfu_accounts_menu' }]] }
+    });
+});
+
+bot.action(/^mfu_acc_del:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const removed = removeMegaAccount(ctx.match[1]);
+    await ctx.answerCbQuery(removed ? '✅ Removed' : '⚠️ Already gone');
+    await renderMegaAccountsPanel(ctx);
+});
+
+
 bot.action('menu_fileshare', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
@@ -3167,7 +3726,8 @@ async function renderBroadcastMenu(ctx) {
         'Use `/schedulebroadcast YYYY-MM-DD HH:MM text` for scheduled text broadcasts, and `/broadcasthistory` to review past sends.';
     const keyboard = {
         inline_keyboard: [
-            [{ text: '📤 Send Now', callback_data: 'fs_broadcast_send' }, { text: `🔁 Forward: ${config.broadcastForwardMode ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_forward' }],
+            [{ text: '📤 Send Now', callback_data: 'fs_broadcast_send' }],
+            [{ text: `🔁 Forward: ${config.broadcastForwardMode ? 'ON' : 'OFF'}`, callback_data: 'fs_toggle_forward' }],
             [{ text: '📜 History', callback_data: 'fs_broadcast_history' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
@@ -3579,10 +4139,14 @@ async function renderAutopostPanel(ctx) {
     const keyboard = {
         inline_keyboard: [
             [{ text: '➕ Add Source Channel', callback_data: 'ap_setsource_menu' }, { text: '➖ Remove Source Channel', callback_data: 'ap_removesource_menu' }],
-            [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }, { text: '🔍 Verify Destination', callback_data: 'ap_verify_dest' }],
-            [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }, { text: '✏️ Set Caption', callback_data: 'ap_caption' }],
-            [{ text: `🖼 Thumbnail: ${cfg.thumbnailMode === 'custom' ? 'Custom' : 'Video'}`, callback_data: 'ap_thumb_toggle' }, { text: '📤 Upload Thumbnail', callback_data: 'ap_thumb_upload' }],
-            [{ text: `🔵 Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}`, callback_data: 'ap_blur_toggle' }, { text: cfg.enabled ? '⏸ Pause' : '▶️ Enable', callback_data: 'ap_toggle_enabled' }],
+            [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }],
+            [{ text: '🔍 Verify Destination (sends a test message)', callback_data: 'ap_verify_dest' }],
+            [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }],
+            [{ text: '✏️ Set Caption', callback_data: 'ap_caption' }],
+            [{ text: `🖼 Thumbnail Source: ${cfg.thumbnailMode === 'custom' ? 'Custom' : 'Video'}`, callback_data: 'ap_thumb_toggle' }],
+            [{ text: '📤 Upload Custom Thumbnail', callback_data: 'ap_thumb_upload' }],
+            [{ text: `🔵 Blur: ${cfg.blurEnabled ? 'ON' : 'OFF'}`, callback_data: 'ap_blur_toggle' }],
+            [{ text: cfg.enabled ? '⏸ Pause' : '▶️ Enable', callback_data: 'ap_toggle_enabled' }],
             [{ text: '🧪 Test Preview', callback_data: 'ap_test' }, { text: '📊 Stats', callback_data: 'ap_stats' }],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
@@ -4733,6 +5297,113 @@ async function handlePendingAction(ctx, text) {
         return;
     }
 
+    // ===== Folder Upload (Advanced) pending actions =====
+    if (action.type === 'mfu_awaiting_link') {
+        delete pendingAction[userId];
+        const url = mfu.parseMegaFolderUrl(text);
+        if (!url) {
+            await ctx.reply('⚠️ That doesn\'t look like a MEGA *folder* link. It should look like `https://mega.nz/folder/ID#KEY`.', {
+                parse_mode: 'Markdown',
+                reply_markup: { inline_keyboard: [[{ text: '📂 Folder Upload', callback_data: 'mfu_menu' }]] }
+            });
+            return;
+        }
+        let statusMsg;
+        try { statusMsg = await ctx.reply('🔍 Loading folder from MEGA...'); } catch (e) { /* best-effort */ }
+        let root;
+        try {
+            root = await mfu.loadFolderTree(url, null);
+        } catch (error) {
+            const msg = `❌ Couldn't load that folder: ${error.message}`;
+            if (statusMsg) {
+                try { await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, msg); return; } catch (e) { /* fall through */ }
+            }
+            await ctx.reply(msg);
+            return;
+        }
+        folderBrowseState[userId] = { url, nodeStack: [root], pathNames: [] };
+        if (statusMsg) { try { await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id); } catch (e) { /* best-effort */ } }
+        await renderFolderBrowse(ctx, userId);
+        return;
+    }
+
+    if (action.type === 'mfu_ch_manual') {
+        const sel = folderSelection[userId];
+        if (!sel) { delete pendingAction[userId]; await ctx.reply('⚠️ Selection expired. Start again from Folder Upload.'); return; }
+        const identifier = text.trim();
+        if (!identifier) { await ctx.reply('⚠️ Send a chat ID or @username, or /cancel.'); return; }
+        let chat;
+        try {
+            const target = identifier.startsWith('@') || isNaN(identifier) ? identifier : Number(identifier);
+            chat = await ctx.telegram.getChat(target);
+        } catch (error) {
+            await ctx.reply(`❌ Couldn't find that chat (${error.message}). Try again, or /cancel.`);
+            return;
+        }
+        try {
+            await ctx.telegram.getChatMember(chat.id, ctx.botInfo.id);
+        } catch (error) {
+            await ctx.reply(`⚠️ Found "${chat.title}" but I'm not a member/admin there. Add me first, then try again, or /cancel.`);
+            return;
+        }
+        recordKnownChat(chat.id, chat.title, chat.type);
+        sel.destinationType = 'channel';
+        sel.destinationId = chat.id;
+        sel.destinationLabel = chat.title;
+        delete pendingAction[userId];
+        await renderFolderConfirm(ctx);
+        return;
+    }
+
+    if (action.type === 'mfu_cat_new_name') {
+        const sel = folderSelection[userId];
+        if (!sel) { delete pendingAction[userId]; await ctx.reply('⚠️ Selection expired. Start again from Folder Upload.'); return; }
+        const result = createCategory(text, userId);
+        delete pendingAction[userId];
+        if (!result.success) {
+            const reason = result.reason === 'exists' ? 'A category with that name already exists.'
+                : result.reason === 'too_long' ? 'That name is too long (max 64 characters).'
+                : 'Please send a non-empty name.';
+            await ctx.reply(`⚠️ ${reason} Try again.`, {
+                reply_markup: { inline_keyboard: [[{ text: '💎 Pick Category', callback_data: 'mfu_dest_category' }]] }
+            });
+            return;
+        }
+        sel.destinationType = 'category';
+        sel.destinationId = result.category.id;
+        sel.destinationLabel = result.category.name;
+        await renderFolderConfirm(ctx);
+        return;
+    }
+
+    if (action.type === 'mfu_acc_add_email') {
+        const email = text.trim();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            await ctx.reply('⚠️ That doesn\'t look like a valid email. Try again, or /cancel.');
+            return;
+        }
+        pendingAction[userId] = { type: 'mfu_acc_add_password', email };
+        await ctx.reply('🔑 Now send the password for that MEGA account, or /cancel.');
+        return;
+    }
+
+    if (action.type === 'mfu_acc_add_password') {
+        const { email } = action;
+        const password = text;
+        delete pendingAction[userId];
+        const result = addMegaAccount(email, password, email.split('@')[0]);
+        if (!result.success) {
+            await ctx.reply('⚠️ That account is already in the pool.', {
+                reply_markup: { inline_keyboard: [[{ text: '🔄 MEGA Accounts', callback_data: 'mfu_accounts_menu' }]] }
+            });
+            return;
+        }
+        await ctx.reply(`✅ Added MEGA account "${result.account.label}" to the rotation pool.`, {
+            reply_markup: { inline_keyboard: [[{ text: '🔄 MEGA Accounts', callback_data: 'mfu_accounts_menu' }]] }
+        });
+        return;
+    }
+
     if (CUSTOM_FIELD_MAP[action.type]) {
         const { key, label, min } = CUSTOM_FIELD_MAP[action.type];
         const n = parseInt(text.trim(), 10);
@@ -4918,6 +5589,11 @@ bot.telegram.getMe().then(async botInfo => {
     // *during* the downtime (bot was off) gets cleaned up right away instead
     // of waiting for the first 60s tick.
     processDuePendingDeletions().catch(err => logError('Pending deletion startup sweep', err));
+
+    // Any Folder Upload job still marked 'running' means the bot went down
+    // mid-upload last time (crash, VPS restart, pm2 respawn) — pick it back
+    // up rather than leaving it stuck.
+    resumeFolderJobs().catch(err => logError('Folder job resume sweep', err));
 
     bot.launch()
         .catch(err => {

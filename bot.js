@@ -1281,7 +1281,8 @@ async function sendRandomFiles(ctx) {
     if (successfullySent.length > 0) {
         markSeen(ctx.from.id, successfullySent);
         if (config.autoDeleteMinutes > 0) {
-            await ctx.reply(`⏳ These file(s) will auto-delete in ${config.autoDeleteMinutes} minute(s).`, { reply_markup: MY_STATS_KEYBOARD });
+            const notice = await ctx.reply(`⏳ These file(s) will auto-delete in ${config.autoDeleteMinutes} minute(s).`, { reply_markup: MY_STATS_KEYBOARD });
+            scheduleAutoDelete(ctx.chat.id, notice.message_id, config.autoDeleteMinutes);
         } else {
             await ctx.reply('📊 Tap below to check your stats.', { reply_markup: MY_STATS_KEYBOARD });
         }
@@ -1338,7 +1339,8 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
                 config.protectContent ? { protect_content: true } : {});
             scheduleAutoDelete(ctx.chat.id, sent.message_id, config.autoDeleteMinutes);
             if (config.autoDeleteMinutes > 0) {
-                await ctx.reply(`⏳ This file will auto-delete in ${config.autoDeleteMinutes} minute(s).`, { reply_markup: MY_STATS_KEYBOARD });
+                const notice = await ctx.reply(`⏳ This file will auto-delete in ${config.autoDeleteMinutes} minute(s).`, { reply_markup: MY_STATS_KEYBOARD });
+                scheduleAutoDelete(ctx.chat.id, notice.message_id, config.autoDeleteMinutes);
             }
         } catch (error) {
             console.error('Failed to copy single shared file:', error.message);
@@ -2158,15 +2160,16 @@ async function handleRandomRequest(ctx) {
     if (!acquireFileShareLock(userId)) return; // duplicate tap while a request is already in flight — ignore
     try {
         const config = loadConfig();
-        if (config.forceSubGroupIds.length === 0) {
-            await ctx.reply('⚠️ Force-sub group is not configured yet. Please ask the admin.');
-            return;
-        }
 
-        const unjoined = await getUnjoinedGroups(ctx, config.forceSubGroupIds, userId);
-        if (unjoined.length > 0) {
-            await sendJoinPrompt(ctx, unjoined);
-            return;
+        // No force-sub group configured = no force-sub requirement, not "the
+        // bot is unusable" — /start already tells users to just send /random
+        // in that case. Only gate on force-sub when at least one group is set.
+        if (config.forceSubGroupIds.length > 0) {
+            const unjoined = await getUnjoinedGroups(ctx, config.forceSubGroupIds, userId);
+            if (unjoined.length > 0) {
+                await sendJoinPrompt(ctx, unjoined);
+                return;
+            }
         }
 
         const check = checkRandomAllowed(userId, config);

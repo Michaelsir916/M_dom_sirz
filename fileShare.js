@@ -697,6 +697,21 @@ function listRunningFolderJobs() {
     return Object.values(loadFolderJobs()).filter(j => j.status === 'running');
 }
 
+// Every job regardless of status — used by the startup resume sweep, which
+// needs to see paused/stopping jobs too (not just 'running' ones) so it can
+// land them in a clean terminal state after a crash/restart.
+function listAllFolderJobs() {
+    return Object.values(loadFolderJobs());
+}
+
+// Jobs a human would still care about seeing in /uploadjobs — anything not
+// yet finished. Excludes 'done'/'failed' terminal jobs to keep the list short.
+function listActiveFolderJobs() {
+    return Object.values(loadFolderJobs()).filter(j =>
+        ['running', 'pause_requested', 'paused', 'stop_requested', 'cancelled'].includes(j.status)
+    );
+}
+
 function deleteFolderJob(id) {
     const jobs = loadFolderJobs();
     if (!jobs[id]) return false;
@@ -1333,6 +1348,8 @@ module.exports = {
     updateFolderJob,
     getFolderJob,
     listRunningFolderJobs,
+    listAllFolderJobs,
+    listActiveFolderJobs,
     deleteFolderJob,
     findFolderUpload,
     recordFolderUpload

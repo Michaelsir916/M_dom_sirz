@@ -403,6 +403,14 @@ function isAudioFile(filename) {
     return audioExtensions.includes(ext);
 }
 
+// Only video/photo ever go to the configured destination (channel or
+// whichever chat the link was sent in) — anything else (ad files reseller's
+// mix into MEGA folders, random docs/zips/audio, etc.) gets diverted to the
+// admin who sent the link instead of leaking into the public destination.
+function isMediaFile(filename) {
+    return isVideoFile(filename) || isImageFile(filename);
+}
+
 async function sendTelegramFile(ctx, filePath, fileName, fileSize, progressCallback, destinationChatId) {
     const chatId = destinationChatId || ctx.chat.id;
     const sendingElsewhere = destinationChatId && destinationChatId !== ctx.chat.id;
@@ -799,12 +807,19 @@ async function processMegaLink(ctx, megaLink) {
             }
 
             try {
+                const isMedia = isMediaFile(result.name);
+                const actualDestination = isMedia ? uploadDestination : (ctx.from ? ctx.from.id : uploadDestination);
+
                 await sendTelegramFile(ctx, result.path, result.name, result.size, (progress) => {
                     uploadUpdater(progress, result.name, result.size, 1, 1);
-                }, uploadDestination);
+                }, actualDestination);
                 await deleteStatus();
 
-                if (chatType !== 'private') {
+                if (!isMedia && actualDestination !== uploadDestination) {
+                    try {
+                        await ctx.reply(`⚠️ *Not a video/photo file* — sent to you privately instead of the destination.\n\n*File:* \`${result.name}\``, { parse_mode: 'Markdown' });
+                    } catch (e) { /* best-effort */ }
+                } else if (chatType !== 'private') {
                     try {
                         await ctx.reply(`✅ *File sent successfully!*${sendingToChannel ? ' (to your configured channel)' : ''}`);
                     } catch (e) {
@@ -838,6 +853,7 @@ async function processMegaLink(ctx, megaLink) {
 
             let sentCount = 0;
             let failedCount = 0;
+            let nonMediaCount = 0;
             const maxFileSize = 2000 * 1024 * 1024;
 
             let progressMsg;
@@ -870,10 +886,14 @@ async function processMegaLink(ctx, megaLink) {
                         continue;
                     }
 
+                    const isMedia = isMediaFile(file.name);
+                    const actualDestination = isMedia ? uploadDestination : (ctx.from ? ctx.from.id : uploadDestination);
+
                     await sendTelegramFile(ctx, file.path, file.name, file.size, (progress) => {
                         folderUploadUpdater(progress, file.name, file.size, i + 1);
-                    }, uploadDestination);
+                    }, actualDestination);
 
+                    if (!isMedia && actualDestination !== uploadDestination) nonMediaCount++;
                     sentCount++;
 
                     await new Promise(resolve => setTimeout(resolve, 1000));
@@ -901,6 +921,9 @@ async function processMegaLink(ctx, megaLink) {
 
             if (failedCount > 0) {
                 summary += `❌ *Failed/Skipped:* ${failedCount} (files >2GB)\n`;
+            }
+            if (nonMediaCount > 0) {
+                summary += `⚠️ *Non-video/photo files:* ${nonMediaCount} (sent to you privately, not the destination)\n`;
             }
 
             summary += `💾 *Total Size:* ${formatBytes(result.totalSize)}`;
@@ -1202,20 +1225,41 @@ function scheduleAutoDelete(chatId, messageId, minutes) {
 // Picks up to `count` files this user hasn't seen yet, sends them via
 // copyMessage (no forward tag), marks them seen, and self-heals dead entries.
 // Caller must hold this user's fileShareLock (see acquireFileShareLock).
+// Broader than the old single "message to copy not found" check — matches
+// any error that means the source message is permanently gone/unreachable
+// (deleted, bot removed from that chat, etc.), as opposed to a transient
+// network/rate-limit blip that's worth leaving in the pool to retry later.
+function isPermanentCopyError(message) {
+    if (!message) return false;
+    return /message to copy not found|message to forward not found|message_id_invalid|chat not found|have no rights to send|not enough rights|chat_admin_required|bot was kicked|bot is not a member|group chat was deactivated|member list is inaccessible/i.test(message);
+}
+
 async function sendRandomFiles(ctx) {
     const config = loadConfig();
-    const unseen = getUnseenFiles(ctx.from.id);
+    let unseen = getUnseenFiles(ctx.from.id);
 
     if (unseen.length === 0) {
         await ctx.reply('🎉 You\'ve received all the files currently available! Check back later for new ones.', { reply_markup: MY_STATS_KEYBOARD });
         return;
     }
 
-    const shuffled = [...unseen].sort(() => Math.random() - 0.5);
-    const picked = shuffled.slice(0, Math.min(config.shareCount, shuffled.length));
+    const target = Math.min(config.shareCount, unseen.length);
     const successfullySent = [];
+    const attempted = new Set();
+    let lastError = null;
 
-    for (const file of picked) {
+    // Backfill: if a picked file turns out to be dead, try another instead
+    // of just giving up on the whole batch — a few broken pool entries
+    // shouldn't block delivery when good files are still available.
+    let guard = 0;
+    while (successfullySent.length < target && guard < target * 4 + 10) {
+        guard++;
+        const remaining = unseen.filter(f => !attempted.has(`${f.chat_id}:${f.message_id}`));
+        if (remaining.length === 0) break;
+        const file = remaining[Math.floor(Math.random() * remaining.length)];
+        const tag = `${file.chat_id}:${file.message_id}`;
+        attempted.add(tag);
+
         try {
             const sent = await ctx.telegram.copyMessage(ctx.chat.id, file.chat_id, file.message_id,
                 config.protectContent ? { protect_content: true } : {});
@@ -1224,9 +1268,12 @@ async function sendRandomFiles(ctx) {
             scheduleAutoDelete(ctx.chat.id, sent.message_id, config.autoDeleteMinutes);
         } catch (error) {
             console.error('Failed to copy shared file:', error.message);
-            // Original message is gone (deleted) — remove it so it's not picked again
-            if (error.message && error.message.includes('message to copy not found')) {
+            lastError = error.message;
+            // Original message is gone (deleted), or the bot can no longer
+            // reach that chat at all — remove it so it's not picked again.
+            if (isPermanentCopyError(error.message)) {
                 removeSharedFile(file.chat_id, file.message_id);
+                unseen = unseen.filter(f => `${f.chat_id}:${f.message_id}` !== tag);
             }
         }
     }
@@ -1240,6 +1287,9 @@ async function sendRandomFiles(ctx) {
         }
     } else {
         await ctx.reply('❌ Could not send the file(s), please try again.', { reply_markup: MY_STATS_KEYBOARD });
+        if (lastError) {
+            await sendToLogChannel(`⚠️ *Random file delivery failed for every attempt*\n\nLast error: \`${escapeMd(lastError)}\`\n\nCheck the shared file pool — some source messages may be inaccessible.`, 'random_fail');
+        }
     }
 }
 
@@ -1292,7 +1342,7 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
             }
         } catch (error) {
             console.error('Failed to copy single shared file:', error.message);
-            if (error.message && error.message.includes('message to copy not found')) {
+            if (isPermanentCopyError(error.message)) {
                 removeSharedFile(sourceChatId, sourceMessageId);
             }
             await ctx.reply('❌ Sorry, this file is no longer available.');
@@ -1305,12 +1355,9 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
 // --- User-facing: My Stats & Referrals ---
 const MY_STATS_KEYBOARD = {
     inline_keyboard: [
-        [{ text: '💎 Buy VIP', callback_data: 'vip_info' }],
-        [{ text: '🎬 Free Video', callback_data: 'user_random' }],
-        [{ text: '📂 VIP Categories', callback_data: 'user_categories' }],
-        [{ text: '📊 My Stats', callback_data: 'user_mystats' }],
-        [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }],
-        [{ text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
+        [{ text: '💎 Buy VIP', callback_data: 'vip_info' }, { text: '🎬 Free Video', callback_data: 'user_random' }],
+        [{ text: '📂 VIP Categories', callback_data: 'user_categories' }, { text: '📊 My Stats', callback_data: 'user_mystats' }],
+        [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }, { text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
         [{ text: 'ℹ️ About', callback_data: 'user_about' }]
     ]
 };
@@ -1400,7 +1447,16 @@ bot.action('user_about', async (ctx) => {
 // itself (not just here) since callback_data on an old message could in
 // principle be re-tapped after VIP lapses or before force-sub is verified —
 // hiding the button is a UX nicety, not the actual security boundary.
-const CAT_BROWSE_BATCH_SIZE = 5;
+const CAT_BROWSE_BATCH_SIZE = 15;
+
+// Tracks which video ids have already been delivered to a user within one
+// continuous browsing thread for a category (key: "<userId>:<categoryId>").
+// "▶️ Next" filters these out before picking the next batch, so a repeat
+// delivery is structurally impossible rather than just relying on the
+// offset math staying in sync. Cleared when the user restarts the category
+// from offset 0, and swept entirely once it grows too large (best-effort,
+// same pattern as recentLogEntries below).
+const categoryBrowseSeen = {};
 
 async function sendCategoryList(ctx) {
     const categories = listNonEmptyCategories();
@@ -1470,7 +1526,15 @@ bot.action(/^catv_open:(.+):(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
 
     const videos = category.videos;
-    const batch = videos.slice(offset, offset + CAT_BROWSE_BATCH_SIZE);
+    const sessionKey = `${userId}:${categoryId}`;
+    if (offset === 0) categoryBrowseSeen[sessionKey] = new Set(); // restart from the top clears delivery history
+    if (Object.keys(categoryBrowseSeen).length > 5000) {
+        for (const k of Object.keys(categoryBrowseSeen)) delete categoryBrowseSeen[k]; // best-effort memory cap
+    }
+    const seenSet = categoryBrowseSeen[sessionKey] || (categoryBrowseSeen[sessionKey] = new Set());
+
+    const unseenVideos = videos.filter(v => !seenSet.has(v.id));
+    const batch = unseenVideos.slice(0, CAT_BROWSE_BATCH_SIZE);
     if (batch.length === 0) {
         // Category shrank (videos removed) between page taps — nothing left
         // at this offset. Send them back to the start rather than a
@@ -1505,6 +1569,7 @@ bot.action(/^catv_open:(.+):(\d+)$/, async (ctx) => {
                     await ctx.telegram.sendVideo(ctx.chat.id, v.file_id, { ...sendOpts, caption: v.caption || undefined });
                 }
             }
+            seenSet.add(v.id);
         } catch (error) {
             console.error(`Failed to deliver category video ${v.id} in "${category.name}":`, error.message);
             // Storage channel post is gone (deleted) — self-heal by
@@ -1512,17 +1577,21 @@ bot.action(/^catv_open:(.+):(\d+)$/, async (ctx) => {
             if (v.chat_id && v.message_id && error.message && error.message.includes('message to copy not found')) {
                 removeCategoryVideoByMessage(v.chat_id, v.message_id);
             }
+            // Don't add to seenSet — a failed delivery should be retryable
+            // on the next "Next" tap rather than silently skipped forever.
         }
     }
 
+    const remaining = unseenVideos.length - batch.length;
     const nextOffset = offset + CAT_BROWSE_BATCH_SIZE;
+    const delivered = videos.length - remaining;
     const nav = [];
-    if (nextOffset < videos.length) {
-        nav.push({ text: `▶️ Next ${Math.min(CAT_BROWSE_BATCH_SIZE, videos.length - nextOffset)}`, callback_data: `catv_open:${category.id}:${nextOffset}` });
+    if (remaining > 0) {
+        nav.push({ text: `▶️ Next ${Math.min(CAT_BROWSE_BATCH_SIZE, remaining)}`, callback_data: `catv_open:${category.id}:${nextOffset}` });
     }
     nav.push({ text: '📂 All Categories', callback_data: 'user_categories' });
 
-    await ctx.reply(`📁 *${escapeMd(category.name)}* — showing ${Math.min(offset + batch.length, videos.length)}/${videos.length}`, {
+    await ctx.reply(`📁 *${escapeMd(category.name)}* — showing ${delivered}/${videos.length}`, {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [nav] }
     });

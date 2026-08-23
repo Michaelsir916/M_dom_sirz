@@ -13,6 +13,8 @@ const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
 const PROMO_CODES_PATH = path.join(__dirname, 'promo_codes.json');
 const PENDING_DELETIONS_PATH = path.join(__dirname, 'pending_deletions.json');
 const CATEGORIES_PATH = path.join(__dirname, 'categories.json');
+const FOLDER_JOBS_PATH = path.join(__dirname, 'mega_folder_jobs.json');
+const FOLDER_UPLOAD_HISTORY_PATH = path.join(__dirname, 'mega_folder_upload_history.json');
 
 const DEFAULT_CONFIG = {
     forceSubGroupIds: [],   // multiple groups supported
@@ -37,7 +39,8 @@ const DEFAULT_CONFIG = {
     aboutLinkUrl: null,          // url that aboutLinkText links to
     vipChannelLink: null,        // url the "💎 Buy VIP" button sends users to
     vipPromoText: null,          // optional promo copy shown above the Join button
-    categoryStorageChannelId: null // dedicated channel VIP category videos are archived to (see fileShare.js VIP Categories section)
+    categoryStorageChannelId: null, // dedicated channel VIP category videos are archived to (see fileShare.js VIP Categories section)
+    megaAccounts: [] // [{ id, email, password, label, disabledUntil }] — pool used by the Folder Upload feature for account rotation
 };
 
 // ===== Config backup (used by /backupconfig) =====
@@ -56,7 +59,9 @@ const CONFIG_BACKUP_FILES = [
     { path: VIP_CLICKS_PATH, name: 'vip_clicks.json' },
     { path: PROMO_CODES_PATH, name: 'promo_codes.json' },
     { path: PENDING_DELETIONS_PATH, name: 'pending_deletions.json' },
-    { path: CATEGORIES_PATH, name: 'categories.json' }
+    { path: CATEGORIES_PATH, name: 'categories.json' },
+    { path: FOLDER_JOBS_PATH, name: 'mega_folder_jobs.json' },
+    { path: FOLDER_UPLOAD_HISTORY_PATH, name: 'mega_folder_upload_history.json' }
 ];
 
 // Only returns files that actually exist yet (a fresh install may not have
@@ -601,6 +606,130 @@ function getCategoryStats() {
     };
 }
 
+// ===== MEGA Accounts (Folder Upload — multi-account rotation) =====
+// Credentials live in config.json alongside everything else. Passwords are
+// stored in plain text here, same trust model as BOT_TOKEN/API_HASH in
+// .env — anyone with shell access to the VPS already has full control, so
+// this isn't adding a new exposure. Keep the VPS itself locked down.
+function getMegaAccounts() {
+    return loadConfig().megaAccounts || [];
+}
+
+function addMegaAccount(email, password, label) {
+    const config = loadConfig();
+    const accounts = config.megaAccounts || [];
+    if (accounts.some(a => a.email.toLowerCase() === String(email).toLowerCase())) {
+        return { success: false, reason: 'exists' };
+    }
+    const account = {
+        id: genId('acc_'),
+        email: String(email).trim(),
+        password: String(password),
+        label: (label || String(email).trim()).slice(0, 40),
+        disabledUntil: null,
+        addedAt: new Date().toISOString()
+    };
+    accounts.push(account);
+    config.megaAccounts = accounts;
+    saveConfig(config);
+    return { success: true, account };
+}
+
+function removeMegaAccount(id) {
+    const config = loadConfig();
+    const accounts = config.megaAccounts || [];
+    const before = accounts.length;
+    config.megaAccounts = accounts.filter(a => a.id !== id);
+    if (config.megaAccounts.length === before) return false;
+    saveConfig(config);
+    return true;
+}
+
+// Puts an account on cooldown (e.g. after a quota/bandwidth error) so the
+// rotation picker skips it until the cooldown expires.
+function setMegaAccountCooldown(id, untilMs) {
+    const config = loadConfig();
+    const accounts = config.megaAccounts || [];
+    const account = accounts.find(a => a.id === id);
+    if (!account) return false;
+    account.disabledUntil = untilMs;
+    config.megaAccounts = accounts;
+    saveConfig(config);
+    return true;
+}
+
+// ===== Folder Upload jobs (resume-on-failure) =====
+// One job = one admin-selected MEGA subfolder being downloaded + delivered.
+// State is written after every single file so a crash/restart mid-job can
+// pick up exactly where it left off instead of re-downloading everything.
+function loadFolderJobs() {
+    return safeReadJson(FOLDER_JOBS_PATH, {});
+}
+
+function saveFolderJobs(jobs) {
+    atomicWrite(FOLDER_JOBS_PATH, jobs);
+}
+
+function createFolderJob(job) {
+    const jobs = loadFolderJobs();
+    jobs[job.id] = job;
+    saveFolderJobs(jobs);
+    return job;
+}
+
+function updateFolderJob(id, patch) {
+    const jobs = loadFolderJobs();
+    if (!jobs[id]) return null;
+    jobs[id] = { ...jobs[id], ...patch };
+    saveFolderJobs(jobs);
+    return jobs[id];
+}
+
+function getFolderJob(id) {
+    return loadFolderJobs()[id] || null;
+}
+
+function listRunningFolderJobs() {
+    return Object.values(loadFolderJobs()).filter(j => j.status === 'running');
+}
+
+function deleteFolderJob(id) {
+    const jobs = loadFolderJobs();
+    if (!jobs[id]) return false;
+    delete jobs[id];
+    saveFolderJobs(jobs);
+    return true;
+}
+
+// ===== Folder upload history (duplicate detection) =====
+// Keyed by the MEGA folder's own node handle (stable per folder regardless
+// of how the admin navigated to it) + the destination, so re-uploading the
+// exact same folder to the exact same place is what gets flagged — sending
+// it to a *different* channel/category a second time is allowed silently.
+function loadFolderUploadHistory() {
+    return safeReadJson(FOLDER_UPLOAD_HISTORY_PATH, {});
+}
+
+function saveFolderUploadHistory(history) {
+    atomicWrite(FOLDER_UPLOAD_HISTORY_PATH, history);
+}
+
+function folderHistoryKey(folderNodeId, destinationType, destinationId) {
+    return `${folderNodeId}:${destinationType}:${destinationId}`;
+}
+
+function findFolderUpload(folderNodeId, destinationType, destinationId) {
+    const history = loadFolderUploadHistory();
+    return history[folderHistoryKey(folderNodeId, destinationType, destinationId)] || null;
+}
+
+function recordFolderUpload(folderNodeId, destinationType, destinationId, meta) {
+    const history = loadFolderUploadHistory();
+    const key = folderHistoryKey(folderNodeId, destinationType, destinationId);
+    history[key] = { ...meta, uploadedAt: new Date().toISOString() };
+    saveFolderUploadHistory(history);
+}
+
 // Returns THIS user's own /random stats (not admin-wide): files received,
 // cooldown remaining, daily-limit remaining. Read-only, does not persist.
 function getUserStats(userId, cooldownSeconds, dailyLimit) {
@@ -690,23 +819,6 @@ function getTopReferrers(limit = 3) {
         .filter(r => r.count > 0)
         .sort((a, b) => b.count - a.count)
         .slice(0, limit);
-}
-
-// This user's position on the all-time referral leaderboard (1-based), plus
-// their count. Ties share the same rank (standard competition ranking).
-// Returns rank: null if they have zero referrals — not worth ranking.
-function getReferrerRank(userId) {
-    const users = loadUsers();
-    const ranked = Object.entries(users)
-        .map(([id, u]) => ({ id, count: (u.referrals || []).length }))
-        .filter(r => r.count > 0)
-        .sort((a, b) => b.count - a.count);
-    const key = String(userId);
-    const idx = ranked.findIndex(r => r.id === key);
-    if (idx === -1) return { rank: null, count: 0 };
-    const count = ranked[idx].count;
-    const rank = ranked.findIndex(r => r.count === count) + 1; // first index with this count
-    return { rank, count };
 }
 
 // ===== Known Chats (groups/channels the bot has seen) =====
@@ -1149,7 +1261,6 @@ module.exports = {
     getUsersJoinedSince,
     getFilesAddedSince,
     getTopReferrers,
-    getReferrerRank,
     getUserStats,
     isNewUser,
     registerReferral,
@@ -1209,5 +1320,16 @@ module.exports = {
     addVideoToCategory,
     removeVideoFromCategory,
     removeCategoryVideoByMessage,
-    getCategoryStats
+    getCategoryStats,
+    getMegaAccounts,
+    addMegaAccount,
+    removeMegaAccount,
+    setMegaAccountCooldown,
+    createFolderJob,
+    updateFolderJob,
+    getFolderJob,
+    listRunningFolderJobs,
+    deleteFolderJob,
+    findFolderUpload,
+    recordFolderUpload
 };

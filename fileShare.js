@@ -232,13 +232,15 @@ function recordRequest(userId, cooldownSeconds, dailyLimit) {
     const users = loadUsers();
     const key = String(userId);
     const u = getUser(users, key);
-    if (u.blocked) u.blocked = false; // they're back — clear the stale block flag
+    let dirty = false;
+    if (u.blocked) { u.blocked = false; dirty = true; } // they're back — clear the stale block flag
     const now = Date.now();
     const today = new Date().toISOString().slice(0, 10);
 
     if (cooldownSeconds > 0 && u.lastRequestAt) {
         const elapsedSec = (now - u.lastRequestAt) / 1000;
         if (elapsedSec < cooldownSeconds) {
+            if (dirty) { users[key] = u; saveUsers(users); } // still persist the unblock even though this request is denied
             return { allowed: false, reason: 'cooldown', retryAfter: Math.ceil(cooldownSeconds - elapsedSec) };
         }
     }
@@ -246,9 +248,11 @@ function recordRequest(userId, cooldownSeconds, dailyLimit) {
     if (u.dailyDate !== today) {
         u.dailyDate = today;
         u.dailyCount = 0;
+        dirty = true;
     }
 
     if (dailyLimit > 0 && u.dailyCount >= dailyLimit) {
+        if (dirty) { users[key] = u; saveUsers(users); }
         return { allowed: false, reason: 'daily_limit' };
     }
 

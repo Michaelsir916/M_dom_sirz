@@ -93,6 +93,8 @@ const {
     updateFolderJob,
     getFolderJob,
     listRunningFolderJobs,
+    listAllFolderJobs,
+    listActiveFolderJobs,
     deleteFolderJob,
     findFolderUpload,
     recordFolderUpload
@@ -2316,6 +2318,7 @@ bot.action('menu_mega', async (ctx) => {
             reply_markup: {
                 inline_keyboard: [
                     [{ text: '📂 Folder Upload (Advanced)', callback_data: 'mfu_menu' }],
+                    [{ text: '📋 Active Jobs', callback_data: 'mfu_jobs_list' }],
                     [{ text: '🔄 MEGA Accounts', callback_data: 'mfu_accounts_menu' }],
                     [{ text: '🔙 Back', callback_data: 'menu_back' }]
                 ]
@@ -3012,6 +3015,231 @@ function knownChatPickerKeyboard(excludeIds, prefix, backCallback, adminId) {
 // from disk without needing this in-memory state at all.
 const folderSelection = {};
 
+// ---- Pause / Resume / Stop / Speed controls for folder-upload jobs ----
+// A job's `status` field drives everything: 'running' means the worker in
+// runFolderUploadJob() is actively looping through files. Pause/Stop don't
+// touch the worker directly (there's no shared JS scope to reach into once a
+// job may have resumed after a restart) — they just write an intent
+// ('pause_requested' / 'stop_requested') to disk, which the worker checks at
+// the top of every file iteration and resolves into a terminal 'paused' or
+// 'cancelled' state. This keeps pause/stop crash-safe for free: if the bot
+// restarts before the worker notices, resumeFolderJobs() below finishes the
+// job off the same way at startup.
+const UPLOAD_SPEED_PRESETS = [
+    { label: '🐇 Fast', delayMs: 300 },
+    { label: '🚶 Normal', delayMs: 800 },
+    { label: '🐢 Slow', delayMs: 2000 }
+];
+
+function speedLabelForDelay(delayMs) {
+    const preset = UPLOAD_SPEED_PRESETS.find(p => p.delayMs === delayMs);
+    return preset ? preset.label : `${delayMs}ms`;
+}
+
+function nextSpeedPreset(currentDelayMs) {
+    const idx = UPLOAD_SPEED_PRESETS.findIndex(p => p.delayMs === currentDelayMs);
+    return UPLOAD_SPEED_PRESETS[(idx + 1) % UPLOAD_SPEED_PRESETS.length];
+}
+
+function formatDuration(ms) {
+    if (!ms || ms <= 0) return '—';
+    const totalSec = Math.round(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function jobStatusEmoji(status) {
+    return {
+        running: '📤', pause_requested: '⏸', paused: '⏸',
+        stop_requested: '⏹', cancelled: '⏹', done: '✅', failed: '❌'
+    }[status] || '•';
+}
+
+// Single source of truth for the progress text, reused by the live progress
+// message, the /uploadjobs detail view, and every button-tap refresh — so
+// all three always show the exact same thing.
+function buildJobProgressText(job, extra = {}) {
+    const { accountLabel, speedFilesPerMin, etaMs } = extra;
+    const statusLine = {
+        running: '📤 Uploading',
+        pause_requested: '⏸ Pausing after current file…',
+        paused: '⏸ Paused',
+        stop_requested: '⏹ Stopping after current file…',
+        cancelled: '⏹ Stopped',
+        done: '✅ Complete',
+        failed: '❌ Failed to start'
+    }[job.status] || '📤 Uploading';
+
+    let text = `${statusLine}\n\n📁 ${escapeMd(job.folderName)}\n` +
+        `📤 Destination: ${job.destinationType === 'category' ? '💎' : '📢'} ${escapeMd(job.destinationLabel)}\n` +
+        `✅ Sent: ${job.sentCount}/${job.files.length}\n` +
+        `❌ Failed: ${job.failedCount}\n` +
+        `⏭ Skipped: ${job.skippedCount}\n` +
+        `⚡ Speed setting: ${speedLabelForDelay(job.delayMs || 800)}`;
+    if (accountLabel) text += `\n🔐 Account: ${escapeMd(accountLabel)}`;
+    if (speedFilesPerMin) text += `\n📈 Rate: ${speedFilesPerMin} files/min`;
+    if (etaMs != null && job.status === 'running') text += `\n⏳ ETA: ${formatDuration(etaMs)}`;
+    return text;
+}
+
+function jobControlKeyboard(jobId, status) {
+    if (status === 'paused') {
+        return { inline_keyboard: [
+            [{ text: '▶️ Resume', callback_data: `mfu_resume:${jobId}` }, { text: '⏹ Stop', callback_data: `mfu_stop:${jobId}` }],
+            [{ text: '⚡ Speed', callback_data: `mfu_speed:${jobId}` }]
+        ] };
+    }
+    if (status === 'cancelled') {
+        return { inline_keyboard: [
+            [{ text: '▶️ Resume', callback_data: `mfu_resume:${jobId}` }, { text: '🗑 Delete', callback_data: `mfu_job_delete:${jobId}` }]
+        ] };
+    }
+    if (status === 'done' || status === 'failed') {
+        return { inline_keyboard: [[{ text: '🗑 Delete', callback_data: `mfu_job_delete:${jobId}` }]] };
+    }
+    // running / pause_requested / stop_requested
+    return { inline_keyboard: [
+        [{ text: '⏸ Pause', callback_data: `mfu_pause:${jobId}` }, { text: '⏹ Stop', callback_data: `mfu_stop:${jobId}` }],
+        [{ text: '⚡ Speed', callback_data: `mfu_speed:${jobId}` }]
+    ] };
+}
+
+// Re-renders whichever message the tapped button lives on — works for both
+// the live progress message in the upload chat and the /uploadjobs detail
+// view, since both are built from the same buildJobProgressText().
+async function refreshJobMessage(ctx, job) {
+    if (!job) return;
+    try {
+        await ctx.editMessageText(
+            buildJobProgressText(job, {}),
+            { parse_mode: 'Markdown', reply_markup: jobControlKeyboard(job.id, job.status) }
+        );
+    } catch (e) { /* not modified, or message gone — ignore */ }
+}
+
+async function renderJobsList(ctx) {
+    const jobs = listActiveFolderJobs().sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    if (jobs.length === 0) {
+        await sendOrEdit(ctx, '📋 *Active Folder Jobs*\n\n_No running, paused, or stopped jobs right now._', {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [[{ text: '📂 Folder Upload', callback_data: 'mfu_menu' }]] }
+        });
+        return;
+    }
+    const rows = jobs.map(j => [{
+        text: `${jobStatusEmoji(j.status)} ${j.folderName} (${j.sentCount}/${j.files.length})`.slice(0, 64),
+        callback_data: `mfu_job_view:${j.id}`
+    }]);
+    rows.push([{ text: '🔄 Refresh', callback_data: 'mfu_jobs_list' }]);
+    await sendOrEdit(ctx, '📋 *Active Folder Jobs*\n\n_Tap a job to view and control it._',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+async function renderJobDetail(ctx, jobId) {
+    const job = getFolderJob(jobId);
+    if (!job) {
+        await sendOrEdit(ctx, '⚠️ Job not found — it may have been deleted.', {
+            reply_markup: { inline_keyboard: [[{ text: '📋 Active Jobs', callback_data: 'mfu_jobs_list' }]] }
+        });
+        return;
+    }
+    const keyboard = jobControlKeyboard(jobId, job.status);
+    keyboard.inline_keyboard.push([{ text: '📋 Back to List', callback_data: 'mfu_jobs_list' }]);
+    await sendOrEdit(ctx, buildJobProgressText(job, {}), { parse_mode: 'Markdown', reply_markup: keyboard });
+}
+
+bot.command('uploadjobs', async (ctx) => {
+    if (!(await requireAdmin(ctx))) return;
+    await renderJobsList(ctx);
+});
+
+bot.action('mfu_jobs_list', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderJobsList(ctx);
+});
+
+bot.action(/^mfu_job_view:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderJobDetail(ctx, ctx.match[1]);
+});
+
+bot.action(/^mfu_pause:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const jobId = ctx.match[1];
+    const job = getFolderJob(jobId);
+    if (!job) { await ctx.answerCbQuery('⚠️ Job not found.'); return; }
+    if (job.status !== 'running') { await ctx.answerCbQuery(`⚠️ Can't pause — job is ${job.status}.`); return; }
+    const updated = updateFolderJob(jobId, { status: 'pause_requested' });
+    await ctx.answerCbQuery('⏸ Pausing after the current file…');
+    await refreshJobMessage(ctx, updated);
+});
+
+bot.action(/^mfu_resume:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const jobId = ctx.match[1];
+    const job = getFolderJob(jobId);
+    if (!job) { await ctx.answerCbQuery('⚠️ Job not found.'); return; }
+    // Only resume from a confirmed-stopped state — 'pause_requested'/'stop_requested'
+    // may still have a worker actively looping, and starting a second worker
+    // for the same job would race on the same files.
+    if (!['paused', 'cancelled'].includes(job.status)) {
+        await ctx.answerCbQuery(`⚠️ Job is ${job.status} — wait a moment and try again.`);
+        return;
+    }
+    const updated = updateFolderJob(jobId, { status: 'running' });
+    await ctx.answerCbQuery('▶️ Resuming…');
+    await refreshJobMessage(ctx, updated);
+    queue.add(() => runFolderUploadJob(jobId)).catch(err => logError('Resumed folder upload job', err));
+});
+
+bot.action(/^mfu_stop:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const jobId = ctx.match[1];
+    const job = getFolderJob(jobId);
+    if (!job) { await ctx.answerCbQuery('⚠️ Job not found.'); return; }
+    if (job.status === 'paused') {
+        // Confirmed no worker is running for this job — finalize right away
+        // instead of setting a flag that nothing will ever check.
+        const tempDir = path.join(os.tmpdir(), 'mega-folder-jobs', jobId);
+        cleanupFolder(tempDir);
+        const updated = updateFolderJob(jobId, { status: 'cancelled', finishedAt: new Date().toISOString() });
+        await ctx.answerCbQuery('⏹ Stopped');
+        await refreshJobMessage(ctx, updated);
+        return;
+    }
+    if (!['running', 'pause_requested', 'stop_requested'].includes(job.status)) {
+        await ctx.answerCbQuery(`⚠️ Job is already ${job.status}.`);
+        return;
+    }
+    const updated = updateFolderJob(jobId, { status: 'stop_requested' });
+    await ctx.answerCbQuery('⏹ Stopping after the current file…');
+    await refreshJobMessage(ctx, updated);
+});
+
+bot.action(/^mfu_speed:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const jobId = ctx.match[1];
+    const job = getFolderJob(jobId);
+    if (!job) { await ctx.answerCbQuery('⚠️ Job not found.'); return; }
+    const next = nextSpeedPreset(job.delayMs || 800);
+    const updated = updateFolderJob(jobId, { delayMs: next.delayMs });
+    await ctx.answerCbQuery(`⚡ Speed set to ${next.label}`);
+    await refreshJobMessage(ctx, updated);
+});
+
+bot.action(/^mfu_job_delete:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const jobId = ctx.match[1];
+    const tempDir = path.join(os.tmpdir(), 'mega-folder-jobs', jobId);
+    cleanupFolder(tempDir);
+    deleteFolderJob(jobId);
+    await ctx.answerCbQuery('🗑 Deleted');
+    await renderJobsList(ctx);
+});
+
 // Works whether called from a button tap (edits the existing message) or
 // from a plain text reply (sends a new message) — both happen in this flow,
 // since a MEGA link / category name / channel ID can arrive as free text.
@@ -3295,7 +3523,9 @@ bot.action('mfu_confirm', async (ctx) => {
         createdAt: new Date().toISOString(),
         sentCount: 0,
         failedCount: 0,
-        skippedCount: 0
+        skippedCount: 0,
+        delayMs: 800,
+        progressMsgId: null
     };
     createFolderJob(job);
 
@@ -3340,9 +3570,13 @@ async function getFolderNodeForJob(job, excludeAccountIds) {
 // files that come down corrupt, then delivers each successfully-downloaded
 // file straight to the destination and persists progress to disk after
 // every single file so a crash mid-job loses at most the one in-flight file.
+// Pause/Stop are checked fresh from disk at the top of every file iteration
+// (see the Pause/Resume/Stop/Speed controls block above) so a button tap
+// takes effect within one file, never mid-download.
 async function runFolderUploadJob(jobId) {
     let job = getFolderJob(jobId);
     if (!job) return;
+    if (job.delayMs == null) job.delayMs = 800; // backward-compat for jobs created before speed control existed
 
     const tempDir = path.join(os.tmpdir(), 'mega-folder-jobs', jobId);
     if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
@@ -3350,6 +3584,7 @@ async function runFolderUploadJob(jobId) {
     const triedAccountIds = [];
     let folderNode = null;
     let currentAccount = null;
+    const fileDurations = []; // rolling window of recent per-file times (ms) — powers the speed/ETA display
 
     async function reloadTree() {
         const { target, account } = await getFolderNodeForJob(job, triedAccountIds);
@@ -3366,31 +3601,94 @@ async function runFolderUploadJob(jobId) {
         return;
     }
 
-    let progressMsgId = null;
-    let lastProgressEdit = 0;
-    try {
-        const msg = await bot.telegram.sendMessage(job.chatId,
-            `📤 *Uploading Folder*\n\n📁 ${escapeMd(job.folderName)}\n✅ Sent: 0/${job.files.length}`, { parse_mode: 'Markdown' });
-        progressMsgId = msg.message_id;
-    } catch (e) { /* continue without a live progress message */ }
+    job = updateFolderJob(jobId, { status: 'running' }) || job;
 
-    async function editProgress() {
+    function accountLabel() {
+        return currentAccount ? currentAccount.label : 'Anonymous';
+    }
+
+    function computeSpeedAndEta(remaining) {
+        if (fileDurations.length === 0) return { speedFilesPerMin: null, etaMs: null };
+        const avgMs = fileDurations.reduce((a, b) => a + b, 0) / fileDurations.length;
+        return {
+            speedFilesPerMin: avgMs > 0 ? Math.max(1, Math.round(60000 / avgMs)) : null,
+            etaMs: avgMs * remaining
+        };
+    }
+
+    // Reuse the same progress message across pause/resume cycles instead of
+    // spamming a new one every time the job restarts.
+    let progressMsgId = job.progressMsgId || null;
+    let lastProgressEdit = 0;
+
+    if (progressMsgId) {
+        try {
+            await bot.telegram.editMessageText(job.chatId, progressMsgId, null,
+                buildJobProgressText(job, { accountLabel: accountLabel() }),
+                { parse_mode: 'Markdown', reply_markup: jobControlKeyboard(jobId, 'running') }
+            );
+        } catch (e) {
+            if (!isMessageNotModifiedError(e)) progressMsgId = null; // message gone — fall through to send a fresh one
+        }
+    }
+    if (!progressMsgId) {
+        try {
+            const msg = await bot.telegram.sendMessage(job.chatId,
+                buildJobProgressText(job, { accountLabel: accountLabel() }),
+                { parse_mode: 'Markdown', reply_markup: jobControlKeyboard(jobId, 'running') });
+            progressMsgId = msg.message_id;
+            job = updateFolderJob(jobId, { progressMsgId }) || job;
+        } catch (e) { /* continue without a live progress message */ }
+    }
+
+    async function editProgress(remaining) {
         if (!progressMsgId) return;
         const now = Date.now();
         if (now - lastProgressEdit < 3000) return;
         lastProgressEdit = now;
+        const { speedFilesPerMin, etaMs } = computeSpeedAndEta(remaining);
         try {
             await bot.telegram.editMessageText(job.chatId, progressMsgId, null,
-                `📤 *Uploading Folder*\n\n📁 ${escapeMd(job.folderName)}\n✅ Sent: ${job.sentCount}/${job.files.length}\n❌ Failed: ${job.failedCount}\n⏭ Skipped: ${job.skippedCount}`,
-                { parse_mode: 'Markdown' }
+                buildJobProgressText(job, { accountLabel: accountLabel(), speedFilesPerMin, etaMs }),
+                { parse_mode: 'Markdown', reply_markup: jobControlKeyboard(jobId, job.status) }
+            ).catch(() => {});
+        } catch (e) { /* ignore */ }
+    }
+
+    // Ends the run early because the admin paused or stopped the job.
+    // Everything already on disk (file statuses, counts) is left exactly as
+    // is — resuming just calls this same function again, which picks up the
+    // first 'pending' file where this run left off.
+    async function finalizeInterrupted(finalStatus) {
+        job = updateFolderJob(jobId, { status: finalStatus }) || job;
+        if (!progressMsgId) return;
+        try {
+            await bot.telegram.editMessageText(job.chatId, progressMsgId, null,
+                buildJobProgressText(job, { accountLabel: accountLabel() }),
+                { parse_mode: 'Markdown', reply_markup: jobControlKeyboard(jobId, finalStatus) }
             ).catch(() => {});
         } catch (e) { /* ignore */ }
     }
 
     for (let i = 0; i < job.files.length; i++) {
+        // Fresh read from disk — picks up a Pause/Stop tap that landed since
+        // the last file finished (the button handlers write straight to disk).
+        const liveJob = getFolderJob(jobId);
+        if (!liveJob || liveJob.status === 'stop_requested') {
+            cleanupFolder(tempDir);
+            await finalizeInterrupted('cancelled');
+            return;
+        }
+        if (liveJob.status === 'pause_requested') {
+            await finalizeInterrupted('paused');
+            return;
+        }
+        job = liveJob;
+
         const fileEntry = job.files[i];
         if (fileEntry.status !== 'pending') continue; // already handled in a previous run — resume skips these
 
+        const fileStartedAt = Date.now();
         const destPath = path.join(tempDir, `${i}_${mfu.sanitizeFilename(fileEntry.name)}`);
         let result = null;
         const maxAttempts = Math.max(1, getMegaAccounts().length) + 1;
@@ -3464,9 +3762,15 @@ async function runFolderUploadJob(jobId) {
         if (fileEntry.status === 'skipped_corrupt') job.skippedCount++;
         else if (fileEntry.status === 'failed') job.failedCount++;
 
+        fileDurations.push(Date.now() - fileStartedAt);
+        if (fileDurations.length > 10) fileDurations.shift(); // keep the window recent so speed/ETA react to changing conditions
+
         job = updateFolderJob(jobId, { files: job.files, sentCount: job.sentCount, failedCount: job.failedCount, skippedCount: job.skippedCount }) || job;
-        await editProgress();
-        await new Promise(r => setTimeout(r, 800));
+        await editProgress(job.files.length - (i + 1));
+
+        // Re-read delayMs each time in case the admin changed the Speed preset mid-run
+        const currentDelay = (getFolderJob(jobId) || job).delayMs || 800;
+        await new Promise(r => setTimeout(r, currentDelay));
     }
 
     job = updateFolderJob(jobId, { status: 'done', finishedAt: new Date().toISOString() }) || job;
@@ -3490,15 +3794,30 @@ async function runFolderUploadJob(jobId) {
     cleanupFolder(tempDir);
 }
 
-// Called once at startup — any job still marked 'running' means the bot
-// went down mid-upload (crash, VPS restart, pm2 respawn). Resuming just
-// re-runs the same worker; already-'done'/'failed'/'skipped_corrupt' files
-// are skipped automatically since only 'pending' entries get processed.
+// Called once at startup. Sweeps every job, not just 'running' ones, because
+// a Pause/Stop tap right before a crash can leave a job stuck in the
+// intermediate 'pause_requested'/'stop_requested' state with no worker left
+// alive to ever resolve it — this finishes that resolution directly since
+// nothing is actually running at boot time. A genuinely 'running' job just
+// gets its worker re-launched; already-'done'/'failed'/'skipped_corrupt'
+// files are skipped automatically since only 'pending' entries get processed.
+// Jobs already 'paused' or 'cancelled' are left alone on purpose — they
+// should never silently auto-resume after a restart, only on an explicit tap.
 async function resumeFolderJobs() {
-    const jobs = listRunningFolderJobs();
+    const jobs = listAllFolderJobs();
     for (const job of jobs) {
-        console.log(`🔁 Resuming folder upload job ${job.id} (${job.folderName})`);
-        queue.add(() => runFolderUploadJob(job.id)).catch(err => logError('Resumed folder upload job', err));
+        if (job.status === 'running') {
+            console.log(`🔁 Resuming folder upload job ${job.id} (${job.folderName})`);
+            queue.add(() => runFolderUploadJob(job.id)).catch(err => logError('Resumed folder upload job', err));
+        } else if (job.status === 'pause_requested') {
+            console.log(`⏸ Landing pause-in-progress job ${job.id} (${job.folderName}) as paused after restart`);
+            updateFolderJob(job.id, { status: 'paused' });
+        } else if (job.status === 'stop_requested') {
+            console.log(`⏹ Landing stop-in-progress job ${job.id} (${job.folderName}) as cancelled after restart`);
+            const tempDir = path.join(os.tmpdir(), 'mega-folder-jobs', job.id);
+            cleanupFolder(tempDir);
+            updateFolderJob(job.id, { status: 'cancelled', finishedAt: new Date().toISOString() });
+        }
     }
 }
 

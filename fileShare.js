@@ -340,6 +340,21 @@ function grantVip(userId, days, source, code) {
     return u.vipExpiresAt;
 }
 
+// Same as grantVip but takes a raw millisecond duration instead of whole
+// days — needed since promo codes can now grant minutes/hours, not just
+// day-granularity VIP. durationMs <= 0 = unlimited (never expires).
+function grantVipMs(userId, durationMs, source, code) {
+    const users = loadUsers();
+    const key = String(userId);
+    const u = getUser(users, key);
+    u.vipExpiresAt = durationMs > 0 ? Date.now() + durationMs : -1;
+    u.vipSource = source || 'manual';
+    u.vipCode = code || null;
+    users[key] = u;
+    saveUsers(users);
+    return u.vipExpiresAt;
+}
+
 function revokeVip(userId) {
     const users = loadUsers();
     const key = String(userId);
@@ -377,34 +392,89 @@ function getVipInfo(userId) {
 
 // ===== Promo codes (admin-created, redeemed by users for VIP access) =====
 function loadPromoCodes() {
-    return safeReadJson(PROMO_CODES_PATH, {});
+    const raw = safeReadJson(PROMO_CODES_PATH, {});
+    for (const key of Object.keys(raw)) normalizePromoCode(raw[key]);
+    return raw;
+}
+
+// Migrates a code entry read from disk to the current shape in place.
+// Old codes only have an integer `days` field — convert that to durationMs
+// once, here, so every other function only ever has to deal with durationMs.
+function normalizePromoCode(entry) {
+    if (entry.durationMs === undefined) {
+        entry.durationMs = entry.days > 0 ? entry.days * 24 * 60 * 60 * 1000 : 0;
+    }
+    if (entry.redeemByMs === undefined) entry.redeemByMs = null;
+    if (entry.campaign === undefined) entry.campaign = null;
+    if (entry.batchId === undefined) entry.batchId = null;
+    return entry;
 }
 
 function savePromoCodes(codes) {
     atomicWrite(PROMO_CODES_PATH, codes);
 }
 
-// days: 0 = unlimited VIP when redeemed. maxUses: 0 = unlimited redemptions.
-function createPromoCode(code, days, maxUses, createdBy) {
-    // Strip anything that isn't alnum/underscore/dash — promo codes are
-    // meant to be simple tokens anyway, and this also guarantees the code
-    // can never contain a backtick, which would otherwise break out of the
-    // `` `code` `` span used to display it in the admin panel.
-    const key = String(code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
-    if (!key) return { success: false, reason: 'empty' };
+// Unambiguous character set — no 0/O or 1/I, so a code read aloud or typed
+// from a screenshot doesn't get mistyped.
+const PROMO_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function generateCodeToken(prefix) {
+    let token = '';
+    for (let i = 0; i < 6; i++) token += PROMO_CODE_CHARS[Math.floor(Math.random() * PROMO_CODE_CHARS.length)];
+    const cleanPrefix = prefix ? String(prefix).trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '') : '';
+    return cleanPrefix ? `${cleanPrefix}-${token}` : token;
+}
+
+// durationMs: 0 = unlimited/lifetime VIP when redeemed. maxUses: 0 = unlimited
+// redemptions. Pass `code: null` to auto-generate one instead of a
+// caller-chosen string (optionally under `prefix`, e.g. "GIVEAWAY-X7K9P2").
+// redeemByMs: optional deadline after which the code itself can no longer be
+// redeemed at all, separate from how long the VIP it grants lasts.
+function createPromoCode({ code = null, durationMs = 0, maxUses = 0, createdBy, redeemByMs = null, campaign = null, batchId = null, prefix = null }) {
     const codes = loadPromoCodes();
-    if (codes[key]) return { success: false, reason: 'exists' };
+    let key;
+    if (code) {
+        // Strip anything that isn't alnum/underscore/dash — also guarantees
+        // the code can never contain a backtick, which would otherwise break
+        // out of the `` `code` `` span used to display it in the admin panel.
+        key = String(code).trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+        if (!key) return { success: false, reason: 'empty' };
+        if (codes[key]) return { success: false, reason: 'exists' };
+    } else {
+        let attempts = 0;
+        do {
+            key = generateCodeToken(prefix);
+            attempts++;
+        } while (codes[key] && attempts < 25);
+        if (codes[key]) return { success: false, reason: 'generation_failed' };
+    }
 
     codes[key] = {
         code: key,
-        days: days > 0 ? days : 0,
+        durationMs: durationMs > 0 ? durationMs : 0,
         maxUses: maxUses > 0 ? maxUses : 0,
         usedBy: [],
         createdBy: String(createdBy),
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        redeemByMs: redeemByMs || null,
+        campaign: campaign || null,
+        batchId: batchId || null
     };
     savePromoCodes(codes);
     return { success: true, code: codes[key] };
+}
+
+// Creates `count` codes in one go, all sharing a generated batchId so they
+// can be pulled back together afterwards (see listPromoCodesByBatch). Always
+// auto-generates each code's token — a bulk batch of caller-chosen strings
+// doesn't make sense.
+function createPromoCodeBatch(count, { durationMs = 0, maxUses = 0, createdBy, redeemByMs = null, campaign = null, prefix = null }) {
+    const batchId = `batch_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+    const created = [];
+    for (let i = 0; i < count; i++) {
+        const result = createPromoCode({ code: null, durationMs, maxUses, createdBy, redeemByMs, campaign, batchId, prefix });
+        if (result.success) created.push(result.code);
+    }
+    return { batchId, codes: created };
 }
 
 function deletePromoCode(code) {
@@ -420,13 +490,22 @@ function listPromoCodes() {
     return Object.values(loadPromoCodes()).sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 }
 
-// Redeems a code for a user: validates existence, use-limit, and that this
-// user hasn't already redeemed this specific code, then grants VIP.
+function listPromoCodesByBatch(batchId) {
+    return Object.values(loadPromoCodes()).filter(c => c.batchId === batchId);
+}
+
+// Redeems a code for a user: validates existence, the code's own redeem-by
+// deadline (if any), the use-limit, and that this user hasn't already
+// redeemed this specific code — then grants VIP for the code's durationMs.
 function redeemPromoCode(userId, code) {
     const key = String(code).trim().toUpperCase();
     const codes = loadPromoCodes();
     const entry = codes[key];
     if (!entry) return { success: false, reason: 'not_found' };
+
+    if (entry.redeemByMs && Date.now() > entry.redeemByMs) {
+        return { success: false, reason: 'expired' };
+    }
 
     const userKey = String(userId);
     if (entry.usedBy.some(u => u.userId === userKey)) {
@@ -440,8 +519,8 @@ function redeemPromoCode(userId, code) {
     codes[key] = entry;
     savePromoCodes(codes);
 
-    const expiresAt = grantVip(userId, entry.days, 'promo', key);
-    return { success: true, days: entry.days, unlimited: entry.days === 0, expiresAt };
+    const expiresAt = grantVipMs(userId, entry.durationMs, 'promo', key);
+    return { success: true, durationMs: entry.durationMs, unlimited: entry.durationMs === 0, expiresAt, code: key };
 }
 
 // ===== VIP Categories (admin-curated video categories, VIP-only access) =====
@@ -1320,12 +1399,15 @@ module.exports = {
     recordVipClick,
     getVipStats,
     grantVip,
+    grantVipMs,
     revokeVip,
     isUserVip,
     getVipInfo,
     createPromoCode,
+    createPromoCodeBatch,
     deletePromoCode,
     listPromoCodes,
+    listPromoCodesByBatch,
     redeemPromoCode,
     schedulePendingDeletion,
     getDuePendingDeletions,

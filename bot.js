@@ -62,7 +62,6 @@ const {
     removeMaintenanceWhitelist,
     getMaintenanceWhitelist,
     getConfigBackupFiles,
-    recordVipClick,
     getVipStats,
     grantVip,
     revokeVip,
@@ -87,6 +86,8 @@ const {
     removeVideoFromCategory,
     removeCategoryVideoByMessage,
     getCategoryStats,
+    recordCategoryView,
+    getCategoryLeaderboard,
     getMegaAccounts,
     addMegaAccount,
     removeMegaAccount,
@@ -105,6 +106,15 @@ const queue = require('./queue');
 const mfu = require('./megaFolderUpload');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// Every "Buy VIP" style button across the bot points straight here — a
+// direct DM to the admin — instead of an intermediate promo message. Fixed
+// destination (not config-driven) since the point is a direct human contact,
+// not a configurable channel link. NOTE: because these are `url` buttons,
+// Telegram never sends the bot a callback for the tap, so recordVipClick()
+// (VIP Promotion panel click stats) can no longer fire — that counter is
+// now effectively frozen at whatever it last read.
+const VIP_CONTACT_URL = 'https://t.me/MR_BOOMSIR';
 
 // Runs before every single handler. When maintenance mode is ON, only admins
 // and whitelisted users pass through — everyone else gets a plain notice.
@@ -1177,7 +1187,7 @@ async function sendJoinPrompt(ctx, groupIds) {
 
     const config = loadConfig();
     if (config.vipChannelLink) {
-        buttons.push([{ text: '💎 Skip — Get VIP Instead', callback_data: 'vip_info' }]);
+        buttons.push([{ text: '💎 Skip — Get VIP Instead', url: VIP_CONTACT_URL }]);
     }
     buttons.push([{ text: '✅ I\'ve Joined — Verify', callback_data: 'recheck_sub' }]);
 
@@ -1329,7 +1339,7 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
                     await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
                 } else {
                     await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                        config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
+                        config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', url: VIP_CONTACT_URL }]] } } : undefined);
                 }
                 return;
             }
@@ -1361,7 +1371,7 @@ async function sendSingleSharedFile(ctx, sourceChatId, sourceMessageId) {
 // --- User-facing: My Stats & Referrals ---
 const MY_STATS_KEYBOARD = {
     inline_keyboard: [
-        [{ text: '💎 Buy VIP', callback_data: 'vip_info' }, { text: '🎬 Free Video', callback_data: 'user_random' }],
+        [{ text: '💎 Buy VIP', url: VIP_CONTACT_URL }, { text: '🎬 Free Video', callback_data: 'user_random' }],
         [{ text: '📂 VIP Categories', callback_data: 'user_categories' }, { text: '📊 My Stats', callback_data: 'user_mystats' }],
         [{ text: '🎁 Invite & Earn', callback_data: 'user_referral' }, { text: '🎟 Redeem Code', callback_data: 'user_redeem' }],
         [{ text: 'ℹ️ About', callback_data: 'user_about' }]
@@ -1387,31 +1397,12 @@ function escapeMd(str) {
     return String(str).replace(/([_*`\[\]])/g, '\\$1');
 }
 
-// "💎 Buy VIP" — the main promo entry point. Shown on /start, the About
-// panel, and at the two moments a free user actually hits friction (daily
-// limit reached, force-sub gate) rather than on every single file delivery,
-// so it reads as a helpful upsell instead of spam.
-bot.action('vip_info', async (ctx) => {
-    await ctx.answerCbQuery();
-    recordVipClick(ctx.from.id);
-    const config = loadConfig();
-
-    if (!config.vipChannelLink) {
-        await ctx.reply('⚠️ VIP is not set up yet. Please check back soon.');
-        return;
-    }
-
-    let text = '💎 <b>VIP Access</b>';
-    if (config.vipPromoText) {
-        text += `\n\n${escapeHtml(config.vipPromoText)}`;
-    }
-
-    await ctx.reply(text, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-        reply_markup: { inline_keyboard: [[{ text: '💎 Join VIP Channel', url: config.vipChannelLink }]] }
-    });
-});
+// "💎 Buy VIP" — every instance now links straight to VIP_CONTACT_URL (a
+// `url` button), so this callback is no longer reachable from anywhere in
+// the bot. Left removed rather than kept as dead code; recordVipClick's
+// data (VIP Promotion panel) still exists from before this change but will
+// no longer grow, since Telegram doesn't notify bots when a `url` button is
+// tapped.
 
 // Public-facing "About" panel — shown to any regular user who taps ℹ️ About
 // on /start. Creator credit + tech stack are fixed; the join-group button
@@ -1432,7 +1423,7 @@ bot.action('user_about', async (ctx) => {
 
     const keyboard = { inline_keyboard: [] };
     if (config.vipChannelLink) {
-        keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', callback_data: 'vip_info' }]);
+        keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', url: VIP_CONTACT_URL }]);
     }
     if (config.aboutJoinGroupLink) {
         keyboard.inline_keyboard.push([{ text: '👥 Join Group', url: config.aboutJoinGroupLink }]);
@@ -1445,15 +1436,17 @@ bot.action('user_about', async (ctx) => {
     });
 });
 
-// --- User-facing: VIP Categories (browse-only; management is admin-only) ---
-// A category is only ever reachable here if it currently has ≥1 video (see
-// listNonEmptyCategories) and the requester passes BOTH gates below — the
-// same force-sub check every other file feature uses, then active VIP
-// status. The VIP/force-sub checks are repeated again inside catv_open
-// itself (not just here) since callback_data on an old message could in
-// principle be re-tapped after VIP lapses or before force-sub is verified —
-// hiding the button is a UX nicety, not the actual security boundary.
+// --- User-facing: VIP Categories ---
+// Category NAMES are visible to every member (free and VIP alike) — only
+// the actual video CONTENT is gated. A non-VIP user who opens a category
+// gets one free preview video (sendCategoryTeaser) plus an upsell; VIP
+// members and admins get the full browse experience below. The force-sub
+// check runs for everyone; the content gate is re-checked inside catv_open
+// itself too (not just at the list), since callback_data on an old message
+// could in principle be re-tapped after VIP lapses — hiding a button is a
+// UX nicety, not the actual security boundary.
 const CAT_BROWSE_BATCH_SIZE = 15;
+const CAT_NEW_BADGE_HOURS = 24; // "🆕" shows if a category got a video within this window
 
 // Tracks which video ids have already been delivered to a user within one
 // continuous browsing thread for a category (key: "<userId>:<categoryId>").
@@ -1464,14 +1457,105 @@ const CAT_BROWSE_BATCH_SIZE = 15;
 // same pattern as recentLogEntries below).
 const categoryBrowseSeen = {};
 
-async function sendCategoryList(ctx) {
+// Per-session (same key as above) shuffle preference — true = batches are
+// picked from the unseen pool in random order instead of insertion order.
+// Repeats are still structurally impossible either way since both modes
+// draw from the same seenSet-filtered pool; shuffle only changes ordering,
+// never re-includes something already delivered.
+const categoryBrowseShuffle = {};
+
+function shuffleArray(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
+// Builds the nav row(s) shown under a category browse message — a "▶️ Next"
+// (only if videos remain), a shuffle toggle, and a way back. Shared between
+// the post-delivery message and the shuffle-toggle handler so both render
+// identically. `nextOffset` is whatever offset the next `catv_open` tap
+// should carry (purely a restart-vs-continue signal, see comment above).
+function buildCategoryNavKeyboard(category, sessionKey, nextOffset) {
+    const seenSet = categoryBrowseSeen[sessionKey] || new Set();
+    const remaining = category.videos.filter(v => !seenSet.has(v.id)).length;
+    const shuffleOn = !!categoryBrowseShuffle[sessionKey];
+
+    const row1 = [];
+    if (remaining > 0) {
+        row1.push({ text: `▶️ Next ${Math.min(CAT_BROWSE_BATCH_SIZE, remaining)}`, callback_data: `catv_open:${category.id}:${nextOffset}` });
+    }
+    const row2 = [
+        { text: shuffleOn ? '🔀 Shuffle: ON' : '🔀 Shuffle: OFF', callback_data: `catv_shuffle:${category.id}:${nextOffset}` },
+        { text: '📂 All Categories', callback_data: 'user_categories' }
+    ];
+    return [row1, row2].filter(row => row.length > 0);
+}
+
+async function sendCategoryList(ctx, locked) {
     const categories = listNonEmptyCategories();
     if (categories.length === 0) {
         await ctx.reply('📂 No VIP categories are available yet — check back soon!');
         return;
     }
-    const rows = categories.slice(0, 30).map(c => [{ text: `📁 ${c.name} (${c.videos.length})`, callback_data: `catv_open:${c.id}:0` }]);
-    await ctx.reply('📂 *VIP Categories* — tap one to browse:', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    const newCutoff = Date.now() - CAT_NEW_BADGE_HOURS * 60 * 60 * 1000;
+    const rows = categories.slice(0, 30).map(c => {
+        const isNew = (c.videos || []).some(v => v.added_at && new Date(v.added_at).getTime() > newCutoff);
+        const label = `${isNew ? '🆕 ' : ''}${locked ? '🔒 ' : '📁 '}${c.name} (${c.videos.length})`;
+        return [{ text: label, callback_data: `catv_open:${c.id}:0` }];
+    });
+    rows.unshift([{ text: '🔥 Trending Categories', callback_data: 'user_categories_trending' }]);
+    const intro = locked
+        ? '📂 *VIP Categories* — names are open to everyone; tap one for a free preview, or 💎 upgrade for full access:'
+        : '📂 *VIP Categories* — tap one to browse:';
+    await ctx.reply(intro, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+// Free preview for non-VIP/non-admin users — always the first video added
+// to the category (stable and predictable, not random each time), plus an
+// upsell. Counts as one "view" toward the category's Trending stat, same as
+// a full VIP open.
+async function sendCategoryTeaser(ctx, category, userId) {
+    const config = loadConfig();
+    const sendOpts = config.protectContent ? { protect_content: true } : {};
+    const teaser = category.videos[0];
+    const previewCaption = `🔒 Free preview from "${category.name}" (1 of ${category.videos.length})`;
+
+    try {
+        if (teaser.chat_id && teaser.message_id) {
+            await ctx.telegram.copyMessage(ctx.chat.id, teaser.chat_id, teaser.message_id, { ...sendOpts, caption: previewCaption });
+        } else if (teaser.file_id) {
+            if (teaser.type === 'photo') {
+                await ctx.telegram.sendPhoto(ctx.chat.id, teaser.file_id, { ...sendOpts, caption: previewCaption });
+            } else if (teaser.type === 'animation') {
+                await ctx.telegram.sendAnimation(ctx.chat.id, teaser.file_id, { ...sendOpts, caption: previewCaption });
+            } else {
+                await ctx.telegram.sendVideo(ctx.chat.id, teaser.file_id, { ...sendOpts, caption: previewCaption });
+            }
+        }
+    } catch (error) {
+        console.error(`Failed to deliver teaser for category "${category.name}":`, error.message);
+        if (teaser.chat_id && teaser.message_id && error.message && error.message.includes('message to copy not found')) {
+            removeCategoryVideoByMessage(teaser.chat_id, teaser.message_id);
+        }
+    }
+
+    recordCategoryView(category.id, userId, 1);
+
+    await ctx.reply(
+        `🔒 *${escapeMd(category.name)}* has ${category.videos.length} videos total — that preview is free. The rest is VIP-only.`,
+        {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '💎 Get VIP — Full Access', url: VIP_CONTACT_URL }],
+                    [{ text: '📂 All Categories', callback_data: 'user_categories' }]
+                ]
+            }
+        }
+    );
 }
 
 bot.action('user_categories', async (ctx) => {
@@ -1488,22 +1572,50 @@ bot.action('user_categories', async (ctx) => {
         }
     }
 
-    if (!isAdminUser && !isUserVip(userId)) {
-        const keyboard = { inline_keyboard: [] };
-        if (config.vipChannelLink) keyboard.inline_keyboard.push([{ text: '💎 Buy VIP', callback_data: 'vip_info' }]);
-        await ctx.reply(
-            '🔒 *VIP Categories* are exclusive to active VIP members.\n\n' +
-            'Upgrade to VIP to unlock curated video categories not available through 🎬 Free Video.',
-            { parse_mode: 'Markdown', ...(keyboard.inline_keyboard.length ? { reply_markup: keyboard } : {}) }
-        );
-        return;
-    }
-
-    await sendCategoryList(ctx);
+    const locked = !isAdminUser && !isUserVip(userId);
+    await sendCategoryList(ctx, locked);
 });
 
-// Delivers up to CAT_BROWSE_BATCH_SIZE videos starting at `offset`, then a
-// small control message with ▶️ Next (if more remain) and a way back.
+// Trending Categories — visible to everyone (free and VIP), ranked by total
+// views (recordCategoryView, incremented once per open/preview, not once
+// per video within a batch). Tapping an entry routes through the normal
+// catv_open gate, so a free user still only gets the teaser from here.
+bot.action('user_categories_trending', async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id;
+    const isAdminUser = isAdmin(userId);
+    const config = loadConfig();
+
+    if (!isAdminUser && config.forceSubGroupIds.length > 0) {
+        const unjoined = await getUnjoinedGroups(ctx, config.forceSubGroupIds, userId);
+        if (unjoined.length > 0) {
+            await sendJoinPrompt(ctx, unjoined);
+            return;
+        }
+    }
+
+    const board = getCategoryLeaderboard(10);
+    if (board.length === 0) {
+        await ctx.reply('🔥 No category activity yet — check back soon!');
+        return;
+    }
+    const medals = ['🥇', '🥈', '🥉'];
+    const lines = board.map((c, i) =>
+        `${medals[i] || `${i + 1}.`} *${escapeMd(c.name)}* — ${c.views} view${c.views === 1 ? '' : 's'} (${c.videoCount} video${c.videoCount === 1 ? '' : 's'})`
+    );
+    const rows = board.map(c => [{ text: `📁 ${c.name}`, callback_data: `catv_open:${c.id}:0` }]);
+    rows.push([{ text: '📂 All Categories', callback_data: 'user_categories' }]);
+
+    await ctx.reply(`🔥 *Trending Categories*\n\n${lines.join('\n')}`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+});
+
+// Delivers up to CAT_BROWSE_BATCH_SIZE videos starting at `offset` (VIP/
+// admin only — non-VIP gets routed to sendCategoryTeaser instead), then a
+// small control message with ▶️ Next (if more remain), a shuffle toggle,
+// and a way back.
 bot.action(/^catv_open:(.+):(\d+)$/, async (ctx) => {
     const userId = ctx.from.id;
     const isAdminUser = isAdmin(userId);
@@ -1517,16 +1629,18 @@ bot.action(/^catv_open:(.+):(\d+)$/, async (ctx) => {
             return;
         }
     }
-    if (!isAdminUser && !isUserVip(userId)) {
-        await ctx.answerCbQuery('🔒 VIP members only.', { show_alert: true });
-        return;
-    }
 
     const categoryId = ctx.match[1];
     const offset = parseInt(ctx.match[2], 10);
     const category = getCategory(categoryId);
     if (!category || category.videos.length === 0) {
         await ctx.answerCbQuery('⚠️ Category unavailable.', { show_alert: true });
+        return;
+    }
+
+    if (!isAdminUser && !isUserVip(userId)) {
+        await ctx.answerCbQuery();
+        await sendCategoryTeaser(ctx, category, userId);
         return;
     }
     await ctx.answerCbQuery();
@@ -1537,9 +1651,14 @@ bot.action(/^catv_open:(.+):(\d+)$/, async (ctx) => {
     if (Object.keys(categoryBrowseSeen).length > 5000) {
         for (const k of Object.keys(categoryBrowseSeen)) delete categoryBrowseSeen[k]; // best-effort memory cap
     }
+    if (Object.keys(categoryBrowseShuffle).length > 5000) {
+        for (const k of Object.keys(categoryBrowseShuffle)) delete categoryBrowseShuffle[k]; // same best-effort cap
+    }
     const seenSet = categoryBrowseSeen[sessionKey] || (categoryBrowseSeen[sessionKey] = new Set());
+    const shuffleOn = !!categoryBrowseShuffle[sessionKey];
 
-    const unseenVideos = videos.filter(v => !seenSet.has(v.id));
+    let unseenVideos = videos.filter(v => !seenSet.has(v.id));
+    if (shuffleOn) unseenVideos = shuffleArray(unseenVideos);
     const batch = unseenVideos.slice(0, CAT_BROWSE_BATCH_SIZE);
     if (batch.length === 0) {
         // Category shrank (videos removed) between page taps — nothing left
@@ -1588,19 +1707,45 @@ bot.action(/^catv_open:(.+):(\d+)$/, async (ctx) => {
         }
     }
 
+    recordCategoryView(category.id, userId, 1);
+
     const remaining = unseenVideos.length - batch.length;
     const nextOffset = offset + CAT_BROWSE_BATCH_SIZE;
     const delivered = videos.length - remaining;
-    const nav = [];
-    if (remaining > 0) {
-        nav.push({ text: `▶️ Next ${Math.min(CAT_BROWSE_BATCH_SIZE, remaining)}`, callback_data: `catv_open:${category.id}:${nextOffset}` });
-    }
-    nav.push({ text: '📂 All Categories', callback_data: 'user_categories' });
 
     await ctx.reply(`📁 *${escapeMd(category.name)}* — showing ${delivered}/${videos.length}`, {
         parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [nav] }
+        reply_markup: { inline_keyboard: buildCategoryNavKeyboard(category, sessionKey, nextOffset) }
     });
+});
+
+// Toggles shuffle on/off for the current browsing session without
+// re-delivering videos — just flips the flag and refreshes the same
+// message's buttons so the next "Next" tap picks up the new order.
+bot.action(/^catv_shuffle:(.+):(\d+)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const isAdminUser = isAdmin(userId);
+    if (!isAdminUser && !isUserVip(userId)) {
+        await ctx.answerCbQuery('🔒 VIP members only.', { show_alert: true });
+        return;
+    }
+    const categoryId = ctx.match[1];
+    const nextOffset = parseInt(ctx.match[2], 10);
+    const category = getCategory(categoryId);
+    if (!category) {
+        await ctx.answerCbQuery('⚠️ Category unavailable.', { show_alert: true });
+        return;
+    }
+    const sessionKey = `${userId}:${categoryId}`;
+    categoryBrowseShuffle[sessionKey] = !categoryBrowseShuffle[sessionKey];
+    await ctx.answerCbQuery(categoryBrowseShuffle[sessionKey] ? '🔀 Shuffle ON — random order' : '🔀 Shuffle OFF — sequential order');
+    try {
+        await ctx.editMessageReplyMarkup({ inline_keyboard: buildCategoryNavKeyboard(category, sessionKey, nextOffset) });
+    } catch (error) {
+        // "message is not modified" if nothing visually changed, or the
+        // message is too old to edit — harmless either way, already
+        // answered the tap above.
+    }
 });
 
 function formatMyStats(userId) {
@@ -2188,7 +2333,7 @@ async function handleRandomRequest(ctx) {
                 await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
             } else {
                 await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                    config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
+                    config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', url: VIP_CONTACT_URL }]] } } : undefined);
             }
             return;
         }
@@ -2240,7 +2385,7 @@ bot.action('recheck_sub', async (ctx) => {
                 await ctx.reply(`⏳ Please wait ${check.retryAfter} second(s) and try again.`);
             } else {
                 await ctx.reply(`🚫 You've reached today's limit. Try again tomorrow, or use /myreferral to earn bonus credits.`,
-                    config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', callback_data: 'vip_info' }]] } } : undefined);
+                    config.vipChannelLink ? { reply_markup: { inline_keyboard: [[{ text: '💎 Buy VIP — No Limits', url: VIP_CONTACT_URL }]] } } : undefined);
             }
             return;
         }
@@ -2444,8 +2589,8 @@ async function renderVipPanel(ctx) {
     const text = '💎 *VIP Promotion*\n\n' +
         `Channel Link: ${config.vipChannelLink ? escapeMd(config.vipChannelLink) : '_Not set_'}\n` +
         `Promo Text: ${config.vipPromoText ? escapeMd(config.vipPromoText) : '_Not set_'}\n\n` +
-        `📊 Button taps: ${stats.totalClicks} total, ${stats.uniqueUsers} unique user(s)\n\n` +
-        '_"💎 Buy VIP" shows on /start, About, when a user hits the daily limit, and on the force-sub join prompt._' +
+        `📊 Button taps (frozen — see note below): ${stats.totalClicks} total, ${stats.uniqueUsers} unique user(s)\n\n` +
+        '_"💎 Buy VIP" shows on /start, About, when a user hits the daily limit, and on the force-sub join prompt. It now links straight to @MR_BOOMSIR, so Telegram no longer tells the bot when it\'s tapped — the count above stopped updating._' +
         (config.vipChannelLink ? '' : '\n\n⚠️ Set a channel link below to activate the button — it stays hidden until then.');
 
     const keyboard = {
@@ -2855,8 +3000,9 @@ async function renderCategoryAdminPanel(ctx, categoryId) {
     const created = new Date(category.createdAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
     const text = `📁 *${escapeMd(category.name)}*\n\n` +
         `Videos: ${category.videos.length}\n` +
+        `Views: ${category.views || 0} (${Array.isArray(category.viewerIds) ? category.viewerIds.length : 0} unique viewer(s))\n` +
         `Created: ${created}\n\n` +
-        '_VIP-only — free users never see this category or its content, in the list or through /random._';
+        '_The category name is visible to every member; only the videos inside are VIP-only. Free users get one free preview video, never the full content or /random._';
 
     const keyboard = {
         inline_keyboard: [

@@ -69,8 +69,10 @@ const {
     isUserVip,
     getVipInfo,
     createPromoCode,
+    createPromoCodeBatch,
     deletePromoCode,
     listPromoCodes,
+    listPromoCodesByBatch,
     redeemPromoCode,
     schedulePendingDeletion,
     getDuePendingDeletions,
@@ -1673,13 +1675,19 @@ async function handleRedeemCode(ctx, code) {
         const messages = {
             not_found: '❌ That code doesn\'t exist. Check the spelling and try again.',
             already_used: '⚠️ You\'ve already redeemed this code.',
-            limit_reached: '⚠️ This code has reached its maximum number of uses.'
+            limit_reached: '⚠️ This code has reached its maximum number of uses.',
+            expired: '⏰ This code\'s redeem-by deadline has passed — it can no longer be used.'
         };
         await ctx.reply(messages[result.reason] || '❌ Could not redeem that code.');
         return;
     }
-    const durationText = result.unlimited ? 'Lifetime (never expires)' : `${result.days} day(s)`;
+    const durationText = result.unlimited ? 'Lifetime (never expires)' : formatVipDuration(result.durationMs);
     await ctx.reply(`🎉 Code redeemed! You now have 💎 VIP access.\n\nDuration: ${durationText}\nEnjoy unlimited /random requests with no cooldown!`);
+
+    const username = ctx.from.username ? `@${ctx.from.username}` : (ctx.from.first_name || 'unknown');
+    await sendToLogChannel(
+        `🎟 *Promo Code Redeemed*\n\n*User:* ${username} (\`${ctx.from.id}\`)\n*Code:* \`${result.code}\`\n*Granted:* ${durationText} VIP`
+    );
 }
 
 bot.command('redeem', async (ctx) => {
@@ -2476,29 +2484,87 @@ bot.action('vip_settext', async (ctx) => {
 });
 
 // --- Promo Codes (admin creates codes that grant VIP access on redemption) ---
+// In-memory code-creation wizard state, keyed by admin id. Bridges the
+// button-driven mode/duration/redeem-by steps to the couple of free-text
+// replies still needed for numbers, prefix, or a custom code — same pattern
+// as folderSelection for Folder Upload.
+const promoWizard = {};
+
+function formatVipDuration(ms) {
+    if (!ms || ms <= 0) return 'Lifetime';
+    const minutes = Math.round(ms / 60000);
+    if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+    const hours = Math.round(ms / 3600000);
+    if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'}`;
+    const days = Math.round(ms / 86400000);
+    return `${days} day${days === 1 ? '' : 's'}`;
+}
+
 async function renderPromoPanel(ctx) {
     const codes = listPromoCodes();
     let text = '🎟 *Promo Codes*\n\n';
+    text += codes.length === 0 ? '_No codes created yet._' : '_Tap a code to view redemptions or delete it._';
+    if (codes.length > 20) text += `\n\n_Showing the 20 most recent of ${codes.length}._`;
 
-    if (codes.length === 0) {
-        text += '_No codes created yet._';
-    } else {
-        text += codes.slice(0, 15).map(c => {
-            const duration = c.days > 0 ? `${c.days}d` : 'Lifetime';
-            const uses = c.maxUses > 0 ? `${c.usedBy.length}/${c.maxUses}` : `${c.usedBy.length}/∞`;
-            return `\`${c.code}\` — ${duration} — used ${uses}`;
-        }).join('\n');
-        if (codes.length > 15) text += `\n_...and ${codes.length - 15} more_`;
+    const rows = codes.slice(0, 20).map(c => {
+        const duration = formatVipDuration(c.durationMs);
+        const uses = c.maxUses > 0 ? `${c.usedBy.length}/${c.maxUses}` : `${c.usedBy.length}/∞`;
+        return [{ text: `${c.code} — ${duration} — used ${uses}`.slice(0, 64), callback_data: `promo_view:${c.code}` }];
+    });
+    rows.push([{ text: '➕ Create Code', callback_data: 'promo_create_menu' }]);
+    rows.push([{ text: '🔙 Back', callback_data: 'menu_fileshare' }]);
+    await sendOrEdit(ctx, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+async function renderPromoCodeDetail(ctx, code) {
+    const entry = listPromoCodes().find(c => c.code === code);
+    if (!entry) {
+        await sendOrEdit(ctx, '⚠️ Code not found — it may have been deleted.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'promo_menu' }]] }
+        });
+        return;
+    }
+    const duration = formatVipDuration(entry.durationMs);
+    const uses = entry.maxUses > 0 ? `${entry.usedBy.length}/${entry.maxUses}` : `${entry.usedBy.length}/∞ (unlimited)`;
+    const redeemBy = entry.redeemByMs
+        ? new Date(entry.redeemByMs).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + (entry.redeemByMs < Date.now() ? ' ⚠️ expired' : '')
+        : 'No deadline';
+
+    let text = `🎟 *Code:* \`${entry.code}\`\n\n` +
+        `Grants: ${duration} VIP\n` +
+        `Uses: ${uses}\n` +
+        `Redeemable until: ${redeemBy}\n` +
+        `Created: ${new Date(entry.createdAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+    if (entry.campaign) text += `\nCampaign: ${escapeMd(entry.campaign)}`;
+    if (entry.batchId) text += `\nBatch: \`${entry.batchId}\``;
+
+    if (entry.usedBy.length > 0) {
+        text += `\n\n*Redeemed by:*\n` + entry.usedBy.slice(0, 15).map(u =>
+            `• \`${u.userId}\` — ${new Date(u.usedAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+        ).join('\n');
+        if (entry.usedBy.length > 15) text += `\n_...and ${entry.usedBy.length - 15} more_`;
     }
 
-    const keyboard = {
-        inline_keyboard: [
-            [{ text: '➕ Create Code', callback_data: 'promo_create_menu' }],
-            [{ text: '🗑 Delete Code', callback_data: 'promo_delete_menu' }],
-            [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
-        ]
-    };
-    await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: keyboard });
+    const rows = [];
+    if (entry.batchId) rows.push([{ text: '📦 View Whole Batch', callback_data: `promo_batch:${entry.batchId}` }]);
+    rows.push([{ text: '🗑 Delete Code', callback_data: `promo_del:${entry.code}` }]);
+    rows.push([{ text: '🔙 Back to List', callback_data: 'promo_menu' }]);
+    await sendOrEdit(ctx, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+async function renderPromoBatchView(ctx, batchId) {
+    const codes = listPromoCodesByBatch(batchId);
+    if (codes.length === 0) {
+        await sendOrEdit(ctx, '⚠️ Batch not found — its codes may have been deleted.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'promo_menu' }]] }
+        });
+        return;
+    }
+    const text = `📦 *Batch:* \`${batchId}\`\n\n${codes.length} code(s):\n\n` +
+        codes.map(c => `\`${c.code}\` — used ${c.usedBy.length}${c.maxUses > 0 ? `/${c.maxUses}` : ''}`).join('\n');
+    const rows = codes.slice(0, 20).map(c => [{ text: c.code, callback_data: `promo_view:${c.code}` }]);
+    rows.push([{ text: '🔙 Back to List', callback_data: 'promo_menu' }]);
+    await sendOrEdit(ctx, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
 }
 
 bot.action('promo_menu', async (ctx) => {
@@ -2507,31 +2573,175 @@ bot.action('promo_menu', async (ctx) => {
     await renderPromoPanel(ctx);
 });
 
+bot.action(/^promo_view:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderPromoCodeDetail(ctx, ctx.match[1]);
+});
+
+bot.action(/^promo_batch:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderPromoBatchView(ctx, ctx.match[1]);
+});
+
+bot.action(/^promo_del:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const deleted = deletePromoCode(ctx.match[1]);
+    await ctx.answerCbQuery(deleted ? '🗑 Deleted' : '⚠️ Already gone');
+    await renderPromoPanel(ctx);
+});
+
+// --- Create Promo Code wizard: mode -> (code text) -> duration unit ->
+// amount/count/maxUses -> (prefix) -> redeem-by deadline -> create ---
 bot.action('promo_create_menu', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'promo_create' };
-    await ctx.editMessageText(
-        '➕ *Create Promo Code*\n\n' +
-        'Send: `CODE DAYS [MAXUSES]`\n\n' +
-        '• `DAYS` — how many days of VIP access. Use `0` for lifetime/unlimited.\n' +
-        '• `MAXUSES` — optional, how many different users can redeem this code. Leave blank or `0` for unlimited people.\n\n' +
-        'Examples:\n' +
-        '`SUMMER30 30` → 30 days VIP, any number of people can use it\n' +
-        '`VIPFRIEND 0 1` → lifetime VIP, redeemable by only 1 person\n' +
-        '`WEEKPASS 7 50` → 7 days VIP, up to 50 people\n\n' +
-        'Or /cancel.',
-        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] } }
-    );
+    promoWizard[ctx.from.id] = {};
+    await sendOrEdit(ctx, '➕ *Create Promo Code*\n\nHow should the code text be chosen?', {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '🎲 Auto-generate (1 code)', callback_data: 'promo_mode:auto' }],
+                [{ text: '✏️ Custom code', callback_data: 'promo_mode:custom' }],
+                [{ text: '📦 Bulk generate', callback_data: 'promo_mode:bulk' }],
+                [{ text: '❌ Cancel', callback_data: 'promo_menu' }]
+            ]
+        }
+    });
 });
 
-bot.action('promo_delete_menu', async (ctx) => {
-    if (!(await requireAdmin(ctx, true))) return;
-    await ctx.answerCbQuery();
-    pendingAction[ctx.from.id] = { type: 'promo_delete' };
-    await ctx.editMessageText('🗑 Send the code to delete, or /cancel.', {
-        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
+async function renderPromoDurationStep(ctx) {
+    await sendOrEdit(ctx, '⏳ *Duration*\n\nHow long should the VIP access last?', {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⏱ Minutes', callback_data: 'promo_unit:minutes' }, { text: '🕐 Hours', callback_data: 'promo_unit:hours' }],
+                [{ text: '📅 Days', callback_data: 'promo_unit:days' }, { text: '♾ Lifetime', callback_data: 'promo_unit:lifetime' }],
+                [{ text: '❌ Cancel', callback_data: 'promo_menu' }]
+            ]
+        }
     });
+}
+
+async function renderPromoRedeemByStep(ctx) {
+    await sendOrEdit(ctx, '⏰ *Redeem-by deadline*\n\nShould the code itself stop being redeemable after a certain time if unused? (This is separate from how long the VIP it grants lasts.)', {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⏭ No deadline', callback_data: 'promo_redeemby:none' }],
+                [{ text: '1 hour', callback_data: 'promo_redeemby:1h' }, { text: '24 hours', callback_data: 'promo_redeemby:24h' }],
+                [{ text: '7 days', callback_data: 'promo_redeemby:7d' }, { text: '30 days', callback_data: 'promo_redeemby:30d' }],
+                [{ text: '❌ Cancel', callback_data: 'promo_menu' }]
+            ]
+        }
+    });
+}
+
+bot.action(/^promo_mode:(auto|custom|bulk)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const wiz = promoWizard[ctx.from.id];
+    if (!wiz) { await ctx.answerCbQuery('⚠️ Session expired, tap ➕ Create Code again.'); return; }
+    wiz.mode = ctx.match[1];
+    await ctx.answerCbQuery();
+    if (wiz.mode === 'custom') {
+        pendingAction[ctx.from.id] = { type: 'promo_code_text' };
+        await sendOrEdit(ctx, '✏️ Send the code text (letters/numbers/-/_ only), or /cancel.', {
+            reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
+        });
+        return;
+    }
+    await renderPromoDurationStep(ctx);
+});
+
+bot.action(/^promo_unit:(minutes|hours|days|lifetime)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const wiz = promoWizard[ctx.from.id];
+    if (!wiz) { await ctx.answerCbQuery('⚠️ Session expired, tap ➕ Create Code again.'); return; }
+    wiz.durationUnit = ctx.match[1];
+    await ctx.answerCbQuery();
+
+    pendingAction[ctx.from.id] = { type: 'promo_amount_text' };
+    if (wiz.durationUnit === 'lifetime') {
+        wiz.durationMs = 0;
+        const hint = wiz.mode === 'bulk'
+            ? 'Send: `COUNT [MAXUSES]`\ne.g. `20 1` = 20 codes, 1 use each'
+            : 'Send `MAXUSES` (0 = unlimited people), e.g. `10` or `0`.';
+        await sendOrEdit(ctx, `♾ Lifetime VIP selected.\n\n${hint}`, {
+            parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
+        });
+        return;
+    }
+    const hint = wiz.mode === 'bulk'
+        ? `Send: \`AMOUNT COUNT [MAXUSES]\`\ne.g. \`7 20 1\` = 7 ${wiz.durationUnit}, 20 codes, 1 use each`
+        : `Send: \`AMOUNT [MAXUSES]\`\ne.g. \`30 10\` = 30 ${wiz.durationUnit}, 10 max uses`;
+    await sendOrEdit(ctx, `⏳ Send the number of *${wiz.durationUnit}*.\n\n${hint}\n\n(MAXUSES: 0 or blank = unlimited people)`, {
+        parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'promo_menu' }]] }
+    });
+});
+
+bot.action(/^promo_redeemby:(none|1h|24h|7d|30d)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const wiz = promoWizard[ctx.from.id];
+    if (!wiz) { await ctx.answerCbQuery('⚠️ Session expired, tap ➕ Create Code again.'); return; }
+    await ctx.answerCbQuery();
+
+    const deadlineOffsets = { none: null, '1h': 3600000, '24h': 86400000, '7d': 604800000, '30d': 2592000000 };
+    const offset = deadlineOffsets[ctx.match[1]];
+    const redeemByMs = offset ? Date.now() + offset : null;
+    delete promoWizard[ctx.from.id];
+
+    if (wiz.mode === 'bulk') {
+        const { batchId, codes } = createPromoCodeBatch(wiz.count, {
+            durationMs: wiz.durationMs, maxUses: wiz.maxUses, createdBy: ctx.from.id,
+            redeemByMs, campaign: wiz.prefix, prefix: wiz.prefix
+        });
+        if (codes.length === 0) {
+            await sendOrEdit(ctx, '❌ Could not generate codes — try again.', { reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'promo_menu' }]] } });
+            return;
+        }
+        const usesText = wiz.maxUses > 0 ? `${wiz.maxUses} use(s) each` : 'Unlimited uses each';
+        const codeList = codes.map(c => `\`${c.code}\``).join('\n');
+        await sendOrEdit(ctx,
+            `✅ *${codes.length} promo codes created!*\n\n` +
+            `Grants: ${formatVipDuration(wiz.durationMs)} VIP\n` +
+            `Uses: ${usesText}\n\n${codeList}`,
+            {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '📦 View Batch', callback_data: `promo_batch:${batchId}` }],
+                        [{ text: '🔙 Back to List', callback_data: 'promo_menu' }]
+                    ]
+                }
+            }
+        );
+        return;
+    }
+
+    const result = createPromoCode({
+        code: wiz.mode === 'custom' ? wiz.code : null,
+        durationMs: wiz.durationMs, maxUses: wiz.maxUses, createdBy: ctx.from.id,
+        redeemByMs, campaign: wiz.prefix, prefix: wiz.prefix
+    });
+    if (!result.success) {
+        const msg = result.reason === 'exists' ? `⚠️ Code \`${wiz.code}\` already exists.` : '⚠️ Could not create that code — try again.';
+        await sendOrEdit(ctx, msg, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'promo_menu' }]] } });
+        return;
+    }
+    const usesText = result.code.maxUses > 0 ? `${result.code.maxUses} user(s)` : 'Unlimited users';
+    const redeemByText = result.code.redeemByMs
+        ? new Date(result.code.redeemByMs).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })
+        : 'No deadline';
+    await sendOrEdit(ctx,
+        `✅ *Promo code created!*\n\n` +
+        `Code: \`${result.code.code}\`\n` +
+        `Grants: ${formatVipDuration(result.code.durationMs)} VIP\n` +
+        `Redeemable by: ${usesText}\n` +
+        `Deadline: ${redeemByText}\n\n` +
+        `Share this with the user — they redeem it with /redeem or the 🎟 Redeem Code button.`,
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to List', callback_data: 'promo_menu' }]] } }
+    );
 });
 
 // --- VIP Categories (admin-curated, VIP-only video categories) ---
@@ -5270,6 +5480,7 @@ async function handlePendingAction(ctx, text) {
 
     if (text.trim() === '/cancel') {
         delete pendingAction[userId];
+        delete promoWizard[userId];
         await ctx.reply('❌ Cancelled.');
         return;
     }
@@ -5542,47 +5753,82 @@ async function handlePendingAction(ctx, text) {
         return;
     }
 
-    if (action.type === 'promo_create') {
-        const parts = text.trim().split(/\s+/);
-        if (parts.length < 2) {
-            await ctx.reply('⚠️ Send: `CODE DAYS [MAXUSES]` (e.g. `SUMMER30 30`), or /cancel.', { parse_mode: 'Markdown' });
-            return;
-        }
-        const [codeRaw, daysRaw, maxUsesRaw] = parts;
-        const days = parseInt(daysRaw, 10);
-        const maxUses = maxUsesRaw ? parseInt(maxUsesRaw, 10) : 0;
-        if (isNaN(days) || days < 0) {
-            await ctx.reply('⚠️ DAYS must be a whole number, 0 or more (0 = lifetime). Try again, or /cancel.');
-            return;
-        }
-        if (maxUsesRaw && (isNaN(maxUses) || maxUses < 0)) {
-            await ctx.reply('⚠️ MAXUSES must be a whole number, 0 or more (0 = unlimited people). Try again, or /cancel.');
-            return;
-        }
-        const result = createPromoCode(codeRaw, days, maxUses, userId);
+    if (action.type === 'promo_code_text') {
+        const wiz = promoWizard[userId];
+        if (!wiz) { delete pendingAction[userId]; await ctx.reply('⚠️ Session expired. Tap ➕ Create Code to start again.'); return; }
+        const codeRaw = text.trim();
+        if (!codeRaw) { await ctx.reply('⚠️ Send a valid code, or /cancel.'); return; }
+        wiz.code = codeRaw;
         delete pendingAction[userId];
-        if (!result.success) {
-            await ctx.reply(result.reason === 'exists' ? `⚠️ Code \`${codeRaw.toUpperCase()}\` already exists.` : '⚠️ Could not create that code.', { parse_mode: 'Markdown' });
-            return;
-        }
-        const durationText = days > 0 ? `${days} day(s)` : 'Lifetime';
-        const usesText = maxUses > 0 ? `${maxUses} user(s)` : 'Unlimited users';
-        await ctx.reply(
-            `✅ Promo code created!\n\n` +
-            `Code: \`${result.code.code}\`\n` +
-            `Grants: ${durationText} VIP\n` +
-            `Redeemable by: ${usesText}\n\n` +
-            `Share this with the user — they redeem it with /redeem or the 🎟 Redeem Code button.`,
-            { parse_mode: 'Markdown' }
-        );
+        await renderPromoDurationStep(ctx);
         return;
     }
 
-    if (action.type === 'promo_delete') {
-        const code = text.trim().toUpperCase();
-        const deleted = deletePromoCode(code);
+    if (action.type === 'promo_amount_text') {
+        const wiz = promoWizard[userId];
+        if (!wiz) { delete pendingAction[userId]; await ctx.reply('⚠️ Session expired. Tap ➕ Create Code to start again.'); return; }
+
+        const parts = text.trim().split(/\s+/).filter(Boolean);
+        const unitMs = { minutes: 60000, hours: 3600000, days: 86400000 }[wiz.durationUnit];
+        const isLifetime = wiz.durationUnit === 'lifetime';
+        const isBulk = wiz.mode === 'bulk';
+
+        let amount = null, count = null, maxUses = 0;
+        if (!isLifetime && !isBulk) {
+            if (parts.length < 1) { await ctx.reply('⚠️ Send at least the amount, e.g. `30`. Or /cancel.', { parse_mode: 'Markdown' }); return; }
+            amount = parseInt(parts[0], 10);
+            maxUses = parts[1] ? parseInt(parts[1], 10) : 0;
+        } else if (!isLifetime && isBulk) {
+            if (parts.length < 2) { await ctx.reply('⚠️ Send: `AMOUNT COUNT [MAXUSES]`, e.g. `7 20 1`. Or /cancel.', { parse_mode: 'Markdown' }); return; }
+            amount = parseInt(parts[0], 10);
+            count = parseInt(parts[1], 10);
+            maxUses = parts[2] ? parseInt(parts[2], 10) : 0;
+        } else if (isLifetime && isBulk) {
+            if (parts.length < 1) { await ctx.reply('⚠️ Send: `COUNT [MAXUSES]`, e.g. `20 1`. Or /cancel.', { parse_mode: 'Markdown' }); return; }
+            count = parseInt(parts[0], 10);
+            maxUses = parts[1] ? parseInt(parts[1], 10) : 0;
+        } else {
+            maxUses = parts[0] ? parseInt(parts[0], 10) : 0;
+        }
+
+        if (!isLifetime && (isNaN(amount) || amount <= 0)) {
+            await ctx.reply('⚠️ Amount must be a whole number greater than 0. Try again, or /cancel.');
+            return;
+        }
+        if (isBulk && (isNaN(count) || count <= 0)) {
+            await ctx.reply('⚠️ COUNT must be a whole number greater than 0. Try again, or /cancel.');
+            return;
+        }
+        if (isBulk && count > 100) {
+            await ctx.reply('⚠️ Max 100 codes per batch. Send a smaller COUNT, or /cancel.');
+            return;
+        }
+        if (isNaN(maxUses) || maxUses < 0) {
+            await ctx.reply('⚠️ MAXUSES must be 0 or a positive whole number. Try again, or /cancel.');
+            return;
+        }
+
+        wiz.durationMs = isLifetime ? 0 : amount * unitMs;
+        wiz.maxUses = maxUses;
+        if (isBulk) wiz.count = count;
         delete pendingAction[userId];
-        await ctx.reply(deleted ? `✅ Code \`${code}\` deleted.` : `⚠️ Code \`${code}\` not found.`, { parse_mode: 'Markdown' });
+
+        if (isBulk || wiz.mode === 'auto') {
+            pendingAction[userId] = { type: 'promo_prefix_text' };
+            await ctx.reply('🏷 Send a campaign prefix to prepend to the generated code(s) (e.g. `GIVEAWAY`), or send `-` to skip.', { parse_mode: 'Markdown' });
+            return;
+        }
+        await renderPromoRedeemByStep(ctx);
+        return;
+    }
+
+    if (action.type === 'promo_prefix_text') {
+        const wiz = promoWizard[userId];
+        if (!wiz) { delete pendingAction[userId]; await ctx.reply('⚠️ Session expired. Tap ➕ Create Code to start again.'); return; }
+        const raw = text.trim();
+        wiz.prefix = (raw === '-' || raw === '') ? null : raw;
+        delete pendingAction[userId];
+        await renderPromoRedeemByStep(ctx);
         return;
     }
 

@@ -689,6 +689,38 @@ function getCategoryStats() {
     };
 }
 
+// ===== Category engagement tracking (Trending Categories) =====
+// `views` counts each successful open/browse/preview event (not each video
+// delivered within a batch — a 15-video batch is still one "view"). Fine
+// for a VIP-scale user base. `viewerIds` dedupes so we can also show
+// unique-viewer counts if useful later. Both are best-effort — missing on
+// older categories, which read back as 0/[] via the `|| 0` / `|| []`
+// fallbacks below rather than needing a migration.
+function recordCategoryView(categoryId, userId, count = 1) {
+    const categories = loadCategories();
+    const category = categories[categoryId];
+    if (!category) return;
+    category.views = (category.views || 0) + count;
+    if (!Array.isArray(category.viewerIds)) category.viewerIds = [];
+    const uid = String(userId);
+    if (!category.viewerIds.includes(uid)) category.viewerIds.push(uid);
+    saveCategories(categories);
+}
+
+function getCategoryLeaderboard(limit = 10) {
+    const categories = listCategories();
+    return categories
+        .map(c => ({
+            id: c.id,
+            name: c.name,
+            views: c.views || 0,
+            uniqueViewers: Array.isArray(c.viewerIds) ? c.viewerIds.length : 0,
+            videoCount: (c.videos || []).length
+        }))
+        .sort((a, b) => b.views - a.views)
+        .slice(0, limit);
+}
+
 // ===== MEGA Accounts (Folder Upload — multi-account rotation) =====
 // Credentials live in config.json alongside everything else. Passwords are
 // stored in plain text here, same trust model as BOT_TOKEN/API_HASH in
@@ -1422,6 +1454,8 @@ module.exports = {
     removeVideoFromCategory,
     removeCategoryVideoByMessage,
     getCategoryStats,
+    recordCategoryView,
+    getCategoryLeaderboard,
     getMegaAccounts,
     addMegaAccount,
     removeMegaAccount,

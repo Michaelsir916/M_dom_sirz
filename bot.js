@@ -83,11 +83,22 @@ const {
     listNonEmptyCategories,
     getCategory,
     addVideoToCategory,
+    setCategoryVideoThumb,
     removeVideoFromCategory,
     removeCategoryVideoByMessage,
     getCategoryStats,
     recordCategoryView,
     getCategoryLeaderboard,
+    addScheduledCategoryAdd,
+    removeScheduledCategoryAdd,
+    markScheduledCategoryAddSent,
+    getDueScheduledCategoryAdds,
+    getPendingScheduledCategoryAdds,
+    addPendingCategoryAssignment,
+    getPendingCategoryAssignment,
+    getAllPendingCategoryAssignments,
+    removePendingCategoryAssignment,
+    pruneOldPendingCategoryAssignments,
     getMegaAccounts,
     addMegaAccount,
     removeMegaAccount,
@@ -1494,10 +1505,14 @@ function buildCategoryNavKeyboard(category, sessionKey, nextOffset) {
     return [row1, row2].filter(row => row.length > 0);
 }
 
-async function sendCategoryList(ctx, locked) {
+// `edit=true` re-renders the SAME message in place (used by the 🔄 Refresh
+// button) instead of sending a new one — so tapping Refresh after an admin
+// adds a new video updates the list/counts without cluttering the chat.
+async function sendCategoryList(ctx, locked, edit = false) {
     const categories = listNonEmptyCategories();
     if (categories.length === 0) {
-        await ctx.reply('📂 No VIP categories are available yet — check back soon!');
+        const msg = '📂 No VIP categories are available yet — check back soon!';
+        if (edit) { await ctx.editMessageText(msg); } else { await ctx.reply(msg); }
         return;
     }
     const newCutoff = Date.now() - CAT_NEW_BADGE_HOURS * 60 * 60 * 1000;
@@ -1507,10 +1522,12 @@ async function sendCategoryList(ctx, locked) {
         return [{ text: label, callback_data: `catv_open:${c.id}:0` }];
     });
     rows.unshift([{ text: '🔥 Trending Categories', callback_data: 'user_categories_trending' }]);
+    rows.push([{ text: '🔄 Refresh', callback_data: `user_categories_refresh:${locked ? 1 : 0}` }]);
     const intro = locked
         ? '📂 *VIP Categories* — names are open to everyone; tap one for a free preview, or 💎 upgrade for full access:'
         : '📂 *VIP Categories* — tap one to browse:';
-    await ctx.reply(intro, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    const opts = { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } };
+    if (edit) { await ctx.editMessageText(intro, opts); } else { await ctx.reply(intro, opts); }
 }
 
 // Free preview for non-VIP/non-admin users — always the first video added
@@ -1521,24 +1538,54 @@ async function sendCategoryTeaser(ctx, category, userId) {
     const config = loadConfig();
     const sendOpts = config.protectContent ? { protect_content: true } : {};
     const teaser = category.videos[0];
-    const previewCaption = `🔒 Free preview from "${category.name}" (1 of ${category.videos.length})`;
+    const blurCaption = `🔒 Blurred preview from "${category.name}" (1 of ${category.videos.length}) — get VIP for the full clear video.`;
+    let sentBlurred = false;
 
-    try {
-        if (teaser.chat_id && teaser.message_id) {
-            await ctx.telegram.copyMessage(ctx.chat.id, teaser.chat_id, teaser.message_id, { ...sendOpts, caption: previewCaption });
-        } else if (teaser.file_id) {
-            if (teaser.type === 'photo') {
-                await ctx.telegram.sendPhoto(ctx.chat.id, teaser.file_id, { ...sendOpts, caption: previewCaption });
-            } else if (teaser.type === 'animation') {
-                await ctx.telegram.sendAnimation(ctx.chat.id, teaser.file_id, { ...sendOpts, caption: previewCaption });
-            } else {
-                await ctx.telegram.sendVideo(ctx.chat.id, teaser.file_id, { ...sendOpts, caption: previewCaption });
+    // Same blur mechanism as Auto-Post: blur the video's own thumbnail and
+    // send that as a static photo instead of the full clear video. Falls
+    // through to the old full-preview behaviour if blur is off, `sharp`
+    // isn't installed, or no thumbnail could be produced.
+    if (config.categoryTeaserBlurEnabled && sharp) {
+        try {
+            let srcFileId = teaser.type === 'video' ? teaser.thumb_file_id : teaser.file_id;
+            // Videos archived before this feature existed won't have a
+            // cached thumbnail yet — fetch it once now and cache it.
+            if (teaser.type === 'video' && !srcFileId && teaser.chat_id && teaser.message_id) {
+                srcFileId = await getVideoThumbnailFileId(ctx.from.id, teaser.chat_id, teaser.message_id);
+                if (srcFileId) setCategoryVideoThumb(category.id, teaser.id, srcFileId);
             }
+            if (srcFileId) {
+                const buf = await downloadTelegramFile(srcFileId);
+                const blurred = buf && await blurBuffer(buf);
+                if (blurred) {
+                    await ctx.telegram.sendPhoto(ctx.chat.id, { source: blurred }, { ...sendOpts, caption: blurCaption });
+                    sentBlurred = true;
+                }
+            }
+        } catch (error) {
+            console.error(`Blurred teaser failed for category "${category.name}":`, error.message);
         }
-    } catch (error) {
-        console.error(`Failed to deliver teaser for category "${category.name}":`, error.message);
-        if (teaser.chat_id && teaser.message_id && error.message && error.message.includes('message to copy not found')) {
-            removeCategoryVideoByMessage(teaser.chat_id, teaser.message_id);
+    }
+
+    if (!sentBlurred) {
+        const previewCaption = config.categoryTeaserBlurEnabled ? blurCaption : `🔒 Free preview from "${category.name}" (1 of ${category.videos.length})`;
+        try {
+            if (teaser.chat_id && teaser.message_id) {
+                await ctx.telegram.copyMessage(ctx.chat.id, teaser.chat_id, teaser.message_id, { ...sendOpts, caption: previewCaption });
+            } else if (teaser.file_id) {
+                if (teaser.type === 'photo') {
+                    await ctx.telegram.sendPhoto(ctx.chat.id, teaser.file_id, { ...sendOpts, caption: previewCaption });
+                } else if (teaser.type === 'animation') {
+                    await ctx.telegram.sendAnimation(ctx.chat.id, teaser.file_id, { ...sendOpts, caption: previewCaption });
+                } else {
+                    await ctx.telegram.sendVideo(ctx.chat.id, teaser.file_id, { ...sendOpts, caption: previewCaption });
+                }
+            }
+        } catch (error) {
+            console.error(`Failed to deliver teaser for category "${category.name}":`, error.message);
+            if (teaser.chat_id && teaser.message_id && error.message && error.message.includes('message to copy not found')) {
+                removeCategoryVideoByMessage(teaser.chat_id, teaser.message_id);
+            }
         }
     }
 
@@ -1574,6 +1621,13 @@ bot.action('user_categories', async (ctx) => {
 
     const locked = !isAdminUser && !isUserVip(userId);
     await sendCategoryList(ctx, locked);
+});
+
+// 🔄 Refresh — re-renders the same category list message in place so newly
+// added categories/videos and updated counts show up without a new message.
+bot.action(/^user_categories_refresh:(0|1)$/, async (ctx) => {
+    await ctx.answerCbQuery('🔄 Refreshed');
+    await sendCategoryList(ctx, ctx.match[1] === '1', true);
 });
 
 // Trending Categories — visible to everyone (free and VIP), ranked by total
@@ -2290,6 +2344,57 @@ async function processDueScheduledBroadcasts() {
     }
 }
 
+// Checked every minute — actually inserts any scheduled category video
+// whose time has come, and pings the admin who scheduled it.
+async function processDueScheduledCategoryAdds() {
+    pruneOldPendingCategoryAssignments(); // cheap housekeeping, piggybacks on this tick
+    const due = getDueScheduledCategoryAdds();
+    for (const s of due) {
+        try {
+            const result = addVideoToCategory(s.categoryId, {
+                chatId: s.chatId,
+                messageId: s.messageId,
+                fileUniqueId: s.fileUniqueId,
+                type: s.type,
+                addedBy: s.createdBy,
+                caption: s.caption,
+                thumbFileId: s.thumbFileId
+            });
+            markScheduledCategoryAddSent(s.id);
+            if (result.success) {
+                bot.telegram.sendMessage(s.createdBy, `✅ Scheduled video added to the category (${result.count} total now).`).catch(() => {});
+            } else {
+                bot.telegram.sendMessage(s.createdBy, `⚠️ Scheduled video wasn't added (${result.reason}) — category or video may no longer exist.`).catch(() => {});
+            }
+        } catch (error) {
+            logError('Scheduled category add', error);
+            markScheduledCategoryAddSent(s.id); // don't retry-loop a broken entry forever
+        }
+    }
+}
+
+bot.command('listscheduledcategory', async (ctx) => {
+    if (!(await requireAdmin(ctx))) return;
+    const pending = getPendingScheduledCategoryAdds();
+    if (pending.length === 0) {
+        await ctx.reply('No scheduled category adds pending.');
+        return;
+    }
+    const lines = pending.map(s => `• \`${s.id}\` — ${new Date(s.sendAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST — category \`${s.categoryId}\``);
+    await ctx.reply(`⏰ *Pending Scheduled Category Adds*\n\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
+});
+
+bot.command('cancelcategoryadd', async (ctx) => {
+    if (!(await requireAdmin(ctx))) return;
+    const id = ctx.message.text.split(' ')[1];
+    if (!id) {
+        await ctx.reply('Usage: `/cancelcategoryadd <id>` (see `/listscheduledcategory`)', { parse_mode: 'Markdown' });
+        return;
+    }
+    const ok = removeScheduledCategoryAdd(id);
+    await ctx.reply(ok ? '✅ Cancelled.' : '❌ No scheduled category add found with that ID.');
+});
+
 // --- User-facing ---
 // Wraps recordRequest(): if the daily limit is hit but the user has earned
 // referral bonus credits, spend one of those instead of blocking them.
@@ -2925,6 +3030,8 @@ async function renderCategoriesPanel(ctx) {
     }
     rows.push([{ text: '➕ Create Category', callback_data: 'cat_create' }]);
     rows.push([{ text: `🎯 ${channelLabel ? 'Change' : 'Set'} Storage Channel`, callback_data: 'cat_setchannel_menu' }]);
+    rows.push([{ text: '📥 Pending Channel Posts', callback_data: 'cat_pending_assignments' }]);
+    rows.push([{ text: `🌫 Teaser Blur: ${config.categoryTeaserBlurEnabled ? 'ON' : 'OFF'}${sharp ? '' : ' (⚠️ sharp not installed)'}`, callback_data: 'cat_blur_toggle' }]);
     rows.push([{ text: '🔙 Back', callback_data: 'menu_fileshare' }]);
 
     await ctx.editMessageText(text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
@@ -2976,6 +3083,17 @@ bot.action('cat_setchannel_manual', async (ctx) => {
 bot.action('cat_menu', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     await ctx.answerCbQuery();
+    await renderCategoriesPanel(ctx);
+});
+
+// Toggles whether the free VIP-category preview sends a blurred thumbnail
+// (like Auto-Post's blur) instead of the full clear video.
+bot.action('cat_blur_toggle', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const config = loadConfig();
+    config.categoryTeaserBlurEnabled = !config.categoryTeaserBlurEnabled;
+    saveConfig(config);
+    await ctx.answerCbQuery(`Blur ${config.categoryTeaserBlurEnabled ? 'ON' : 'OFF'}`);
     await renderCategoriesPanel(ctx);
 });
 
@@ -3053,6 +3171,28 @@ bot.action(/^cat_addvideo:(.+)$/, async (ctx) => {
             reply_markup: { inline_keyboard: [[{ text: '✅ Done', callback_data: `cat_adddone:${category.id}` }]] }
         }
     );
+});
+
+// A video/photo/animation posted directly to the Category Storage Channel
+// (by an admin or by another bot — never forwarded to this bot's DM) shows
+// up here as a pending assignment. Tapping this opens the category picker
+// for it (see the channel_post handler + catassign_* actions below).
+bot.action('cat_pending_assignments', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    const pending = getAllPendingCategoryAssignments();
+    if (pending.length === 0) {
+        await ctx.editMessageText('📥 No unassigned channel posts right now.', {
+            reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'cat_menu' }]] }
+        });
+        return;
+    }
+    const rows = pending.slice(0, 25).map(a => {
+        const label = a.caption ? a.caption.slice(0, 40) : `${a.type} (no caption)`;
+        return [{ text: `📌 ${label}`, callback_data: `catassign_menu:${a.id}` }];
+    });
+    rows.push([{ text: '🔙 Back', callback_data: 'cat_menu' }]);
+    await ctx.editMessageText(`📥 *${pending.length} unassigned channel post(s)*`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
 });
 
 bot.action(/^cat_adddone:(.+)$/, async (ctx) => {
@@ -5472,6 +5612,123 @@ async function isTrustedChannelAdmin(ctx) {
     }
 }
 
+// DMs every configured admin with a "📁 Assign to Category" button whenever
+// a new video/photo/animation lands in the Category Storage Channel. If an
+// admin has never opened a DM with the bot (or blocked it), sendMessage just
+// fails silently for them — the post still shows up under "📥 Pending
+// Channel Posts" in the category admin panel as a fallback.
+async function notifyAdminsOfNewCategoryPost(assignment) {
+    const adminIds = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
+    const label = assignment.caption ? assignment.caption.slice(0, 60) : `${assignment.type} (no caption)`;
+    for (const adminId of adminIds) {
+        try {
+            await bot.telegram.sendMessage(
+                adminId,
+                `📥 New ${assignment.type} posted to the category storage channel:\n"${escapeMd(label)}"\n\nFile it into a category?`,
+                { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '📁 Assign to Category', callback_data: `catassign_menu:${assignment.id}` }]] } }
+            );
+        } catch (e) { /* admin hasn't opened a DM with the bot yet, or blocked it — ignore */ }
+    }
+}
+
+// Category picker for a pending channel-post assignment.
+bot.action(/^catassign_menu:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const assignment = getPendingCategoryAssignment(ctx.match[1]);
+    if (!assignment) {
+        await ctx.answerCbQuery('⚠️ Expired or already handled.');
+        return;
+    }
+    const categories = listCategories();
+    if (categories.length === 0) {
+        await ctx.answerCbQuery();
+        await ctx.editMessageText('📂 No categories exist yet — create one first from the VIP Categories admin panel.');
+        return;
+    }
+    await ctx.answerCbQuery();
+    const rows = categories.slice(0, 30).map(c => [{ text: `📁 ${c.name} (${c.videos.length})`, callback_data: `catassign_pick:${assignment.id}:${c.id}` }]);
+    await ctx.editMessageText('📁 Pick a category for this video:', { reply_markup: { inline_keyboard: rows } });
+});
+
+// Category chosen — now ask Now vs Schedule.
+bot.action(/^catassign_pick:([^:]+):(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const [, assignId, categoryId] = ctx.match;
+    const assignment = getPendingCategoryAssignment(assignId);
+    const category = getCategory(categoryId);
+    if (!assignment || !category) {
+        await ctx.answerCbQuery('⚠️ Expired or already handled.');
+        return;
+    }
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`📁 "${escapeMd(category.name)}" selected. Add it now, or schedule for later?`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [
+            [{ text: '▶️ Add Now', callback_data: `catassign_now:${assignId}:${categoryId}` }],
+            [{ text: '⏱ Schedule', callback_data: `catassign_sched:${assignId}:${categoryId}` }]
+        ] }
+    });
+});
+
+// Immediate add — video is already sitting in the storage channel, so this
+// just registers it in the category's video list (with a cached thumbnail
+// for the blur teaser).
+bot.action(/^catassign_now:([^:]+):(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const [, assignId, categoryId] = ctx.match;
+    const assignment = getPendingCategoryAssignment(assignId);
+    const category = getCategory(categoryId);
+    if (!assignment || !category) {
+        await ctx.answerCbQuery('⚠️ Expired or already handled.');
+        return;
+    }
+    let thumbFileId = null;
+    if (assignment.type === 'video') {
+        thumbFileId = await getVideoThumbnailFileId(ctx.from.id, assignment.chatId, assignment.messageId);
+    }
+    const result = addVideoToCategory(categoryId, {
+        chatId: assignment.chatId, messageId: assignment.messageId, fileUniqueId: assignment.fileUniqueId,
+        type: assignment.type, addedBy: ctx.from.id, caption: assignment.caption, thumbFileId
+    });
+    removePendingCategoryAssignment(assignId);
+    await ctx.answerCbQuery(result.success ? '✅ Added' : `⚠️ ${result.reason}`);
+    await ctx.editMessageText(result.success
+        ? `✅ Added to "${category.name}" — ${result.count} video(s) now.`
+        : `⚠️ Not added (${result.reason}).`);
+});
+
+// Schedule for later — reuses the exact same 'cat_schedule_add_time'
+// pendingAction step (and processDueScheduledCategoryAdds sweep) as before;
+// the only difference is the video's already archived, so there's no need
+// to ask the admin to send/forward anything.
+bot.action(/^catassign_sched:([^:]+):(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const [, assignId, categoryId] = ctx.match;
+    const assignment = getPendingCategoryAssignment(assignId);
+    const category = getCategory(categoryId);
+    if (!assignment || !category) {
+        await ctx.answerCbQuery('⚠️ Expired or already handled.');
+        return;
+    }
+    await ctx.answerCbQuery();
+    let thumbFileId = null;
+    if (assignment.type === 'video') {
+        thumbFileId = await getVideoThumbnailFileId(ctx.from.id, assignment.chatId, assignment.messageId);
+    }
+    pendingAction[ctx.from.id] = {
+        type: 'cat_schedule_add_time',
+        categoryId,
+        chatId: assignment.chatId,
+        messageId: assignment.messageId,
+        fileUniqueId: assignment.fileUniqueId,
+        kind: assignment.type,
+        caption: assignment.caption,
+        thumbFileId,
+        assignId
+    };
+    await ctx.editMessageText(`⏰ Send the date & time (IST) to add it to "${escapeMd(category.name)}", like:\n\`2026-08-30 18:00\`\n\nOr /cancel.`, { parse_mode: 'Markdown' });
+});
+
 // Auto-approves join requests for any chat currently set as a force-sub
 // group/channel — this is what makes the "request to join" invite links
 // (see getOrCreateJoinRequestLink) actually unlock instantly instead of
@@ -5551,6 +5808,23 @@ bot.on('channel_post', async (ctx) => {
     const post = ctx.channelPost;
     console.log(`📨 channel_post received in ${ctx.chat.id}: "${(post.text || '[non-text]').slice(0, 50)}"`);
     trackKnownChat(ctx);
+
+    // VIP Category Storage Channel: any video/photo/animation posted here
+    // directly — by an admin uploading manually, or by another bot with
+    // post access — is flagged for an admin to file into a category via
+    // inline buttons. Nothing needs to be forwarded to the bot's DM.
+    if (post.video || post.photo || post.animation) {
+        const config = loadConfig();
+        if (config.categoryStorageChannelId && String(ctx.chat.id) === String(config.categoryStorageChannelId)) {
+            const type = post.video ? 'video' : post.animation ? 'animation' : 'photo';
+            const fileUniqueId = type === 'video' ? post.video.file_unique_id
+                : type === 'animation' ? post.animation.file_unique_id
+                : post.photo[post.photo.length - 1].file_unique_id;
+            const assignment = addPendingCategoryAssignment({ chatId: ctx.chat.id, messageId: post.message_id, type, fileUniqueId, caption: post.caption || null });
+            await notifyAdminsOfNewCategoryPost(assignment);
+            return;
+        }
+    }
 
     // File tracking: legacy source group, or any admin's auto-post source channel
     if (post.photo || post.video) {
@@ -6080,6 +6354,33 @@ async function handlePendingAction(ctx, text) {
         return;
     }
 
+    // Final step of the "⏱ Schedule Add" flow — the video is already
+    // archived (see the media handler above); this just records WHEN it
+    // should actually enter the category. processDueScheduledCategoryAdds()
+    // (checked every 60s) does the real insert once the time arrives.
+    if (action.type === 'cat_schedule_add_time') {
+        const parts = text.trim().split(/\s+/);
+        const isoIst = `${parts[0]}T${parts[1]}:00+05:30`;
+        const sendAt = new Date(isoIst);
+        if (!parts[0] || !parts[1] || isNaN(sendAt.getTime()) || sendAt.getTime() <= Date.now()) {
+            await ctx.reply('⚠️ Send it like `2026-08-30 18:00` (IST), and it must be a future time. Or /cancel.', { parse_mode: 'Markdown' });
+            return;
+        }
+        const { categoryId, chatId, messageId, fileUniqueId, kind, caption, thumbFileId, assignId } = action;
+        delete pendingAction[userId];
+        if (assignId) removePendingCategoryAssignment(assignId);
+        const record = addScheduledCategoryAdd({
+            categoryId, chatId, messageId, fileUniqueId, type: kind, caption, thumbFileId,
+            sendAt: sendAt.toISOString(), createdBy: userId
+        });
+        await ctx.reply(
+            `⏰ Will be added to the category at ${sendAt.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST.\n` +
+            `ID: \`${record.id}\`\n\nCancel with \`/cancelcategoryadd ${record.id}\``,
+            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '🔙 Back to Category', callback_data: `cat_admin:${categoryId}` }]] } }
+        );
+        return;
+    }
+
     // ===== Folder Upload (Advanced) pending actions =====
     if (action.type === 'mfu_awaiting_link') {
         delete pendingAction[userId];
@@ -6349,6 +6650,9 @@ bot.telegram.getMe().then(async botInfo => {
     // for hour-scale intervals.
     setInterval(() => {
         processDueScheduledBroadcasts().catch(err => logError('Scheduled broadcast tick', err));
+    }, 60 * 1000);
+    setInterval(() => {
+        processDueScheduledCategoryAdds().catch(err => logError('Scheduled category add tick', err));
     }, 60 * 1000);
     setInterval(() => {
         processAutopostTicks().catch(err => logError('Auto-post tick', err));

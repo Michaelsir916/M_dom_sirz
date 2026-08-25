@@ -13,6 +13,8 @@ const VIP_CLICKS_PATH = path.join(__dirname, 'vip_clicks.json');
 const PROMO_CODES_PATH = path.join(__dirname, 'promo_codes.json');
 const PENDING_DELETIONS_PATH = path.join(__dirname, 'pending_deletions.json');
 const CATEGORIES_PATH = path.join(__dirname, 'categories.json');
+const SCHEDULED_CATEGORY_ADDS_PATH = path.join(__dirname, 'scheduled_category_adds.json');
+const PENDING_CATEGORY_ASSIGN_PATH = path.join(__dirname, 'pending_category_assignments.json');
 const FOLDER_JOBS_PATH = path.join(__dirname, 'mega_folder_jobs.json');
 const FOLDER_UPLOAD_HISTORY_PATH = path.join(__dirname, 'mega_folder_upload_history.json');
 
@@ -40,6 +42,7 @@ const DEFAULT_CONFIG = {
     vipChannelLink: null,        // url the "💎 Buy VIP" button sends users to
     vipPromoText: null,          // optional promo copy shown above the Join button
     categoryStorageChannelId: null, // dedicated channel VIP category videos are archived to (see fileShare.js VIP Categories section)
+    categoryTeaserBlurEnabled: false, // free category preview sends a blurred image instead of the full clear video when true
     megaAccounts: [] // [{ id, email, password, label, disabledUntil }] — pool used by the Folder Upload feature for account rotation
 };
 
@@ -60,6 +63,8 @@ const CONFIG_BACKUP_FILES = [
     { path: PROMO_CODES_PATH, name: 'promo_codes.json' },
     { path: PENDING_DELETIONS_PATH, name: 'pending_deletions.json' },
     { path: CATEGORIES_PATH, name: 'categories.json' },
+    { path: SCHEDULED_CATEGORY_ADDS_PATH, name: 'scheduled_category_adds.json' },
+    { path: PENDING_CATEGORY_ASSIGN_PATH, name: 'pending_category_assignments.json' },
     { path: FOLDER_JOBS_PATH, name: 'mega_folder_jobs.json' },
     { path: FOLDER_UPLOAD_HISTORY_PATH, name: 'mega_folder_upload_history.json' }
 ];
@@ -629,7 +634,7 @@ function getCategory(id) {
 // Dedupes on file_unique_id WITHIN the same category — re-adding the exact
 // same clip to a category it's already in is a no-op. The same video is
 // still allowed to belong to multiple different categories on purpose.
-function addVideoToCategory(categoryId, { chatId, messageId, fileUniqueId, type, addedBy, caption }) {
+function addVideoToCategory(categoryId, { chatId, messageId, fileUniqueId, type, addedBy, caption, thumbFileId }) {
     const categories = loadCategories();
     const category = categories[categoryId];
     if (!category) return { success: false, reason: 'not_found' };
@@ -645,12 +650,25 @@ function addVideoToCategory(categoryId, { chatId, messageId, fileUniqueId, type,
         file_unique_id: fileUniqueId || null,
         type: type || 'video',
         caption: caption || null,
+        thumb_file_id: thumbFileId || null,
         added_at: new Date().toISOString(),
         added_by: String(addedBy)
     };
     category.videos.push(video);
     saveCategories(categories);
     return { success: true, video, count: category.videos.length };
+}
+
+// Caches a video's blurred-preview source thumbnail after it's fetched once,
+// so future teaser sends for that video don't need to re-fetch it.
+function setCategoryVideoThumb(categoryId, videoId, thumbFileId) {
+    const categories = loadCategories();
+    const category = categories[categoryId];
+    const video = category && category.videos.find(v => v.id === videoId);
+    if (!video) return false;
+    video.thumb_file_id = thumbFileId;
+    saveCategories(categories);
+    return true;
 }
 
 function removeVideoFromCategory(categoryId, videoId) {
@@ -1074,6 +1092,103 @@ function getPendingScheduledBroadcasts() {
     return loadScheduledBroadcasts().filter(s => !s.sent);
 }
 
+// ===== Scheduled category video adds =====
+// Lets an admin pre-archive a video now and have it actually appear inside
+// a VIP category later, at a chosen IST date/time — same durable pattern
+// as scheduled broadcasts (persisted to disk, swept every minute in bot.js).
+function loadScheduledCategoryAdds() {
+    return safeReadJson(SCHEDULED_CATEGORY_ADDS_PATH, []);
+}
+
+function saveScheduledCategoryAdds(list) {
+    atomicWrite(SCHEDULED_CATEGORY_ADDS_PATH, list);
+}
+
+// entry: { categoryId, chatId, messageId, fileUniqueId, type, caption,
+//          thumbFileId, sendAt (ISO string), createdBy }
+function addScheduledCategoryAdd(entry) {
+    const list = loadScheduledCategoryAdds();
+    const record = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), sent: false, ...entry };
+    list.push(record);
+    saveScheduledCategoryAdds(list);
+    return record;
+}
+
+function removeScheduledCategoryAdd(id) {
+    const list = loadScheduledCategoryAdds();
+    const filtered = list.filter(s => s.id !== id);
+    if (filtered.length !== list.length) saveScheduledCategoryAdds(filtered);
+    return filtered.length !== list.length;
+}
+
+function markScheduledCategoryAddSent(id) {
+    const list = loadScheduledCategoryAdds();
+    const rec = list.find(s => s.id === id);
+    if (rec) {
+        rec.sent = true;
+        saveScheduledCategoryAdds(list);
+    }
+}
+
+// Due = not sent yet and sendAt has passed
+function getDueScheduledCategoryAdds() {
+    const now = Date.now();
+    return loadScheduledCategoryAdds().filter(s => !s.sent && new Date(s.sendAt).getTime() <= now);
+}
+
+function getPendingScheduledCategoryAdds() {
+    return loadScheduledCategoryAdds().filter(s => !s.sent);
+}
+
+// ===== Pending category assignments =====
+// When a video/photo/animation lands directly in the Category Storage
+// Channel (posted by an admin or by another bot — never forwarded to this
+// bot's DM), it's recorded here so an admin can later pick which category
+// it belongs to (and optionally schedule the add) via inline buttons.
+function loadPendingCategoryAssignments() {
+    return safeReadJson(PENDING_CATEGORY_ASSIGN_PATH, {});
+}
+
+function savePendingCategoryAssignments(map) {
+    atomicWrite(PENDING_CATEGORY_ASSIGN_PATH, map);
+}
+
+function addPendingCategoryAssignment({ chatId, messageId, type, fileUniqueId, caption }) {
+    const map = loadPendingCategoryAssignments();
+    const id = genId('pa_');
+    map[id] = { id, chatId, messageId, type, fileUniqueId: fileUniqueId || null, caption: caption || null, createdAt: new Date().toISOString() };
+    savePendingCategoryAssignments(map);
+    return map[id];
+}
+
+function getPendingCategoryAssignment(id) {
+    return loadPendingCategoryAssignments()[id] || null;
+}
+
+function getAllPendingCategoryAssignments() {
+    return Object.values(loadPendingCategoryAssignments());
+}
+
+function removePendingCategoryAssignment(id) {
+    const map = loadPendingCategoryAssignments();
+    if (!map[id]) return false;
+    delete map[id];
+    savePendingCategoryAssignments(map);
+    return true;
+}
+
+// Best-effort cleanup — assignments nobody ever acted on eventually get
+// dropped so the file doesn't grow forever. Default: 7 days.
+function pruneOldPendingCategoryAssignments(maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
+    const map = loadPendingCategoryAssignments();
+    const cutoff = Date.now() - maxAgeMs;
+    let changed = false;
+    for (const [id, entry] of Object.entries(map)) {
+        if (new Date(entry.createdAt).getTime() < cutoff) { delete map[id]; changed = true; }
+    }
+    if (changed) savePendingCategoryAssignments(map);
+}
+
 // ===== Auto-post system (per-admin, isolated channels) =====
 // Keyed by admin user id. Each admin configures their own destination
 // channel, interval, caption, thumbnail source and blur — fully isolated
@@ -1451,11 +1566,22 @@ module.exports = {
     listNonEmptyCategories,
     getCategory,
     addVideoToCategory,
+    setCategoryVideoThumb,
     removeVideoFromCategory,
     removeCategoryVideoByMessage,
     getCategoryStats,
     recordCategoryView,
     getCategoryLeaderboard,
+    addScheduledCategoryAdd,
+    removeScheduledCategoryAdd,
+    markScheduledCategoryAddSent,
+    getDueScheduledCategoryAdds,
+    getPendingScheduledCategoryAdds,
+    addPendingCategoryAssignment,
+    getPendingCategoryAssignment,
+    getAllPendingCategoryAssignments,
+    removePendingCategoryAssignment,
+    pruneOldPendingCategoryAssignments,
     getMegaAccounts,
     addMegaAccount,
     removeMegaAccount,

@@ -111,7 +111,8 @@ const {
     listActiveFolderJobs,
     deleteFolderJob,
     findFolderUpload,
-    recordFolderUpload
+    recordFolderUpload,
+    findLastCategoryForFolder
 } = require('./fileShare');
 const queue = require('./queue');
 const mfu = require('./megaFolderUpload');
@@ -3031,6 +3032,7 @@ async function renderCategoriesPanel(ctx) {
     rows.push([{ text: '➕ Create Category', callback_data: 'cat_create' }]);
     rows.push([{ text: `🎯 ${channelLabel ? 'Change' : 'Set'} Storage Channel`, callback_data: 'cat_setchannel_menu' }]);
     rows.push([{ text: '📥 Pending Channel Posts', callback_data: 'cat_pending_assignments' }]);
+    rows.push([{ text: `⏱ Batch Wait: ${getCategoryBatchDebounceMinutes(config)} min`, callback_data: 'cat_batchwait_cycle' }]);
     rows.push([{ text: `🌫 Teaser Blur: ${config.categoryTeaserBlurEnabled ? 'ON' : 'OFF'}${sharp ? '' : ' (⚠️ sharp not installed)'}`, callback_data: 'cat_blur_toggle' }]);
     rows.push([{ text: '🔙 Back', callback_data: 'menu_fileshare' }]);
 
@@ -3094,6 +3096,29 @@ bot.action('cat_blur_toggle', async (ctx) => {
     config.categoryTeaserBlurEnabled = !config.categoryTeaserBlurEnabled;
     saveConfig(config);
     await ctx.answerCbQuery(`Blur ${config.categoryTeaserBlurEnabled ? 'ON' : 'OFF'}`);
+    await renderCategoriesPanel(ctx);
+});
+
+// Idea 26: how long to wait for channel-post activity to go quiet before
+// batching everything accumulated into a single "which category?" prompt
+// (see scheduleCategoryBatchFlush / flushCategoryBatch below).
+const CATEGORY_BATCH_WAIT_OPTIONS = [1, 2, 5, 10];
+function getCategoryBatchDebounceMinutes(config) {
+    const c = config || loadConfig();
+    return CATEGORY_BATCH_WAIT_OPTIONS.includes(c.categoryBatchDebounceMinutes) ? c.categoryBatchDebounceMinutes : 2;
+}
+function getCategoryBatchDebounceMs() {
+    return getCategoryBatchDebounceMinutes() * 60 * 1000;
+}
+
+bot.action('cat_batchwait_cycle', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const config = loadConfig();
+    const current = getCategoryBatchDebounceMinutes(config);
+    const idx = CATEGORY_BATCH_WAIT_OPTIONS.indexOf(current);
+    config.categoryBatchDebounceMinutes = CATEGORY_BATCH_WAIT_OPTIONS[(idx + 1) % CATEGORY_BATCH_WAIT_OPTIONS.length];
+    saveConfig(config);
+    await ctx.answerCbQuery(`Batch wait: ${config.categoryBatchDebounceMinutes} min`);
     await renderCategoriesPanel(ctx);
 });
 
@@ -3161,6 +3186,25 @@ bot.action(/^cat_addvideo:(.+)$/, async (ctx) => {
         return;
     }
     await ctx.answerCbQuery();
+    await ctx.editMessageText(
+        `➕ *Add to "${escapeMd(category.name)}"*\n\nHow do you want to add content?`,
+        {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [
+                [{ text: '🎥 Forward Manually', callback_data: `cat_addvideo_manual:${category.id}` }],
+                [{ text: '📤 MEGA Folder', callback_data: `mfu_from_category:${category.id}` }],
+                [{ text: '🔗 MEGA Single Link', callback_data: `cat_addvideo_megalink:${category.id}` }],
+                [{ text: '🔙 Back', callback_data: `cat_admin:${category.id}` }]
+            ] }
+        }
+    );
+});
+
+bot.action(/^cat_addvideo_manual:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const category = getCategory(ctx.match[1]);
+    if (!category) { await ctx.answerCbQuery('⚠️ Category not found.'); return; }
+    await ctx.answerCbQuery();
     pendingAction[ctx.from.id] = { type: 'cat_add_video', categoryId: category.id };
     await ctx.editMessageText(
         `➕ *Adding videos to "${escapeMd(category.name)}"*\n\n` +
@@ -3170,6 +3214,52 @@ bot.action(/^cat_addvideo:(.+)$/, async (ctx) => {
             parse_mode: 'Markdown',
             reply_markup: { inline_keyboard: [[{ text: '✅ Done', callback_data: `cat_adddone:${category.id}` }]] }
         }
+    );
+});
+
+// Idea 2: launch the MEGA Folder Upload flow with the destination already
+// pinned to this category — folder pick + filters still happen as normal,
+// but the destination-picker step is skipped entirely at the end (see
+// mfu_filter_continue / mfu_select, which honor state.presetCategoryId).
+bot.action(/^mfu_from_category:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const category = getCategory(ctx.match[1]);
+    if (!category) { await ctx.answerCbQuery('⚠️ Category not found.'); return; }
+    const config = loadConfig();
+    if (!config.categoryStorageChannelId) {
+        await ctx.answerCbQuery('⚠️ Set a storage channel first.');
+        await ctx.editMessageText(
+            '⚠️ *No storage channel set yet*\n\nSet one before uploading into a category.',
+            { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '🎯 Set Storage Channel', callback_data: 'cat_setchannel_menu' }], [{ text: '🔙 Back', callback_data: `cat_admin:${category.id}` }]] } }
+        );
+        return;
+    }
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'mfu_awaiting_link', presetCategoryId: category.id };
+    await ctx.editMessageText(
+        `📂 *MEGA Folder → "${escapeMd(category.name)}"*\n\n` +
+        'Send a MEGA *folder* link — after you pick the subfolder and filters, it uploads straight into this category (no destination step needed).\n\n' +
+        '`https://mega.nz/folder/ID#KEY`',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `cat_admin:${category.id}` }]] } }
+    );
+});
+
+// New: paste a single MEGA *file* link straight into a category, without
+// going through the full folder-upload machinery. Downloads the file,
+// archives it into the category storage channel, and registers it —
+// mirrors exactly what the MFU job runner does per-file for
+// destinationType === 'category' (see runFolderJob), just for one file.
+bot.action(/^cat_addvideo_megalink:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const category = getCategory(ctx.match[1]);
+    if (!category) { await ctx.answerCbQuery('⚠️ Category not found.'); return; }
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'cat_add_megalink', categoryId: category.id };
+    await ctx.editMessageText(
+        `🔗 *MEGA Single Link → "${escapeMd(category.name)}"*\n\n` +
+        'Send a MEGA *file* link (not a folder) — `https://mega.nz/file/ID#KEY`.\n\n' +
+        'It\'ll be downloaded, archived into the storage channel, and added to this category. Only video/photo files are accepted. Send /cancel to stop.',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `cat_admin:${category.id}` }]] } }
     );
 });
 
@@ -3187,10 +3277,14 @@ bot.action('cat_pending_assignments', async (ctx) => {
         });
         return;
     }
-    const rows = pending.slice(0, 25).map(a => {
+    const rows = [];
+    if (pending.length > 1) {
+        rows.push([{ text: `✅ Assign All ${pending.length} to One Category`, callback_data: 'catbatch_menu:all' }]);
+    }
+    for (const a of pending.slice(0, 25)) {
         const label = a.caption ? a.caption.slice(0, 40) : `${a.type} (no caption)`;
-        return [{ text: `📌 ${label}`, callback_data: `catassign_menu:${a.id}` }];
-    });
+        rows.push([{ text: `📌 ${label}`, callback_data: `catassign_menu:${a.id}` }]);
+    }
     rows.push([{ text: '🔙 Back', callback_data: 'cat_menu' }]);
     await ctx.editMessageText(`📥 *${pending.length} unassigned channel post(s)*`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
 });
@@ -3828,17 +3922,317 @@ bot.action('mfu_select', async (ctx) => {
     if (mediaFiles.length === 0) { await ctx.answerCbQuery('⚠️ No photo/video files here.'); return; }
 
     const folderName = state.pathNames.length ? state.pathNames[state.pathNames.length - 1] : (currentNode.name || 'root');
-    folderSelection[ctx.from.id] = {
+    const sel = {
         url: state.url,
         pathNames: [...state.pathNames],
         folderName,
         files: mediaFiles.map(f => ({ name: f.name, size: f.size || 0 })),
         totalSize: mediaFiles.reduce((s, f) => s + (f.size || 0), 0),
-        skippedNonMedia: files.length - mediaFiles.length
+        skippedNonMedia: files.length - mediaFiles.length,
+        // --- Upload filter state (see "Upload Filters" block below) ---
+        typeFilter: 'all',      // 'all' | 'video' | 'photo'
+        order: 'sequential',    // 'sequential' | 'shuffle'
+        countMode: 'all',       // 'all' | 'first' | 'last' | 'random'
+        countN: null,
+        manualExcluded: [],     // file names explicitly deselected in the review list
+        randomNames: null       // frozen file-name pick for countMode === 'random'
     };
+
+    // Idea 2: destination pinned when launched from a category's admin panel
+    // (mfu_from_category) — skips the destination-picker step entirely.
+    if (state.presetCategoryId) {
+        const presetCategory = getCategory(state.presetCategoryId);
+        if (presetCategory) {
+            sel.destinationType = 'category';
+            sel.destinationId = presetCategory.id;
+            sel.destinationLabel = presetCategory.name;
+        }
+    }
+    folderSelection[ctx.from.id] = sel;
     delete folderBrowseState[ctx.from.id];
     await ctx.answerCbQuery();
+    await renderFolderFilterPanel(ctx);
+});
+
+// ============================================================================
+// Upload Filters — lets the admin narrow down exactly which files from the
+// selected MEGA folder actually get uploaded, and in what order, before
+// picking a destination. Sits between "✅ Select This Folder" and the
+// destination picker. Nothing here touches sel.files (the raw folder
+// listing) — filters are stored as separate criteria and resolved on demand
+// via getTypeFilteredFiles/getEffectiveFiles, so toggling a filter back and
+// forth never loses data.
+// ============================================================================
+
+// Files matching the current type filter, in original folder order. This is
+// the base pool every other filter (manual exclude, count, review list
+// indexing) operates on — kept as a single source of truth so paginated
+// review-list indices stay valid across renders.
+function getTypeFilteredFiles(sel) {
+    if (sel.typeFilter === 'video') return sel.files.filter(f => isVideoFile(f.name));
+    if (sel.typeFilter === 'photo') return sel.files.filter(f => isImageFile(f.name));
+    return sel.files;
+}
+
+// Type-filtered pool minus anything manually deselected in the review list.
+function getManualFilteredFiles(sel) {
+    const excluded = new Set(sel.manualExcluded || []);
+    return getTypeFilteredFiles(sel).filter(f => !excluded.has(f.name));
+}
+
+// The final file list that will actually be uploaded — type filter, manual
+// deselect, and count-limiting always applied; shuffle order only applied
+// when applyOrder is true (i.e. at confirm/job-creation time), so the
+// review/preview screens always show a stable, readable folder-order list.
+function getEffectiveFiles(sel, { applyOrder = false } = {}) {
+    const pool = getManualFilteredFiles(sel);
+    let result;
+    if (sel.countMode === 'first' && sel.countN) {
+        result = pool.slice(0, sel.countN);
+    } else if (sel.countMode === 'last' && sel.countN) {
+        result = pool.slice(-sel.countN);
+    } else if (sel.countMode === 'random' && sel.countN) {
+        const names = new Set(sel.randomNames || []);
+        result = pool.filter(f => names.has(f.name));
+    } else {
+        result = pool;
+    }
+    if (applyOrder && sel.order === 'shuffle') {
+        result = shuffleArray(result);
+    }
+    return result;
+}
+
+// Re-derives sel.randomNames after the underlying pool changes (type filter
+// toggled, or count re-entered) so a "random N" pick always draws from the
+// currently valid pool instead of a stale one.
+function refreshRandomPick(sel) {
+    if (sel.countMode !== 'random' || !sel.countN) { sel.randomNames = null; return; }
+    const pool = getManualFilteredFiles(sel);
+    const n = Math.min(sel.countN, pool.length);
+    sel.randomNames = shuffleArray(pool).slice(0, n).map(f => f.name);
+}
+
+function countModeLabel(sel) {
+    if (sel.countMode === 'first' && sel.countN) return `First ${sel.countN}`;
+    if (sel.countMode === 'last' && sel.countN) return `Last ${sel.countN}`;
+    if (sel.countMode === 'random' && sel.countN) return `Random ${sel.countN}`;
+    return 'All';
+}
+
+async function renderFolderFilterPanel(ctx) {
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) {
+        await sendOrEdit(ctx, '⚠️ Selection expired. Start again from Folder Upload.', {
+            reply_markup: { inline_keyboard: [[{ text: '📂 Folder Upload', callback_data: 'mfu_menu' }]] }
+        });
+        return;
+    }
+    const typeFiltered = getTypeFilteredFiles(sel);
+    const videoCount = sel.files.filter(f => isVideoFile(f.name)).length;
+    const photoCount = sel.files.filter(f => isImageFile(f.name)).length;
+    const effective = getEffectiveFiles(sel);
+    const effectiveSize = effective.reduce((s, f) => s + (f.size || 0), 0);
+    const excludedCount = (sel.manualExcluded || []).filter(name => typeFiltered.some(f => f.name === name)).length;
+
+    const typeLabel = sel.typeFilter === 'video' ? 'Video only 🎬' : sel.typeFilter === 'photo' ? 'Photo only 🖼' : 'All 🎬🖼';
+    const orderLabel = sel.order === 'shuffle' ? 'Shuffle 🔀' : 'Sequential ➡️';
+
+    const text = `🎛 *Upload Filters*\n\n📁 ${escapeMd(sel.folderName)}\n` +
+        (sel.destinationType ? `🎯 Destination: 💎 ${escapeMd(sel.destinationLabel)} (preset)\n` : '') +
+        `Available: ${videoCount} video, ${photoCount} photo (${sel.files.length} total)\n\n` +
+        `🎬 Type: *${typeLabel}*\n` +
+        `🔀 Order: *${orderLabel}*\n` +
+        `🔢 Count: *${countModeLabel(sel)}*\n` +
+        (excludedCount > 0 ? `🚫 Manually excluded: ${excludedCount}\n` : '') +
+        `\n✅ *Will upload: ${effective.length} file(s), ${mfu.formatBytes(effectiveSize)}*`;
+
+    const rows = [
+        [{ text: `🎬 Type: ${typeLabel}`, callback_data: 'mfu_filter_type' }],
+        [{ text: `🔀 Order: ${orderLabel}`, callback_data: 'mfu_filter_order' }],
+        [{ text: `🔢 Count: ${countModeLabel(sel)}`, callback_data: 'mfu_filter_count_menu' }],
+        [{ text: `📋 Review Files (${typeFiltered.length})`, callback_data: 'mfu_filter_review:0' }],
+        [{ text: '➡️ Continue', callback_data: 'mfu_filter_continue' }],
+        [{ text: '❌ Cancel', callback_data: 'mfu_cancel' }]
+    ];
+    await sendOrEdit(ctx, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+}
+
+bot.action('mfu_filter_back', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    await ctx.answerCbQuery();
+    await renderFolderFilterPanel(ctx);
+});
+
+bot.action('mfu_filter_continue', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    if (getEffectiveFiles(sel).length === 0) {
+        await ctx.answerCbQuery('⚠️ No files left after filters — adjust them first.');
+        return;
+    }
+    await ctx.answerCbQuery();
+    if (sel.destinationType) {
+        // Preset destination (idea 2: launched via mfu_from_category) — skip straight to Confirm.
+        await renderFolderConfirm(ctx);
+        return;
+    }
     await renderFolderDestinationPicker(ctx);
+});
+
+bot.action('mfu_filter_type', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    sel.typeFilter = sel.typeFilter === 'all' ? 'video' : sel.typeFilter === 'video' ? 'photo' : 'all';
+    refreshRandomPick(sel);
+    await ctx.answerCbQuery(`Type: ${sel.typeFilter}`);
+    await renderFolderFilterPanel(ctx);
+});
+
+bot.action('mfu_filter_order', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    sel.order = sel.order === 'sequential' ? 'shuffle' : 'sequential';
+    await ctx.answerCbQuery(`Order: ${sel.order}`);
+    await renderFolderFilterPanel(ctx);
+});
+
+bot.action('mfu_filter_count_menu', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    await ctx.answerCbQuery();
+    const pool = getManualFilteredFiles(sel).length;
+    await sendOrEdit(ctx, `🔢 *Count*\n\nPool available: ${pool} file(s) after type/manual filters.\nPick how many to upload:`, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '✅ All', callback_data: 'mfu_count_set:all' }],
+                [{ text: '🔼 First N…', callback_data: 'mfu_count_ask:first' }],
+                [{ text: '🔽 Last N…', callback_data: 'mfu_count_ask:last' }],
+                [{ text: '🎲 Random N…', callback_data: 'mfu_count_ask:random' }],
+                [{ text: '🔙 Back', callback_data: 'mfu_filter_back' }]
+            ]
+        }
+    });
+});
+
+bot.action('mfu_count_set:all', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    sel.countMode = 'all';
+    sel.countN = null;
+    sel.randomNames = null;
+    await ctx.answerCbQuery('Count: All');
+    await renderFolderFilterPanel(ctx);
+});
+
+bot.action(/^mfu_count_ask:(first|last|random)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    const mode = ctx.match[1];
+    const pool = getManualFilteredFiles(sel).length;
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'mfu_count_number', mode };
+    await ctx.editMessageText(`⌨️ Send a number between 1 and ${pool} (${mode} N), or /cancel.`, {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mfu_filter_count_menu' }]] }
+    });
+});
+
+// Paginated review list — lets the admin deselect individual files from the
+// type-filtered pool without leaving the folder selection flow. Indices are
+// positions into getTypeFilteredFiles(sel), which stays deterministic as
+// long as typeFilter and the raw sel.files don't change between renders —
+// true here, since only mfu_filetoggle/select-all/deselect-all read it.
+const MFU_REVIEW_PAGE_SIZE = 8;
+
+async function renderFolderReviewList(ctx, page) {
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) {
+        await sendOrEdit(ctx, '⚠️ Selection expired. Start again from Folder Upload.', {
+            reply_markup: { inline_keyboard: [[{ text: '📂 Folder Upload', callback_data: 'mfu_menu' }]] }
+        });
+        return;
+    }
+    const pool = getTypeFilteredFiles(sel);
+    const excluded = new Set(sel.manualExcluded || []);
+    const totalPages = Math.max(1, Math.ceil(pool.length / MFU_REVIEW_PAGE_SIZE));
+    const clampedPage = Math.max(0, Math.min(page, totalPages - 1));
+    const start = clampedPage * MFU_REVIEW_PAGE_SIZE;
+    const slice = pool.slice(start, start + MFU_REVIEW_PAGE_SIZE);
+
+    const rows = slice.map((f, i) => {
+        const idx = start + i;
+        const isExcluded = excluded.has(f.name);
+        const label = f.name.length > 38 ? f.name.slice(0, 35) + '…' : f.name;
+        return [{ text: `${isExcluded ? '⬜' : '✅'} ${label} (${mfu.formatBytes(f.size || 0)})`, callback_data: `mfu_filetoggle:${idx}:${clampedPage}` }];
+    });
+
+    const navRow = [];
+    if (clampedPage > 0) navRow.push({ text: '◀️ Prev', callback_data: `mfu_filter_review:${clampedPage - 1}` });
+    if (clampedPage < totalPages - 1) navRow.push({ text: '▶️ Next', callback_data: `mfu_filter_review:${clampedPage + 1}` });
+    if (navRow.length) rows.push(navRow);
+
+    rows.push([
+        { text: '✅ Select All', callback_data: 'mfu_filter_selectall' },
+        { text: '⬜ Deselect All', callback_data: 'mfu_filter_deselectall' }
+    ]);
+    rows.push([{ text: '🔙 Back', callback_data: 'mfu_filter_back' }]);
+
+    const includedCount = pool.length - excluded.size;
+    await sendOrEdit(ctx, `📋 *Review Files* — page ${clampedPage + 1}/${totalPages}\n\n${includedCount}/${pool.length} selected. Tap a file to toggle it.`, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: rows }
+    });
+}
+
+bot.action(/^mfu_filter_review:(\d+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    if (!folderSelection[ctx.from.id]) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    await ctx.answerCbQuery();
+    await renderFolderReviewList(ctx, parseInt(ctx.match[1], 10));
+});
+
+bot.action(/^mfu_filetoggle:(\d+):(\d+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    const idx = parseInt(ctx.match[1], 10);
+    const page = parseInt(ctx.match[2], 10);
+    const pool = getTypeFilteredFiles(sel);
+    const file = pool[idx];
+    if (!file) { await ctx.answerCbQuery('⚠️ Not found.'); return; }
+    const excluded = new Set(sel.manualExcluded || []);
+    if (excluded.has(file.name)) excluded.delete(file.name); else excluded.add(file.name);
+    sel.manualExcluded = [...excluded];
+    refreshRandomPick(sel);
+    await ctx.answerCbQuery(excluded.has(file.name) ? 'Deselected' : 'Selected');
+    await renderFolderReviewList(ctx, page);
+});
+
+bot.action('mfu_filter_selectall', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    sel.manualExcluded = [];
+    refreshRandomPick(sel);
+    await ctx.answerCbQuery('✅ All selected');
+    await renderFolderReviewList(ctx, 0);
+});
+
+bot.action('mfu_filter_deselectall', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    sel.manualExcluded = getTypeFilteredFiles(sel).map(f => f.name);
+    refreshRandomPick(sel);
+    await ctx.answerCbQuery('⬜ All deselected');
+    await renderFolderReviewList(ctx, 0);
 });
 
 async function renderFolderDestinationPicker(ctx) {
@@ -3849,10 +4243,14 @@ async function renderFolderDestinationPicker(ctx) {
         });
         return;
     }
+    const effective = getEffectiveFiles(sel);
+    const effectiveSize = effective.reduce((s, f) => s + (f.size || 0), 0);
+    const filtersActive = sel.typeFilter !== 'all' || sel.order !== 'sequential' || sel.countMode !== 'all' || (sel.manualExcluded || []).length > 0;
     const text = `📁 *${escapeMd(sel.folderName)}*\n\n` +
-        `Files to upload: ${sel.files.length}\n` +
-        `Total size: ${mfu.formatBytes(sel.totalSize)}\n` +
+        `Files to upload: ${effective.length}\n` +
+        `Total size: ${mfu.formatBytes(effectiveSize)}\n` +
         (sel.skippedNonMedia > 0 ? `Skipping ${sel.skippedNonMedia} non-photo/video file(s)\n` : '') +
+        (filtersActive ? `🎛 Filters: ${countModeLabel(sel)}, ${sel.order === 'shuffle' ? 'shuffled' : 'sequential'}, type: ${sel.typeFilter}\n` : '') +
         `\nWhere should these go?`;
     await sendOrEdit(ctx, text, {
         parse_mode: 'Markdown',
@@ -3860,6 +4258,7 @@ async function renderFolderDestinationPicker(ctx) {
             inline_keyboard: [
                 [{ text: '📢 Public Channel', callback_data: 'mfu_dest_channel' }],
                 [{ text: '💎 VIP Category', callback_data: 'mfu_dest_category' }],
+                [{ text: '🎛 Back to Filters', callback_data: 'mfu_filter_back' }],
                 [{ text: '❌ Cancel', callback_data: 'mfu_cancel' }]
             ]
         }
@@ -3929,8 +4328,27 @@ async function renderFolderCategoryPicker(ctx) {
         });
         return;
     }
+    const sel = folderSelection[ctx.from.id];
     const categories = listCategories();
-    const rows = categories.slice(0, 25).map(c => [{ text: `📁 ${c.name} (${c.videos.length})`, callback_data: `mfu_cat:${c.id}` }]);
+    const rows = [];
+
+    // Idea 13: suggest whatever category this exact folder last went to,
+    // pinned above the alphabetic list, so a repeated upload into the same
+    // category is a single tap instead of a re-pick.
+    let suggestedId = null;
+    if (sel) {
+        const folderKey = `${sel.url}::${sel.pathNames.join('/')}`;
+        const lastUsed = findLastCategoryForFolder(folderKey);
+        if (lastUsed && getCategory(lastUsed.destinationId)) {
+            suggestedId = lastUsed.destinationId;
+            const cat = getCategory(suggestedId);
+            rows.push([{ text: `⭐ ${cat.name} (last used)`, callback_data: `mfu_cat:${cat.id}` }]);
+        }
+    }
+    for (const c of categories.slice(0, 25)) {
+        if (c.id === suggestedId) continue; // already shown above
+        rows.push([{ text: `📁 ${c.name} (${c.videos.length})`, callback_data: `mfu_cat:${c.id}` }]);
+    }
     rows.push([{ text: '➕ New Category', callback_data: 'mfu_cat_new' }]);
     rows.push([{ text: '🔙 Back', callback_data: 'mfu_reselect_dest' }]);
     await sendOrEdit(ctx, '💎 *Choose VIP Category*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
@@ -3949,7 +4367,50 @@ bot.action(/^mfu_cat:(.+)$/, async (ctx) => {
     await renderFolderConfirm(ctx);
 });
 
+// Idea 4: instead of always asking the admin to type a name, offer the
+// MEGA folder's own name as a one-tap suggestion — still editable via
+// "Type a Different Name" for anyone who wants something else.
 bot.action('mfu_cat_new', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    await ctx.answerCbQuery();
+    const suggested = sel.folderName || '';
+    const shortLabel = suggested.length > 30 ? suggested.slice(0, 27) + '…' : suggested;
+    const rows = [];
+    if (suggested) rows.push([{ text: `✅ Use "${shortLabel}"`, callback_data: 'mfu_cat_new_suggested' }]);
+    rows.push([{ text: '✏️ Type a Different Name', callback_data: 'mfu_cat_new_custom' }]);
+    rows.push([{ text: '❌ Cancel', callback_data: 'mfu_dest_category' }]);
+    await ctx.editMessageText(
+        `➕ *New Category*\n\n` + (suggested ? `Suggested name (from folder): "${escapeMd(suggested)}"` : 'Send a name for the new category (max 64 characters), or /cancel.'),
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } }
+    );
+});
+
+bot.action('mfu_cat_new_suggested', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const sel = folderSelection[ctx.from.id];
+    if (!sel) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    const result = createCategory(sel.folderName, ctx.from.id);
+    if (!result.success) {
+        const reason = result.reason === 'exists' ? 'A category with that name already exists.'
+            : result.reason === 'too_long' ? 'That name is too long (max 64 characters).'
+            : 'Please pick a name.';
+        await ctx.answerCbQuery();
+        await ctx.editMessageText(`⚠️ ${reason} Type a different name instead:`, {
+            reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mfu_dest_category' }]] }
+        });
+        pendingAction[ctx.from.id] = { type: 'mfu_cat_new_name' };
+        return;
+    }
+    sel.destinationType = 'category';
+    sel.destinationId = result.category.id;
+    sel.destinationLabel = result.category.name;
+    await ctx.answerCbQuery('✅ Category created');
+    await renderFolderConfirm(ctx);
+});
+
+bot.action('mfu_cat_new_custom', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     if (!folderSelection[ctx.from.id]) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
     await ctx.answerCbQuery();
@@ -3969,12 +4430,16 @@ async function renderFolderConfirm(ctx) {
     }
     const folderKey = `${sel.url}::${sel.pathNames.join('/')}`;
     const prevUpload = findFolderUpload(folderKey, sel.destinationType, sel.destinationId);
+    const effective = getEffectiveFiles(sel);
+    const effectiveSize = effective.reduce((s, f) => s + (f.size || 0), 0);
+    const filtersActive = sel.typeFilter !== 'all' || sel.order !== 'sequential' || sel.countMode !== 'all' || (sel.manualExcluded || []).length > 0;
 
     let text = `🚀 *Ready to Upload*\n\n` +
         `📁 Folder: ${escapeMd(sel.folderName)}\n` +
-        `📊 Files: ${sel.files.length}\n` +
-        `💾 Size: ${mfu.formatBytes(sel.totalSize)}\n` +
-        `📤 Destination: ${sel.destinationType === 'channel' ? '📢' : '💎'} ${escapeMd(sel.destinationLabel)}\n`;
+        `📊 Files: ${effective.length}\n` +
+        `💾 Size: ${mfu.formatBytes(effectiveSize)}\n` +
+        `📤 Destination: ${sel.destinationType === 'channel' ? '📢' : '💎'} ${escapeMd(sel.destinationLabel)}\n` +
+        (filtersActive ? `🎛 Filters: type ${sel.typeFilter}, count ${countModeLabel(sel)}, order ${sel.order === 'shuffle' ? 'shuffle 🔀' : 'sequential ➡️'}\n` : '');
 
     if (prevUpload) {
         const when = new Date(prevUpload.uploadedAt).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
@@ -3983,7 +4448,11 @@ async function renderFolderConfirm(ctx) {
 
     await sendOrEdit(ctx, text, {
         parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [[{ text: '🚀 Start Upload', callback_data: 'mfu_confirm' }], [{ text: '❌ Cancel', callback_data: 'mfu_cancel' }]] }
+        reply_markup: { inline_keyboard: [
+            [{ text: '🚀 Start Upload', callback_data: 'mfu_confirm' }],
+            [{ text: '🎛 Edit Filters', callback_data: 'mfu_filter_back' }],
+            [{ text: '❌ Cancel', callback_data: 'mfu_cancel' }]
+        ] }
     });
 }
 
@@ -4000,6 +4469,8 @@ bot.action('mfu_confirm', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     const sel = folderSelection[ctx.from.id];
     if (!sel || !sel.destinationType) { await ctx.answerCbQuery('⚠️ Selection expired.'); return; }
+    const effectiveFiles = getEffectiveFiles(sel, { applyOrder: true });
+    if (effectiveFiles.length === 0) { await ctx.answerCbQuery('⚠️ No files left after filters.'); return; }
     await ctx.answerCbQuery('🚀 Starting...');
     delete folderSelection[ctx.from.id];
 
@@ -4015,7 +4486,7 @@ bot.action('mfu_confirm', async (ctx) => {
         destinationType: sel.destinationType,
         destinationId: sel.destinationId,
         destinationLabel: sel.destinationLabel,
-        files: sel.files.map(f => ({ name: f.name, size: f.size, status: 'pending' })),
+        files: effectiveFiles.map(f => ({ name: f.name, size: f.size, status: 'pending' })),
         createdAt: new Date().toISOString(),
         sentCount: 0,
         failedCount: 0,
@@ -5612,24 +6083,137 @@ async function isTrustedChannelAdmin(ctx) {
     }
 }
 
-// DMs every configured admin with a "📁 Assign to Category" button whenever
-// a new video/photo/animation lands in the Category Storage Channel. If an
-// admin has never opened a DM with the bot (or blocked it), sendMessage just
-// fails silently for them — the post still shows up under "📥 Pending
-// Channel Posts" in the category admin panel as a fallback.
-async function notifyAdminsOfNewCategoryPost(assignment) {
+// ---- Channel batch-categorize ----
+// Posting to the Category Storage Channel in bulk (or one at a time) used to
+// DM admins once per file, which is spammy for a 50-file drop. Instead,
+// every new post is buffered here and the debounce timer keeps getting
+// pushed back; only once posting activity goes quiet for
+// getCategoryBatchDebounceMs() (idea 26, admin-configurable) does a single
+// "N files — which category?" prompt go out, covering the whole buffer.
+// Buffer is in-memory/ephemeral by design — if the process restarts mid-wait,
+// the individual assignments are still safely persisted via
+// addPendingCategoryAssignment and remain reachable through "📥 Pending
+// Channel Posts" as a fallback (see cat_pending_assignments, idea 10's bulk
+// button there covers exactly this recovery case).
+let categoryBatchBuffer = [];
+let categoryBatchTimer = null;
+const pendingCategoryBatches = {}; // batchId -> { ids: [...], createdAt }
+
+function scheduleCategoryBatchFlush(assignmentId) {
+    categoryBatchBuffer.push(assignmentId);
+    if (categoryBatchTimer) clearTimeout(categoryBatchTimer);
+    categoryBatchTimer = setTimeout(() => { flushCategoryBatch().catch(e => logError('flushCategoryBatch', e)); }, getCategoryBatchDebounceMs());
+}
+
+async function flushCategoryBatch() {
+    categoryBatchTimer = null;
+    if (categoryBatchBuffer.length === 0) return;
+    const ids = categoryBatchBuffer;
+    categoryBatchBuffer = [];
+    const batchId = `cbatch_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    pendingCategoryBatches[batchId] = { ids, createdAt: Date.now() };
+    await notifyAdminsOfCategoryBatch(batchId, ids.length);
+}
+
+// Resolves a batch token to a live list of assignment ids — either a real
+// batchId from pendingCategoryBatches, or the special token 'all', which
+// always re-reads *every* currently pending assignment fresh (used by idea
+// 10's "Assign All to One Category" bulk button, and as the fallback path
+// if a batch notification's own ids have since been handled individually).
+function resolveBatchIds(token) {
+    if (token === 'all') return getAllPendingCategoryAssignments().map(a => a.id);
+    const batch = pendingCategoryBatches[token];
+    return batch ? batch.ids : null;
+}
+
+async function notifyAdminsOfCategoryBatch(batchId, count) {
     const adminIds = (process.env.ADMIN_IDS || '').split(',').map(id => id.trim()).filter(Boolean);
-    const label = assignment.caption ? assignment.caption.slice(0, 60) : `${assignment.type} (no caption)`;
+    const text = `📥 *${count} new file(s)* posted to the category storage channel.\n\nFile them into a category?`;
+    const keyboard = { inline_keyboard: [
+        [{ text: '📁 Choose Category', callback_data: `catbatch_menu:${batchId}` }],
+        [{ text: '❌ Skip These', callback_data: `catbatch_skip:${batchId}` }]
+    ] };
     for (const adminId of adminIds) {
         try {
-            await bot.telegram.sendMessage(
-                adminId,
-                `📥 New ${assignment.type} posted to the category storage channel:\n"${escapeMd(label)}"\n\nFile it into a category?`,
-                { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '📁 Assign to Category', callback_data: `catassign_menu:${assignment.id}` }]] } }
-            );
+            await bot.telegram.sendMessage(adminId, text, { parse_mode: 'Markdown', reply_markup: keyboard });
         } catch (e) { /* admin hasn't opened a DM with the bot yet, or blocked it — ignore */ }
     }
 }
+
+// Category picker for a batch (existing categories + New Category).
+bot.action(/^catbatch_menu:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const token = ctx.match[1];
+    const ids = resolveBatchIds(token);
+    if (!ids || ids.length === 0) {
+        await ctx.answerCbQuery('⚠️ Nothing left to assign — already handled.');
+        return;
+    }
+    await ctx.answerCbQuery();
+    const categories = listCategories();
+    const rows = categories.slice(0, 25).map(c => [{ text: `📁 ${c.name} (${c.videos.length})`, callback_data: `catbatch_pick:${token}:${c.id}` }]);
+    rows.push([{ text: '➕ New Category', callback_data: `catbatch_newcat:${token}` }]);
+    await sendOrEdit(ctx, `📁 *Pick a category for ${ids.length} file(s):*`, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+});
+
+// Bulk-add every assignment in the batch into the chosen category — same
+// per-file logic as catassign_now, just looped.
+bot.action(/^catbatch_pick:([^:]+):(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const [, token, categoryId] = ctx.match;
+    const category = getCategory(categoryId);
+    const ids = resolveBatchIds(token);
+    if (!category || !ids || ids.length === 0) {
+        await ctx.answerCbQuery('⚠️ Expired or already handled.');
+        return;
+    }
+    await ctx.answerCbQuery('⏳ Adding...');
+    let added = 0, duplicate = 0, missing = 0;
+    for (const id of ids) {
+        const assignment = getPendingCategoryAssignment(id);
+        if (!assignment) { missing++; continue; }
+        let thumbFileId = null;
+        if (assignment.type === 'video') {
+            thumbFileId = await getVideoThumbnailFileId(ctx.from.id, assignment.chatId, assignment.messageId);
+        }
+        const result = addVideoToCategory(categoryId, {
+            chatId: assignment.chatId, messageId: assignment.messageId, fileUniqueId: assignment.fileUniqueId,
+            type: assignment.type, addedBy: ctx.from.id, caption: assignment.caption, thumbFileId
+        });
+        if (result.success) added++; else if (result.reason === 'duplicate') duplicate++; else missing++;
+        removePendingCategoryAssignment(id);
+    }
+    delete pendingCategoryBatches[token];
+    let summary = `✅ Added ${added} file(s) to "${category.name}".`;
+    if (duplicate > 0) summary += ` ${duplicate} duplicate(s) skipped.`;
+    if (missing > 0) summary += ` ${missing} already handled elsewhere.`;
+    await sendOrEdit(ctx, summary, { reply_markup: { inline_keyboard: [[{ text: '📂 Categories', callback_data: 'cat_menu' }]] } });
+});
+
+bot.action(/^catbatch_newcat:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const token = ctx.match[1];
+    const ids = resolveBatchIds(token);
+    if (!ids || ids.length === 0) { await ctx.answerCbQuery('⚠️ Nothing left to assign — already handled.'); return; }
+    await ctx.answerCbQuery();
+    pendingAction[ctx.from.id] = { type: 'catbatch_new_name', token };
+    await sendOrEdit(ctx, `➕ Send a name for the new category (max 64 characters) for these ${ids.length} file(s), or /cancel.`, {
+        reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: `catbatch_menu:${token}` }]] }
+    });
+});
+
+// "Skip" leaves the underlying pending assignments untouched (still
+// reachable individually or via idea 10's bulk button in "📥 Pending Channel
+// Posts") — it only dismisses this particular batch notification.
+bot.action(/^catbatch_skip:(.+)$/, async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const token = ctx.match[1];
+    delete pendingCategoryBatches[token];
+    await ctx.answerCbQuery('Skipped');
+    await sendOrEdit(ctx, '⏭ Skipped — these still show up under "📥 Pending Channel Posts" (VIP Categories menu) if you want to file them later.', {
+        reply_markup: { inline_keyboard: [[{ text: '📂 Categories', callback_data: 'cat_menu' }]] }
+    });
+});
 
 // Category picker for a pending channel-post assignment.
 bot.action(/^catassign_menu:(.+)$/, async (ctx) => {
@@ -5811,8 +6395,9 @@ bot.on('channel_post', async (ctx) => {
 
     // VIP Category Storage Channel: any video/photo/animation posted here
     // directly — by an admin uploading manually, or by another bot with
-    // post access — is flagged for an admin to file into a category via
-    // inline buttons. Nothing needs to be forwarded to the bot's DM.
+    // post access — is flagged for an admin to file into a category.
+    // Buffered (see scheduleCategoryBatchFlush) so a bulk drop of many files
+    // triggers one "which category?" prompt instead of one per file.
     if (post.video || post.photo || post.animation) {
         const config = loadConfig();
         if (config.categoryStorageChannelId && String(ctx.chat.id) === String(config.categoryStorageChannelId)) {
@@ -5821,7 +6406,7 @@ bot.on('channel_post', async (ctx) => {
                 : type === 'animation' ? post.animation.file_unique_id
                 : post.photo[post.photo.length - 1].file_unique_id;
             const assignment = addPendingCategoryAssignment({ chatId: ctx.chat.id, messageId: post.message_id, type, fileUniqueId, caption: post.caption || null });
-            await notifyAdminsOfNewCategoryPost(assignment);
+            scheduleCategoryBatchFlush(assignment.id);
             return;
         }
     }
@@ -6327,6 +6912,7 @@ async function handlePendingAction(ctx, text) {
             reply_markup: {
                 inline_keyboard: [
                     [{ text: '➕ Add Videos Now', callback_data: `cat_addvideo:${result.category.id}` }],
+                    [{ text: '📤 Upload MEGA Folder', callback_data: `mfu_from_category:${result.category.id}` }],
                     [{ text: '📂 Categories', callback_data: 'cat_menu' }]
                 ]
             }
@@ -6405,7 +6991,7 @@ async function handlePendingAction(ctx, text) {
             await ctx.reply(msg);
             return;
         }
-        folderBrowseState[userId] = { url, nodeStack: [root], pathNames: [] };
+        folderBrowseState[userId] = { url, nodeStack: [root], pathNames: [], presetCategoryId: action.presetCategoryId || null };
         if (statusMsg) { try { await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id); } catch (e) { /* best-effort */ } }
         await renderFolderBrowse(ctx, userId);
         return;
@@ -6439,6 +7025,135 @@ async function handlePendingAction(ctx, text) {
         return;
     }
 
+    if (action.type === 'cat_add_megalink') {
+        const category = getCategory(action.categoryId);
+        if (!category) { delete pendingAction[userId]; await ctx.reply('⚠️ That category no longer exists.'); return; }
+        const link = cleanMegaLink(text.trim());
+        if (!link) {
+            await ctx.reply('⚠️ That doesn\'t look like a MEGA link. Send a `https://mega.nz/file/ID#KEY` link, or /cancel.', { parse_mode: 'Markdown' });
+            return;
+        }
+        if (link.includes('/folder/')) {
+            await ctx.reply('⚠️ That\'s a *folder* link — use 📤 MEGA Folder instead. Send a *file* link, or /cancel.', { parse_mode: 'Markdown' });
+            return;
+        }
+        const config = loadConfig();
+        if (!config.categoryStorageChannelId) {
+            delete pendingAction[userId];
+            await ctx.reply('⚠️ No storage channel set — set one from the VIP Categories menu first.');
+            return;
+        }
+        delete pendingAction[userId];
+
+        let statusMsg;
+        try { statusMsg = await ctx.reply('🔍 *Downloading from MEGA...*', { parse_mode: 'Markdown' }); } catch (e) { /* best-effort */ }
+        const editStatus = async (t) => {
+            if (!statusMsg) return;
+            try { await ctx.telegram.editMessageText(ctx.chat.id, statusMsg.message_id, null, t, { parse_mode: 'Markdown' }); } catch (e) { /* best-effort */ }
+        };
+        const downloadUpdater = createProgressUpdater(editStatus, '⬇️ *Downloading from MEGA*');
+
+        let result;
+        try {
+            result = await downloadMegaFile(link, userId, downloadUpdater);
+        } catch (error) {
+            await editStatus(`❌ *Download failed*\n\n${error.message}`);
+            return;
+        }
+
+        if (result.type !== 'file') {
+            await editStatus('⚠️ That link pointed to a folder, not a file — use 📤 MEGA Folder instead.');
+            return;
+        }
+
+        const maxFileSize = 2000 * 1024 * 1024;
+        if (result.size > maxFileSize) {
+            await editStatus(`❌ *File too large* (${formatBytes(result.size)}) — Telegram's limit is 2GB.`);
+            cleanupFile(result.path);
+            return;
+        }
+
+        const type = isVideoFile(result.name) ? 'video' : isImageFile(result.name) ? 'photo' : null;
+        if (!type) {
+            await editStatus(`⚠️ *Not a video/photo file* — "${result.name}" can't be added to a category.`);
+            cleanupFile(result.path);
+            return;
+        }
+
+        let sentMsg;
+        try {
+            await editStatus(`📤 *Uploading to storage channel...*\n\n*Name:* \`${result.name}\`\n*Size:* ${formatBytes(result.size)}`);
+            sentMsg = await sendFileToChatDirect(result.path, result.name, config.categoryStorageChannelId);
+        } catch (sendError) {
+            await editStatus(`❌ *Failed to upload*\n\n${sendError.message}`);
+            cleanupFile(result.path);
+            return;
+        }
+        cleanupFile(result.path);
+
+        let thumbFileId = null;
+        if (type === 'video') {
+            thumbFileId = await getVideoThumbnailFileId(userId, config.categoryStorageChannelId, sentMsg.id);
+        }
+        const addResult = addVideoToCategory(category.id, {
+            chatId: config.categoryStorageChannelId, messageId: sentMsg.id, fileUniqueId: null,
+            type, addedBy: userId, caption: null, thumbFileId
+        });
+
+        if (statusMsg) { try { await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id); } catch (e) { /* best-effort */ } }
+        await ctx.reply(
+            addResult.success
+                ? `✅ Added to "${category.name}" — ${addResult.count} video(s) now.`
+                : `⚠️ Uploaded, but not added to the category (${addResult.reason}).`,
+            { reply_markup: { inline_keyboard: [
+                [{ text: '🔗 Add Another Link', callback_data: `cat_addvideo_megalink:${category.id}` }],
+                [{ text: '🔙 Category', callback_data: `cat_admin:${category.id}` }]
+            ] } }
+        );
+        return;
+    }
+
+    if (action.type === 'catbatch_new_name') {
+        const { token } = action;
+        const ids = resolveBatchIds(token);
+        delete pendingAction[userId];
+        if (!ids || ids.length === 0) {
+            await ctx.reply('⚠️ Nothing left to assign — already handled.');
+            return;
+        }
+        const result = createCategory(text, userId);
+        if (!result.success) {
+            const reason = result.reason === 'exists' ? 'A category with that name already exists.'
+                : result.reason === 'too_long' ? 'That name is too long (max 64 characters).'
+                : 'Please send a non-empty name.';
+            await ctx.reply(`⚠️ ${reason} Try again.`, {
+                reply_markup: { inline_keyboard: [[{ text: '📁 Choose Category', callback_data: `catbatch_menu:${token}` }]] }
+            });
+            return;
+        }
+        let added = 0, duplicate = 0, missing = 0;
+        for (const id of ids) {
+            const assignment = getPendingCategoryAssignment(id);
+            if (!assignment) { missing++; continue; }
+            let thumbFileId = null;
+            if (assignment.type === 'video') {
+                thumbFileId = await getVideoThumbnailFileId(userId, assignment.chatId, assignment.messageId);
+            }
+            const addResult = addVideoToCategory(result.category.id, {
+                chatId: assignment.chatId, messageId: assignment.messageId, fileUniqueId: assignment.fileUniqueId,
+                type: assignment.type, addedBy: userId, caption: assignment.caption, thumbFileId
+            });
+            if (addResult.success) added++; else if (addResult.reason === 'duplicate') duplicate++; else missing++;
+            removePendingCategoryAssignment(id);
+        }
+        delete pendingCategoryBatches[token];
+        let summary = `✅ Created "${result.category.name}" and added ${added} file(s).`;
+        if (duplicate > 0) summary += ` ${duplicate} duplicate(s) skipped.`;
+        if (missing > 0) summary += ` ${missing} already handled elsewhere.`;
+        await ctx.reply(summary, { reply_markup: { inline_keyboard: [[{ text: '📂 Categories', callback_data: 'cat_menu' }]] } });
+        return;
+    }
+
     if (action.type === 'mfu_cat_new_name') {
         const sel = folderSelection[userId];
         if (!sel) { delete pendingAction[userId]; await ctx.reply('⚠️ Selection expired. Start again from Folder Upload.'); return; }
@@ -6457,6 +7172,29 @@ async function handlePendingAction(ctx, text) {
         sel.destinationId = result.category.id;
         sel.destinationLabel = result.category.name;
         await renderFolderConfirm(ctx);
+        return;
+    }
+
+    if (action.type === 'mfu_count_number') {
+        const sel = folderSelection[userId];
+        if (!sel) { delete pendingAction[userId]; await ctx.reply('⚠️ Selection expired. Start again from Folder Upload.'); return; }
+        const n = parseInt(text.trim(), 10);
+        const pool = getManualFilteredFiles(sel).length;
+        if (!Number.isInteger(n) || n < 1) {
+            await ctx.reply('⚠️ Send a whole number of 1 or more, or /cancel.');
+            return;
+        }
+        if (n > pool) {
+            await ctx.reply(`⚠️ Only ${pool} file(s) available after current filters — send a number up to ${pool}, or /cancel.`);
+            return;
+        }
+        sel.countMode = action.mode; // 'first' | 'last' | 'random'
+        sel.countN = n;
+        refreshRandomPick(sel);
+        delete pendingAction[userId];
+        await ctx.reply(`✅ Count set: ${countModeLabel(sel)}.`, {
+            reply_markup: { inline_keyboard: [[{ text: '🎛 Back to Filters', callback_data: 'mfu_filter_back' }]] }
+        });
         return;
     }
 

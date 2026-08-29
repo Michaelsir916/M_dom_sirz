@@ -878,6 +878,25 @@ function recordFolderUpload(folderNodeId, destinationType, destinationId, meta) 
     saveFolderUploadHistory(history);
 }
 
+// Idea 13: when the same MEGA folder gets uploaded again, suggest whichever
+// category it last went to instead of making the admin re-pick from
+// scratch. Scans the flat history object for any "<folderNodeId>:category:*"
+// entry and returns the most recent one (by uploadedAt).
+function findLastCategoryForFolder(folderNodeId) {
+    const history = loadFolderUploadHistory();
+    const prefix = `${folderNodeId}:category:`;
+    let best = null;
+    for (const key of Object.keys(history)) {
+        if (!key.startsWith(prefix)) continue;
+        const destinationId = key.slice(prefix.length);
+        const entry = history[key];
+        if (!best || new Date(entry.uploadedAt) > new Date(best.uploadedAt)) {
+            best = { ...entry, destinationId };
+        }
+    }
+    return best;
+}
+
 // Returns THIS user's own /random stats (not admin-wide): files received,
 // cooldown remaining, daily-limit remaining. Read-only, does not persist.
 function getUserStats(userId, cooldownSeconds, dailyLimit) {
@@ -1594,5 +1613,6 @@ module.exports = {
     listActiveFolderJobs,
     deleteFolderJob,
     findFolderUpload,
-    recordFolderUpload
+    recordFolderUpload,
+    findLastCategoryForFolder
 };

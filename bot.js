@@ -285,6 +285,15 @@ const pendingAction = {};
 // fileShare.js, resumed at startup).
 const folderBrowseState = {};
 
+// In-memory state for the quick-paste MEGA folder link flow (plain link
+// pasted straight into a private chat — not the 📂 Folder Upload panel).
+// Keyed by admin user id. Holds the flat file list (metadata only, nothing
+// downloaded yet) plus a cursor so the admin can be asked "how many files?"
+// and then upload happens in confirmed batches of that size instead of the
+// whole folder at once. Lost on restart, same as pendingAction — the admin
+// just re-pastes the link.
+const megaQuickBatch = {};
+
 // In-memory holder for an auto-post "test preview" awaiting the admin's
 // ✅ Post / ❌ Skip tap (setup-time confirm only — scheduled runs never wait
 // on this). Keyed by admin user id. Lost on restart, which is fine — the
@@ -717,6 +726,73 @@ async function downloadMegaFile(megaUrl, userId, onProgress) {
     });
 }
 
+// Loads just the metadata for a MEGA link (file or folder) WITHOUT
+// downloading any content. Used so the quick-paste flow can tell, before
+// touching disk, whether a folder link needs to ask "how many files?" (see
+// processMegaLink below). Mirrors the loadAttributes portion of
+// downloadMegaFile() — kept separate so the download itself only happens
+// once we know how many files to actually pull.
+function peekMegaLink(megaUrl) {
+    return new Promise((resolve, reject) => {
+        try {
+            const file = mega.File.fromURL(megaUrl);
+            if (!file) {
+                reject(new Error('Could not parse MEGA URL'));
+                return;
+            }
+            file.loadAttributes((err) => {
+                if (err) {
+                    let errorMsg = `Failed to load: ${err.message}`;
+                    if (err.message.includes('ENOENT') || err.message.includes('not found')) {
+                        errorMsg = 'File/Folder not found. Link may be expired or invalid.';
+                    } else if (err.message.includes('decryption')) {
+                        errorMsg = 'Decryption failed. Check if your link has the correct key';
+                    }
+                    reject(new Error(errorMsg));
+                    return;
+                }
+                resolve(file);
+            });
+        } catch (error) {
+            reject(new Error(`Invalid MEGA link: ${error.message}`));
+        }
+    });
+}
+
+// Downloads a single already-resolved MEGA file node (e.g. one entry from
+// getAllFilesFromFolder) to destPath. Same stream logic as the inner loop of
+// downloadMegaFolder(), pulled out so the quick-paste batch flow can
+// download exactly one file at a time instead of the whole folder up front.
+async function downloadMegaFileNode(file, destPath, onProgress) {
+    return new Promise((resolve, reject) => {
+        const fileDir = path.dirname(destPath);
+        if (!fs.existsSync(fileDir)) fs.mkdirSync(fileDir, { recursive: true });
+
+        const writeStream = fs.createWriteStream(destPath);
+        let downloadedBytes = 0;
+        const stream = file.download();
+
+        stream.on('data', chunk => {
+            downloadedBytes += chunk.length;
+            if (onProgress) onProgress(downloadedBytes / file.size);
+        });
+
+        stream.on('error', (err) => {
+            writeStream.end();
+            cleanupFile(destPath);
+            reject(err);
+        });
+
+        stream.pipe(writeStream);
+
+        writeStream.on('finish', () => resolve({ path: destPath, name: file.name, size: file.size }));
+        writeStream.on('error', (err) => {
+            cleanupFile(destPath);
+            reject(err);
+        });
+    });
+}
+
 function createProgressUpdater(editStatusFunc, actionPrefix, totalFiles = 1) {
     let lastUpdate = 0;
     let lastProgressText = '';
@@ -808,9 +884,6 @@ async function processMegaLink(ctx, megaLink) {
             }
         };
 
-        const downloadUpdater = createProgressUpdater(editStatus, '⬇️ *Downloading from MEGA*');
-        const result = await downloadMegaFile(megaLink, userId, downloadUpdater);
-
         const deleteStatus = async () => {
             if (statusMsg) {
                 try {
@@ -820,6 +893,69 @@ async function processMegaLink(ctx, megaLink) {
                 }
             }
         };
+
+        // Load metadata only first (no download yet) — a folder link pasted in a
+        // private chat gets asked "how many files?" before anything hits disk;
+        // everywhere else (single file, or a folder link in a group/channel where
+        // there's no one to interactively ask) keeps the original behavior.
+        const peeked = await peekMegaLink(megaLink);
+        const tempDirBase = path.join(os.tmpdir(), 'mega-bot', userId.toString());
+
+        if (peeked.directory && chatType === 'private') {
+            await editStatus(`📂 *Reading Folder*\n\nListing files...`);
+            let allFiles;
+            try {
+                allFiles = await getAllFilesFromFolder(peeked);
+            } catch (listError) {
+                await editStatus(`❌ *Failed to List Folder*\n\n*Error:* ${listError.message}`);
+                return;
+            }
+            if (allFiles.length === 0) {
+                await editStatus(`❌ *Folder is Empty*`);
+                return;
+            }
+            const totalSize = allFiles.reduce((s, f) => s + (f.size || 0), 0);
+            await deleteStatus();
+
+            megaQuickBatch[userId] = {
+                chatId,
+                chatType,
+                uploadDestination,
+                sendingToChannel,
+                allFiles,
+                folderName: peeked.name || 'folder',
+                totalSize,
+                nextIndex: 0,
+                batchSize: null,
+                sentCount: 0,
+                failedCount: 0,
+                nonMediaCount: 0,
+                tempDir: path.join(tempDirBase, 'quickbatch')
+            };
+            pendingAction[userId] = { type: 'mega_quick_count' };
+            await ctx.reply(
+                `📁 *${escapeMd(peeked.name || 'Folder')}*\n\n` +
+                `ആകെ ${allFiles.length} ഫയൽസ് ഉണ്ട് (${formatBytes(totalSize)}).\n\n` +
+                `എത്ര ഫയൽസ് upload ആക്കണം? (1 - ${allFiles.length} ഇടയിൽ ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel)`,
+                { parse_mode: 'Markdown' }
+            );
+            return;
+        }
+
+        if (!fs.existsSync(tempDirBase)) fs.mkdirSync(tempDirBase, { recursive: true });
+
+        let result;
+        if (peeked.directory) {
+            // Group/channel folder link — no one to interactively ask, so keep
+            // the original "download & send everything" behavior.
+            const downloadUpdater = createProgressUpdater(editStatus, '⬇️ *Downloading from MEGA*');
+            result = await downloadMegaFolder(peeked, tempDirBase, downloadUpdater);
+        } else {
+            const downloadUpdater = createProgressUpdater(editStatus, '⬇️ *Downloading from MEGA*');
+            const destPath = path.join(tempDirBase, peeked.name);
+            const dl = await downloadMegaFileNode(peeked, destPath, (p) => downloadUpdater(p, peeked.name, peeked.size, 1, 1));
+            result = { type: 'file', path: dl.path, name: dl.name, size: dl.size };
+        }
 
         if (result.type === 'file') {
             const uploadUpdater = createProgressUpdater(editStatus, '📤 *Uploading to Telegram*');
@@ -987,6 +1123,142 @@ async function processMegaLink(ctx, megaLink) {
         cleanupFolder(tempDir);
     }
 }
+
+// Downloads-then-sends the next confirmed batch for the quick-paste MEGA
+// folder flow (see megaQuickBatch / processMegaLink above). Called once the
+// admin sends a valid count, and again every time they tap "✅ Continue" on
+// the "N files left, upload more?" prompt this posts at the end of each
+// round. Deliberately does NOT auto-chain into the next batch on its own —
+// that's the whole point of the feature (ask before continuing).
+async function runMegaQuickBatch(ctx, userId) {
+    const state = megaQuickBatch[userId];
+    if (!state) {
+        try { await ctx.reply('⚠️ Session expired. Send the MEGA link again.'); } catch (e) { /* ignore */ }
+        return;
+    }
+
+    const maxFileSize = 2000 * 1024 * 1024;
+    const start = state.nextIndex;
+    const end = Math.min(start + state.batchSize, state.allFiles.length);
+    const batchFiles = state.allFiles.slice(start, end);
+    if (batchFiles.length === 0) {
+        delete megaQuickBatch[userId];
+        return;
+    }
+
+    if (!fs.existsSync(state.tempDir)) fs.mkdirSync(state.tempDir, { recursive: true });
+
+    let progressMsg;
+    try {
+        progressMsg = await ctx.reply(
+            `📦 *Batch Upload* (${batchFiles.length} file${batchFiles.length === 1 ? '' : 's'})\n\nStarting...`,
+            { parse_mode: 'Markdown' }
+        );
+    } catch (e) { /* best-effort */ }
+
+    const editProgress = async (text) => {
+        if (!progressMsg) return;
+        try {
+            await ctx.telegram.editMessageText(state.chatId, progressMsg.message_id, null, text, { parse_mode: 'Markdown' });
+        } catch (e) { /* ignore */ }
+    };
+
+    let roundSent = 0;
+    let roundFailed = 0;
+
+    for (let i = 0; i < batchFiles.length; i++) {
+        const file = batchFiles[i];
+        try {
+            if (file.size > maxFileSize) {
+                roundFailed++;
+                state.failedCount++;
+                continue;
+            }
+
+            const dlUpdater = createProgressUpdater(editProgress, `⬇️ *Downloading* [${i + 1}/${batchFiles.length}]`);
+            const destPath = path.join(state.tempDir, `${start + i}_${file.name}`);
+            await downloadMegaFileNode(file, destPath, (p) => dlUpdater(p, file.name, file.size, 1));
+
+            const isMedia = isMediaFile(file.name);
+            const actualDestination = isMedia ? state.uploadDestination : userId;
+
+            const upUpdater = createProgressUpdater(editProgress, `📤 *Uploading* [${i + 1}/${batchFiles.length}]`);
+            await sendTelegramFile(ctx, destPath, file.name, file.size, (p) => upUpdater(p, file.name, file.size, 1), actualDestination);
+
+            if (!isMedia && actualDestination !== state.uploadDestination) state.nonMediaCount++;
+            roundSent++;
+            state.sentCount++;
+            cleanupFile(destPath);
+
+            await new Promise(r => setTimeout(r, 1000));
+        } catch (fileError) {
+            console.error(`Quick batch: failed on ${file.name}:`, fileError.message);
+            roundFailed++;
+            state.failedCount++;
+        }
+    }
+
+    if (progressMsg) {
+        try { await ctx.telegram.deleteMessage(state.chatId, progressMsg.message_id); } catch (e) { /* ignore */ }
+    }
+
+    state.nextIndex = end;
+    const remaining = state.allFiles.length - state.nextIndex;
+
+    const batchSummary = `✅ *Batch Complete*\n\n✅ Sent: ${roundSent}/${batchFiles.length}` +
+        (roundFailed > 0 ? `\n❌ Failed: ${roundFailed}` : '');
+
+    if (remaining > 0) {
+        const nextN = Math.min(state.batchSize, remaining);
+        try {
+            await ctx.reply(
+                `${batchSummary}\n\n📁 *${escapeMd(state.folderName)}*-ൽ ഇനി ${remaining} ഫയൽസ് ബാക്കിയുണ്ട്.\n\n` +
+                `അടുത്ത ${nextN} ഫയൽസ് കൂടി upload ആക്കണോ?`,
+                {
+                    parse_mode: 'Markdown',
+                    reply_markup: { inline_keyboard: [[
+                        { text: `✅ അതെ, ${nextN} എണ്ണം കൂടി`, callback_data: 'megaq_continue_yes' },
+                        { text: '❌ വേണ്ട, നിർത്തൂ', callback_data: 'megaq_continue_no' }
+                    ]] }
+                }
+            );
+        } catch (e) { /* best-effort */ }
+    } else {
+        try {
+            await ctx.reply(
+                `${batchSummary}\n\n✅ *${escapeMd(state.folderName)}*-ലെ എല്ലാ ${state.allFiles.length} ഫയലുകളും upload ആയി.\n` +
+                `💾 Total: ${state.sentCount} sent` + (state.failedCount > 0 ? `, ${state.failedCount} failed` : '') +
+                (state.nonMediaCount > 0 ? `\n⚠️ ${state.nonMediaCount} non-media file(s) sent to you privately.` : ''),
+                { parse_mode: 'Markdown' }
+            );
+        } catch (e) { /* best-effort */ }
+        cleanupFolder(state.tempDir);
+        delete megaQuickBatch[userId];
+    }
+}
+
+bot.action('megaq_continue_yes', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    if (!megaQuickBatch[ctx.from.id]) { await ctx.answerCbQuery('⚠️ Session expired.'); return; }
+    await ctx.answerCbQuery('🚀 Starting next batch...');
+    try { await ctx.editMessageReplyMarkup(); } catch (e) { /* ignore */ }
+    await runMegaQuickBatch(ctx, ctx.from.id);
+});
+
+bot.action('megaq_continue_no', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const state = megaQuickBatch[ctx.from.id];
+    await ctx.answerCbQuery('⏹ Stopped');
+    if (state) {
+        cleanupFolder(state.tempDir);
+        delete megaQuickBatch[ctx.from.id];
+        try {
+            await ctx.editMessageText(`⏹ നിർത്തി. ${state.nextIndex}/${state.allFiles.length} ഫയൽസ് ഇതുവരെ upload ആയി.`);
+        } catch (e) { /* ignore */ }
+    } else {
+        try { await ctx.editMessageText('⏹ നിർത്തി.'); } catch (e) { /* ignore */ }
+    }
+});
 
 bot.start(async (ctx) => {
     const chatType = ctx.chat.type;
@@ -3605,6 +3877,19 @@ function knownChatPickerKeyboard(excludeIds, prefix, backCallback, adminId) {
 // from disk without needing this in-memory state at all.
 const folderSelection = {};
 
+// In-memory state for category-preset Folder Upload uploads done in
+// confirmed batches (mfu_from_category → mfu_select skips the filter panel
+// and asks directly "how many files?", see mfu_cat_direct_count). Keyed by
+// admin user id. Tracks the full file list captured at selection time and a
+// cursor, so each round creates a normal folder-upload job for just the next
+// N files, and only continues into the next N after the admin confirms via
+// the mfu_catbatch_continue_yes/no buttons shown when a round's job
+// finishes (see the end of runFolderUploadJob). Lost on restart like the
+// other in-memory folder-upload state above — a job already running is
+// safe (persisted via createFolderJob), only the "ask before continuing"
+// chain doesn't survive a restart.
+const megaCatBatch = {};
+
 // ---- Pause / Resume / Stop / Speed controls for folder-upload jobs ----
 // A job's `status` field drives everything: 'running' means the worker in
 // runFolderUploadJob() is actively looping through files. Pause/Stop don't
@@ -3922,12 +4207,46 @@ bot.action('mfu_select', async (ctx) => {
     if (mediaFiles.length === 0) { await ctx.answerCbQuery('⚠️ No photo/video files here.'); return; }
 
     const folderName = state.pathNames.length ? state.pathNames[state.pathNames.length - 1] : (currentNode.name || 'root');
+    const flatFiles = mediaFiles.map(f => ({ name: f.name, size: f.size || 0 }));
+
+    // Category-preset uploads (mfu_from_category): skip both the
+    // destination-picker AND the filter panel entirely — ask directly how
+    // many files to upload, then run it in confirmed batches of that size
+    // (mfu_cat_direct_count / startNextCatBatchJob / the
+    // mfu_catbatch_continue_yes|no prompt shown when each round finishes).
+    if (state.presetCategoryId) {
+        const presetCategory = getCategory(state.presetCategoryId);
+        if (presetCategory) {
+            delete folderBrowseState[ctx.from.id];
+            megaCatBatch[ctx.from.id] = {
+                url: state.url,
+                pathNames: [...state.pathNames],
+                folderName,
+                destinationType: 'category',
+                destinationId: presetCategory.id,
+                destinationLabel: presetCategory.name,
+                allFiles: flatFiles,
+                nextIndex: 0,
+                batchSize: null
+            };
+            pendingAction[ctx.from.id] = { type: 'mfu_cat_direct_count' };
+            await ctx.answerCbQuery();
+            await ctx.editMessageText(
+                `📂 *${escapeMd(folderName)}* → *${escapeMd(presetCategory.name)}*\n\n` +
+                `ആകെ ${flatFiles.length} ഫയൽസ് ഉണ്ട്.\n\n` +
+                `എത്ര ഫയൽസ് upload ആക്കണം? (1 - ${flatFiles.length} ഇടയിൽ ഒരു നമ്പർ അയക്കൂ)`,
+                { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mfu_cancel' }]] } }
+            );
+            return;
+        }
+    }
+
     const sel = {
         url: state.url,
         pathNames: [...state.pathNames],
         folderName,
-        files: mediaFiles.map(f => ({ name: f.name, size: f.size || 0 })),
-        totalSize: mediaFiles.reduce((s, f) => s + (f.size || 0), 0),
+        files: flatFiles,
+        totalSize: flatFiles.reduce((s, f) => s + (f.size || 0), 0),
         skippedNonMedia: files.length - mediaFiles.length,
         // --- Upload filter state (see "Upload Filters" block below) ---
         typeFilter: 'all',      // 'all' | 'video' | 'photo'
@@ -3937,17 +4256,6 @@ bot.action('mfu_select', async (ctx) => {
         manualExcluded: [],     // file names explicitly deselected in the review list
         randomNames: null       // frozen file-name pick for countMode === 'random'
     };
-
-    // Idea 2: destination pinned when launched from a category's admin panel
-    // (mfu_from_category) — skips the destination-picker step entirely.
-    if (state.presetCategoryId) {
-        const presetCategory = getCategory(state.presetCategoryId);
-        if (presetCategory) {
-            sel.destinationType = 'category';
-            sel.destinationId = presetCategory.id;
-            sel.destinationLabel = presetCategory.name;
-        }
-    }
     folderSelection[ctx.from.id] = sel;
     delete folderBrowseState[ctx.from.id];
     await ctx.answerCbQuery();
@@ -4460,6 +4768,7 @@ bot.action('mfu_cancel', async (ctx) => {
     if (!(await requireAdmin(ctx, true))) return;
     delete folderBrowseState[ctx.from.id];
     delete folderSelection[ctx.from.id];
+    delete megaCatBatch[ctx.from.id];
     delete pendingAction[ctx.from.id];
     await ctx.answerCbQuery('❌ Cancelled');
     await ctx.editMessageText('❌ Cancelled.', { reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_mega' }]] } });
@@ -4501,6 +4810,77 @@ bot.action('mfu_confirm', async (ctx) => {
     } catch (e) { /* best-effort */ }
 
     queue.add(() => runFolderUploadJob(jobId)).catch(err => logError('Folder upload job', err));
+});
+
+// Creates and starts one round of a confirmed-batch category folder upload —
+// a normal folder-upload job scoped to just the next `batchSize` files from
+// megaCatBatch's captured file list. Called once the admin sends a count
+// (mfu_cat_direct_count) and again each time they tap "✅ Continue" on the
+// prompt runFolderUploadJob() posts when a round finishes. The job itself
+// runs through the exact same runFolderUploadJob() as any other folder
+// upload — job.catBatchAdminId is just a flag so that function knows to ask
+// before chaining into the next round instead of just stopping.
+async function startNextCatBatchJob(ctx, adminId) {
+    const batch = megaCatBatch[adminId];
+    if (!batch) return;
+    const start = batch.nextIndex;
+    const end = Math.min(start + batch.batchSize, batch.allFiles.length);
+    const sliceFiles = batch.allFiles.slice(start, end);
+    if (sliceFiles.length === 0) { delete megaCatBatch[adminId]; return; }
+
+    const jobId = `fj_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+    const job = {
+        id: jobId,
+        adminId,
+        chatId: ctx.chat.id,
+        status: 'running',
+        url: batch.url,
+        pathNames: batch.pathNames,
+        folderName: batch.folderName,
+        destinationType: batch.destinationType,
+        destinationId: batch.destinationId,
+        destinationLabel: batch.destinationLabel,
+        files: sliceFiles.map(f => ({ name: f.name, size: f.size, status: 'pending' })),
+        createdAt: new Date().toISOString(),
+        sentCount: 0,
+        failedCount: 0,
+        skippedCount: 0,
+        delayMs: 800,
+        progressMsgId: null,
+        catBatchAdminId: adminId
+    };
+    createFolderJob(job);
+    batch.nextIndex = end;
+
+    try {
+        await ctx.reply(
+            `🚀 *Upload started* (${sliceFiles.length} file${sliceFiles.length === 1 ? '' : 's'})\n\n` +
+            `📁 ${escapeMd(batch.folderName)} → ${escapeMd(batch.destinationLabel)}\n\nI'll post progress here.`,
+            { parse_mode: 'Markdown' }
+        );
+    } catch (e) { /* best-effort */ }
+
+    queue.add(() => runFolderUploadJob(jobId)).catch(err => logError('Folder upload job', err));
+}
+
+bot.action('mfu_catbatch_continue_yes', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    if (!megaCatBatch[ctx.from.id]) { await ctx.answerCbQuery('⚠️ Session expired.'); return; }
+    await ctx.answerCbQuery('🚀 Starting next batch...');
+    try { await ctx.editMessageReplyMarkup(); } catch (e) { /* ignore */ }
+    await startNextCatBatchJob(ctx, ctx.from.id);
+});
+
+bot.action('mfu_catbatch_continue_no', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const batch = megaCatBatch[ctx.from.id];
+    delete megaCatBatch[ctx.from.id];
+    await ctx.answerCbQuery('⏹ Stopped');
+    try {
+        await ctx.editMessageText(
+            batch ? `⏹ നിർത്തി. ${batch.nextIndex}/${batch.allFiles.length} ഫയൽസ് ഇതുവരെ upload ആയി.` : '⏹ നിർത്തി.'
+        );
+    } catch (e) { /* ignore */ }
 });
 
 // Sends a file straight to a chat via MTProto without needing a live ctx —
@@ -4758,6 +5138,39 @@ async function runFolderUploadJob(jobId) {
     } catch (e) { /* best-effort */ }
 
     await sendToLogChannel(`📦 *Folder Upload Report*\n\n${summary}`);
+
+    // Confirmed-batch series (category folder-upload with a fixed count per
+    // round — see mfu_cat_direct_count / startNextCatBatchJob): don't chain
+    // straight into the next round on its own. Ask first, since the admin
+    // only asked for N files at a time.
+    if (job.catBatchAdminId) {
+        const batch = megaCatBatch[job.catBatchAdminId];
+        if (batch) {
+            const remaining = batch.allFiles.length - batch.nextIndex;
+            if (remaining > 0) {
+                const nextN = Math.min(batch.batchSize, remaining);
+                try {
+                    await bot.telegram.sendMessage(job.chatId,
+                        `📁 *${escapeMd(batch.folderName)}*-ൽ ഇനി ${remaining} ഫയൽസ് ബാക്കിയുണ്ട്.\n\n` +
+                        `അടുത്ത ${nextN} ഫയൽസ് കൂടി upload ആക്കണോ?`,
+                        {
+                            parse_mode: 'Markdown',
+                            reply_markup: { inline_keyboard: [[
+                                { text: `✅ അതെ, ${nextN} എണ്ണം കൂടി`, callback_data: 'mfu_catbatch_continue_yes' },
+                                { text: '❌ വേണ്ട, നിർത്തൂ', callback_data: 'mfu_catbatch_continue_no' }
+                            ]] }
+                        }
+                    ).catch(() => {});
+                } catch (e) { /* best-effort */ }
+            } else {
+                delete megaCatBatch[job.catBatchAdminId];
+                try {
+                    await bot.telegram.sendMessage(job.chatId, `✅ Folder-ലെ എല്ലാ ${batch.allFiles.length} ഫയലുകളും upload ആയി.`).catch(() => {});
+                } catch (e) { /* best-effort */ }
+            }
+        }
+    }
+
     cleanupFolder(tempDir);
 }
 
@@ -6486,7 +6899,57 @@ async function handlePendingAction(ctx, text) {
     if (text.trim() === '/cancel') {
         delete pendingAction[userId];
         delete promoWizard[userId];
+        if (megaQuickBatch[userId]) {
+            cleanupFolder(megaQuickBatch[userId].tempDir);
+            delete megaQuickBatch[userId];
+        }
+        delete megaCatBatch[userId];
         await ctx.reply('❌ Cancelled.');
+        return;
+    }
+
+    if (action.type === 'mega_quick_count') {
+        const state = megaQuickBatch[userId];
+        if (!state) {
+            delete pendingAction[userId];
+            await ctx.reply('⚠️ Session expired. Send the MEGA link again.');
+            return;
+        }
+        const n = parseInt(text.trim(), 10);
+        if (!Number.isInteger(n) || n < 1) {
+            await ctx.reply('⚠️ 1-ൽ കൂടുതൽ ഉള്ള ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel.');
+            return;
+        }
+        if (n > state.allFiles.length) {
+            await ctx.reply(`⚠️ ആകെ ${state.allFiles.length} ഫയൽസ് മാത്രമേ ഉള്ളൂ — അതിനുള്ളിൽ ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel.`);
+            return;
+        }
+        state.batchSize = n;
+        delete pendingAction[userId];
+        await runMegaQuickBatch(ctx, userId);
+        return;
+    }
+
+    if (action.type === 'mfu_cat_direct_count') {
+        const batch = megaCatBatch[userId];
+        if (!batch) {
+            delete pendingAction[userId];
+            await ctx.reply('⚠️ Selection expired. Start again from the category.');
+            return;
+        }
+        const remaining = batch.allFiles.length - batch.nextIndex;
+        const n = parseInt(text.trim(), 10);
+        if (!Number.isInteger(n) || n < 1) {
+            await ctx.reply('⚠️ 1-ൽ കൂടുതൽ ഉള്ള ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel.');
+            return;
+        }
+        if (n > remaining) {
+            await ctx.reply(`⚠️ ആകെ ${remaining} ഫയൽസ് മാത്രമേ ബാക്കിയുള്ളൂ — അതിനുള്ളിൽ ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel.`);
+            return;
+        }
+        batch.batchSize = n;
+        delete pendingAction[userId];
+        await startNextCatBatchJob(ctx, userId);
         return;
     }
 

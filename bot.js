@@ -935,8 +935,8 @@ async function processMegaLink(ctx, megaLink) {
             pendingAction[userId] = { type: 'mega_quick_count' };
             await ctx.reply(
                 `📁 *${escapeMd(peeked.name || 'Folder')}*\n\n` +
-                `ആകെ ${allFiles.length} ഫയൽസ് ഉണ്ട് (${formatBytes(totalSize)}).\n\n` +
-                `എത്ര ഫയൽസ് upload ആക്കണം? (1 - ${allFiles.length} ഇടയിൽ ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel)`,
+                `Total: ${allFiles.length} files (${formatBytes(totalSize)}).\n\n` +
+                `How many files do you want to upload? (send a number between 1 - ${allFiles.length}, or /cancel)`,
                 { parse_mode: 'Markdown' }
             );
             return;
@@ -1212,13 +1212,13 @@ async function runMegaQuickBatch(ctx, userId) {
         const nextN = Math.min(state.batchSize, remaining);
         try {
             await ctx.reply(
-                `${batchSummary}\n\n📁 *${escapeMd(state.folderName)}*-ൽ ഇനി ${remaining} ഫയൽസ് ബാക്കിയുണ്ട്.\n\n` +
-                `അടുത്ത ${nextN} ഫയൽസ് കൂടി upload ആക്കണോ?`,
+                `${batchSummary}\n\n📁 *${escapeMd(state.folderName)}* — ${remaining} file${remaining === 1 ? '' : 's'} left.\n\n` +
+                `Upload the next ${nextN} file${nextN === 1 ? '' : 's'}?`,
                 {
                     parse_mode: 'Markdown',
                     reply_markup: { inline_keyboard: [[
-                        { text: `✅ അതെ, ${nextN} എണ്ണം കൂടി`, callback_data: 'megaq_continue_yes' },
-                        { text: '❌ വേണ്ട, നിർത്തൂ', callback_data: 'megaq_continue_no' }
+                        { text: `✅ Yes, ${nextN} more`, callback_data: 'megaq_continue_yes' },
+                        { text: '❌ No, stop', callback_data: 'megaq_continue_no' }
                     ]] }
                 }
             );
@@ -1226,7 +1226,7 @@ async function runMegaQuickBatch(ctx, userId) {
     } else {
         try {
             await ctx.reply(
-                `${batchSummary}\n\n✅ *${escapeMd(state.folderName)}*-ലെ എല്ലാ ${state.allFiles.length} ഫയലുകളും upload ആയി.\n` +
+                `${batchSummary}\n\n✅ All ${state.allFiles.length} files from *${escapeMd(state.folderName)}* have been uploaded.\n` +
                 `💾 Total: ${state.sentCount} sent` + (state.failedCount > 0 ? `, ${state.failedCount} failed` : '') +
                 (state.nonMediaCount > 0 ? `\n⚠️ ${state.nonMediaCount} non-media file(s) sent to you privately.` : ''),
                 { parse_mode: 'Markdown' }
@@ -1253,10 +1253,10 @@ bot.action('megaq_continue_no', async (ctx) => {
         cleanupFolder(state.tempDir);
         delete megaQuickBatch[ctx.from.id];
         try {
-            await ctx.editMessageText(`⏹ നിർത്തി. ${state.nextIndex}/${state.allFiles.length} ഫയൽസ് ഇതുവരെ upload ആയി.`);
+            await ctx.editMessageText(`⏹ Stopped. ${state.nextIndex}/${state.allFiles.length} files uploaded so far.`);
         } catch (e) { /* ignore */ }
     } else {
-        try { await ctx.editMessageText('⏹ നിർത്തി.'); } catch (e) { /* ignore */ }
+        try { await ctx.editMessageText('⏹ Stopped.'); } catch (e) { /* ignore */ }
     }
 });
 
@@ -4233,8 +4233,8 @@ bot.action('mfu_select', async (ctx) => {
             await ctx.answerCbQuery();
             await ctx.editMessageText(
                 `📂 *${escapeMd(folderName)}* → *${escapeMd(presetCategory.name)}*\n\n` +
-                `ആകെ ${flatFiles.length} ഫയൽസ് ഉണ്ട്.\n\n` +
-                `എത്ര ഫയൽസ് upload ആക്കണം? (1 - ${flatFiles.length} ഇടയിൽ ഒരു നമ്പർ അയക്കൂ)`,
+                `Total: ${flatFiles.length} files.\n\n` +
+                `How many files do you want to upload? (send a number between 1 - ${flatFiles.length})`,
                 { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'mfu_cancel' }]] } }
             );
             return;
@@ -4878,7 +4878,7 @@ bot.action('mfu_catbatch_continue_no', async (ctx) => {
     await ctx.answerCbQuery('⏹ Stopped');
     try {
         await ctx.editMessageText(
-            batch ? `⏹ നിർത്തി. ${batch.nextIndex}/${batch.allFiles.length} ഫയൽസ് ഇതുവരെ upload ആയി.` : '⏹ നിർത്തി.'
+            batch ? `⏹ Stopped. ${batch.nextIndex}/${batch.allFiles.length} files uploaded so far.` : '⏹ Stopped.'
         );
     } catch (e) { /* ignore */ }
 });
@@ -5151,13 +5151,13 @@ async function runFolderUploadJob(jobId) {
                 const nextN = Math.min(batch.batchSize, remaining);
                 try {
                     await bot.telegram.sendMessage(job.chatId,
-                        `📁 *${escapeMd(batch.folderName)}*-ൽ ഇനി ${remaining} ഫയൽസ് ബാക്കിയുണ്ട്.\n\n` +
-                        `അടുത്ത ${nextN} ഫയൽസ് കൂടി upload ആക്കണോ?`,
+                        `📁 *${escapeMd(batch.folderName)}* — ${remaining} file${remaining === 1 ? '' : 's'} left.\n\n` +
+                        `Upload the next ${nextN} file${nextN === 1 ? '' : 's'}?`,
                         {
                             parse_mode: 'Markdown',
                             reply_markup: { inline_keyboard: [[
-                                { text: `✅ അതെ, ${nextN} എണ്ണം കൂടി`, callback_data: 'mfu_catbatch_continue_yes' },
-                                { text: '❌ വേണ്ട, നിർത്തൂ', callback_data: 'mfu_catbatch_continue_no' }
+                                { text: `✅ Yes, ${nextN} more`, callback_data: 'mfu_catbatch_continue_yes' },
+                                { text: '❌ No, stop', callback_data: 'mfu_catbatch_continue_no' }
                             ]] }
                         }
                     ).catch(() => {});
@@ -5165,7 +5165,7 @@ async function runFolderUploadJob(jobId) {
             } else {
                 delete megaCatBatch[job.catBatchAdminId];
                 try {
-                    await bot.telegram.sendMessage(job.chatId, `✅ Folder-ലെ എല്ലാ ${batch.allFiles.length} ഫയലുകളും upload ആയി.`).catch(() => {});
+                    await bot.telegram.sendMessage(job.chatId, `✅ All ${batch.allFiles.length} files from the folder have been uploaded.`).catch(() => {});
                 } catch (e) { /* best-effort */ }
             }
         }
@@ -6917,11 +6917,11 @@ async function handlePendingAction(ctx, text) {
         }
         const n = parseInt(text.trim(), 10);
         if (!Number.isInteger(n) || n < 1) {
-            await ctx.reply('⚠️ 1-ൽ കൂടുതൽ ഉള്ള ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel.');
+            await ctx.reply('⚠️ Send a number greater than 0, or /cancel.');
             return;
         }
         if (n > state.allFiles.length) {
-            await ctx.reply(`⚠️ ആകെ ${state.allFiles.length} ഫയൽസ് മാത്രമേ ഉള്ളൂ — അതിനുള്ളിൽ ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel.`);
+            await ctx.reply(`⚠️ Only ${state.allFiles.length} files total — send a number within that, or /cancel.`);
             return;
         }
         state.batchSize = n;
@@ -6940,11 +6940,11 @@ async function handlePendingAction(ctx, text) {
         const remaining = batch.allFiles.length - batch.nextIndex;
         const n = parseInt(text.trim(), 10);
         if (!Number.isInteger(n) || n < 1) {
-            await ctx.reply('⚠️ 1-ൽ കൂടുതൽ ഉള്ള ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel.');
+            await ctx.reply('⚠️ Send a number greater than 0, or /cancel.');
             return;
         }
         if (n > remaining) {
-            await ctx.reply(`⚠️ ആകെ ${remaining} ഫയൽസ് മാത്രമേ ബാക്കിയുള്ളൂ — അതിനുള്ളിൽ ഒരു നമ്പർ അയക്കൂ, അല്ലെങ്കിൽ /cancel.`);
+            await ctx.reply(`⚠️ Only ${remaining} files left — send a number within that, or /cancel.`);
             return;
         }
         batch.batchSize = n;

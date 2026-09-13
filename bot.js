@@ -294,6 +294,13 @@ const folderBrowseState = {};
 // just re-pastes the link.
 const megaQuickBatch = {};
 
+// Intermediate state for the quick-paste flow when the pasted folder link
+// turns out to contain subfolders — holds just enough to answer whichever
+// of the 3 choices (All / Browse / Root-only) the admin taps next (see
+// megaqc_all / megaqc_browse / megaqc_root / megaqc_cancel below). Replaced
+// by megaQuickBatch once a choice is made.
+const megaQuickChoice = {};
+
 // In-memory holder for an auto-post "test preview" awaiting the admin's
 // ✅ Post / ❌ Skip tap (setup-time confirm only — scheduled runs never wait
 // on this). Keyed by admin user id. Lost on restart, which is fine — the
@@ -902,28 +909,56 @@ async function processMegaLink(ctx, megaLink) {
         const tempDirBase = path.join(os.tmpdir(), 'mega-bot', userId.toString());
 
         if (peeked.directory && chatType === 'private') {
-            await editStatus(`📂 *Reading Folder*\n\nListing files...`);
-            let allFiles;
+            await editStatus(`📂 *Reading Folder*\n\nChecking contents...`);
+            let rootFolders, rootFiles;
             try {
-                allFiles = await getAllFilesFromFolder(peeked);
-            } catch (listError) {
-                await editStatus(`❌ *Failed to List Folder*\n\n*Error:* ${listError.message}`);
+                ({ folders: rootFolders, files: rootFiles } = mfu.splitChildren(peeked));
+            } catch (splitError) {
+                await editStatus(`❌ *Failed to Read Folder*\n\n*Error:* ${splitError.message}`);
                 return;
             }
-            if (allFiles.length === 0) {
+
+            const quickChoiceBase = {
+                chatId, chatType, uploadDestination, sendingToChannel,
+                tempDirBase, folderName: peeked.name || 'folder'
+            };
+
+            if (rootFolders.length > 0) {
+                // Has subfolders — flattening everything together silently would
+                // mix files from unrelated subfolders into one list, so ask how
+                // to handle it instead (see megaqc_all / megaqc_browse / megaqc_root).
+                await deleteStatus();
+                megaQuickChoice[userId] = { ...quickChoiceBase, rootNode: peeked };
+                const buttons = [
+                    [{ text: '📦 All (every subfolder)', callback_data: 'megaqc_all' }],
+                    [{ text: '📂 Browse & pick a subfolder', callback_data: 'megaqc_browse' }]
+                ];
+                if (rootFiles.length > 0) {
+                    buttons.push([{ text: `📄 Root files only (${rootFiles.length})`, callback_data: 'megaqc_root' }]);
+                }
+                buttons.push([{ text: '❌ Cancel', callback_data: 'megaqc_cancel' }]);
+                await ctx.reply(
+                    `📁 *${escapeMd(peeked.name || 'Folder')}*\n\n` +
+                    `This folder has ${rootFolders.length} subfolder${rootFolders.length === 1 ? '' : 's'}` +
+                    (rootFiles.length ? ` and ${rootFiles.length} file${rootFiles.length === 1 ? '' : 's'} directly in it` : '') +
+                    `.\n\nWhat do you want to upload?`,
+                    { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } }
+                );
+                return;
+            }
+
+            // No subfolders — nothing to choose between, go straight to the
+            // usual "how many files?" prompt.
+            if (rootFiles.length === 0) {
                 await editStatus(`❌ *Folder is Empty*`);
                 return;
             }
-            const totalSize = allFiles.reduce((s, f) => s + (f.size || 0), 0);
+            const totalSize = rootFiles.reduce((s, f) => s + (f.size || 0), 0);
             await deleteStatus();
 
             megaQuickBatch[userId] = {
-                chatId,
-                chatType,
-                uploadDestination,
-                sendingToChannel,
-                allFiles,
-                folderName: peeked.name || 'folder',
+                ...quickChoiceBase,
+                allFiles: rootFiles,
                 totalSize,
                 nextIndex: 0,
                 batchSize: null,
@@ -935,8 +970,8 @@ async function processMegaLink(ctx, megaLink) {
             pendingAction[userId] = { type: 'mega_quick_count' };
             await ctx.reply(
                 `📁 *${escapeMd(peeked.name || 'Folder')}*\n\n` +
-                `Total: ${allFiles.length} files (${formatBytes(totalSize)}).\n\n` +
-                `How many files do you want to upload? (send a number between 1 - ${allFiles.length}, or /cancel)`,
+                `Total: ${rootFiles.length} files (${formatBytes(totalSize)}).\n\n` +
+                `How many files do you want to upload? (send a number between 1 - ${rootFiles.length}, or /cancel)`,
                 { parse_mode: 'Markdown' }
             );
             return;
@@ -1258,6 +1293,102 @@ bot.action('megaq_continue_no', async (ctx) => {
     } else {
         try { await ctx.editMessageText('⏹ Stopped.'); } catch (e) { /* ignore */ }
     }
+});
+
+// Finishes the "📦 All" / "📄 Root only" choice from the subfolder prompt
+// above — lists the relevant files (recursive or just this folder's direct
+// children) and hands off into the normal count-then-batch flow
+// (megaQuickBatch / mega_quick_count), same as the no-subfolders case.
+async function startMegaQuickListing(ctx, userId, rootNode, choice, opts) {
+    try {
+        await ctx.editMessageText(`📂 *Reading Folder*\n\nListing files...`, { parse_mode: 'Markdown' });
+    } catch (e) { /* ignore */ }
+
+    let allFiles;
+    try {
+        if (opts.recursive) {
+            allFiles = await getAllFilesFromFolder(rootNode);
+        } else {
+            const { files } = mfu.splitChildren(rootNode);
+            allFiles = files;
+        }
+    } catch (listError) {
+        try { await ctx.editMessageText(`❌ *Failed to List Folder*\n\n*Error:* ${listError.message}`, { parse_mode: 'Markdown' }); } catch (e) { /* ignore */ }
+        return;
+    }
+
+    if (allFiles.length === 0) {
+        try { await ctx.editMessageText(`❌ *No files found.*`, { parse_mode: 'Markdown' }); } catch (e) { /* ignore */ }
+        return;
+    }
+
+    const totalSize = allFiles.reduce((s, f) => s + (f.size || 0), 0);
+
+    megaQuickBatch[userId] = {
+        chatId: choice.chatId,
+        chatType: choice.chatType,
+        uploadDestination: choice.uploadDestination,
+        sendingToChannel: choice.sendingToChannel,
+        allFiles,
+        folderName: choice.folderName,
+        totalSize,
+        nextIndex: 0,
+        batchSize: null,
+        sentCount: 0,
+        failedCount: 0,
+        nonMediaCount: 0,
+        tempDir: path.join(choice.tempDirBase, 'quickbatch')
+    };
+    pendingAction[userId] = { type: 'mega_quick_count' };
+
+    try {
+        await ctx.editMessageText(
+            `📁 *${escapeMd(choice.folderName)}*\n\n` +
+            `Total: ${allFiles.length} files (${formatBytes(totalSize)}).\n\n` +
+            `How many files do you want to upload? (send a number between 1 - ${allFiles.length}, or /cancel)`,
+            { parse_mode: 'Markdown' }
+        );
+    } catch (e) { /* ignore */ }
+}
+
+bot.action('megaqc_all', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const choice = megaQuickChoice[ctx.from.id];
+    if (!choice) { await ctx.answerCbQuery('⚠️ Session expired.'); return; }
+    await ctx.answerCbQuery();
+    delete megaQuickChoice[ctx.from.id];
+    await startMegaQuickListing(ctx, ctx.from.id, choice.rootNode, choice, { recursive: true });
+});
+
+bot.action('megaqc_root', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const choice = megaQuickChoice[ctx.from.id];
+    if (!choice) { await ctx.answerCbQuery('⚠️ Session expired.'); return; }
+    await ctx.answerCbQuery();
+    delete megaQuickChoice[ctx.from.id];
+    await startMegaQuickListing(ctx, ctx.from.id, choice.rootNode, choice, { recursive: false });
+});
+
+bot.action('megaqc_browse', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const choice = megaQuickChoice[ctx.from.id];
+    if (!choice) { await ctx.answerCbQuery('⚠️ Session expired.'); return; }
+    await ctx.answerCbQuery();
+    folderBrowseState[ctx.from.id] = {
+        url: null,
+        pathNames: [],
+        nodeStack: [choice.rootNode],
+        quickPasteContext: choice
+    };
+    delete megaQuickChoice[ctx.from.id];
+    await renderFolderBrowse(ctx, ctx.from.id);
+});
+
+bot.action('megaqc_cancel', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    delete megaQuickChoice[ctx.from.id];
+    await ctx.answerCbQuery('❌ Cancelled');
+    try { await ctx.editMessageText('❌ Cancelled.'); } catch (e) { /* ignore */ }
 });
 
 bot.start(async (ctx) => {
@@ -4209,6 +4340,41 @@ bot.action('mfu_select', async (ctx) => {
     const folderName = state.pathNames.length ? state.pathNames[state.pathNames.length - 1] : (currentNode.name || 'root');
     const flatFiles = mediaFiles.map(f => ({ name: f.name, size: f.size || 0 }));
 
+    // Quick-paste flow, "📂 Browse & pick a subfolder" (see megaqc_browse
+    // above): hand off into the same count-then-batch flow as the other two
+    // subfolder choices (megaQuickBatch / mega_quick_count) — this is a
+    // direct MTProto send, not a category/channel job, so it needs the real
+    // MEGA file nodes (mediaFiles), not the serialized name+size pairs.
+    if (state.quickPasteContext) {
+        const qc = state.quickPasteContext;
+        delete folderBrowseState[ctx.from.id];
+        const totalSize = mediaFiles.reduce((s, f) => s + (f.size || 0), 0);
+        megaQuickBatch[ctx.from.id] = {
+            chatId: qc.chatId,
+            chatType: qc.chatType,
+            uploadDestination: qc.uploadDestination,
+            sendingToChannel: qc.sendingToChannel,
+            allFiles: mediaFiles,
+            folderName,
+            totalSize,
+            nextIndex: 0,
+            batchSize: null,
+            sentCount: 0,
+            failedCount: 0,
+            nonMediaCount: 0,
+            tempDir: path.join(qc.tempDirBase, 'quickbatch')
+        };
+        pendingAction[ctx.from.id] = { type: 'mega_quick_count' };
+        await ctx.answerCbQuery();
+        await ctx.editMessageText(
+            `📁 *${escapeMd(folderName)}*\n\n` +
+            `Total: ${mediaFiles.length} files (${formatBytes(totalSize)}).\n\n` +
+            `How many files do you want to upload? (send a number between 1 - ${mediaFiles.length}, or /cancel)`,
+            { parse_mode: 'Markdown' }
+        );
+        return;
+    }
+
     // Category-preset uploads (mfu_from_category): skip both the
     // destination-picker AND the filter panel entirely — ask directly how
     // many files to upload, then run it in confirmed batches of that size
@@ -4769,6 +4935,7 @@ bot.action('mfu_cancel', async (ctx) => {
     delete folderBrowseState[ctx.from.id];
     delete folderSelection[ctx.from.id];
     delete megaCatBatch[ctx.from.id];
+    delete megaQuickChoice[ctx.from.id];
     delete pendingAction[ctx.from.id];
     await ctx.answerCbQuery('❌ Cancelled');
     await ctx.editMessageText('❌ Cancelled.', { reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu_mega' }]] } });
@@ -6904,6 +7071,7 @@ async function handlePendingAction(ctx, text) {
             delete megaQuickBatch[userId];
         }
         delete megaCatBatch[userId];
+        delete megaQuickChoice[userId];
         await ctx.reply('❌ Cancelled.');
         return;
     }

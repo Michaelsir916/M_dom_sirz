@@ -117,7 +117,16 @@ const {
 const queue = require('./queue');
 const mfu = require('./megaFolderUpload');
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// handlerTimeout is set to Infinity because MEGA downloads + Telegram
+// uploads routinely run well past Telegraf's 90s default (that default is
+// meant for typical bot commands, not multi-hundred-MB/multi-GB transfers).
+// Without this, Telegraf's internal p-timeout race rejects the outer
+// handler at exactly 90000ms — "Promise timed out after 90000 milliseconds"
+// — even though the download/upload itself is still running fine in the
+// background via queue.js. That abandoned promise is also why some uploads
+// well under the 2GB Telegram limit appeared to "just not complete": the
+// bot gave up watching before the transfer actually finished.
+const bot = new Telegraf(process.env.BOT_TOKEN, { handlerTimeout: Infinity });
 
 // Every "Buy VIP" style button across the bot points straight here — a
 // direct DM to the admin — instead of an intermediate promo message. Fixed
@@ -163,6 +172,7 @@ async function startMtproto() {
     }
 }
 let botUsername = '';
+let botId = null;
 const botStartedAt = Date.now();
 
 // Telegram throws this whenever editMessageText/editMessageCaption is called
@@ -3433,7 +3443,9 @@ async function renderCategoriesPanel(ctx) {
         text += `\n\n_...and ${categories.length - shown.length} more (showing first ${shown.length}, A–Z)._`;
     }
     rows.push([{ text: '➕ Create Category', callback_data: 'cat_create' }]);
-    rows.push([{ text: `🎯 ${channelLabel ? 'Change' : 'Set'} Storage Channel`, callback_data: 'cat_setchannel_menu' }]);
+    const channelRow = [{ text: `🎯 ${channelLabel ? 'Change' : 'Set'} Storage Channel`, callback_data: 'cat_setchannel_menu' }];
+    if (channelLabel) channelRow.push({ text: '🗑 Remove', callback_data: 'cat_removechannel' });
+    rows.push(channelRow);
     rows.push([{ text: '📥 Pending Channel Posts', callback_data: 'cat_pending_assignments' }]);
     rows.push([{ text: `⏱ Batch Wait: ${getCategoryBatchDebounceMinutes(config)} min`, callback_data: 'cat_batchwait_cycle' }]);
     rows.push([{ text: `🌫 Teaser Blur: ${config.categoryTeaserBlurEnabled ? 'ON' : 'OFF'}${sharp ? '' : ' (⚠️ sharp not installed)'}`, callback_data: 'cat_blur_toggle' }]);
@@ -3473,6 +3485,15 @@ bot.action(/^cat_setchannel:(-?\d+)$/, async (ctx) => {
     await ctx.editMessageText(`✅ VIP category videos will now be archived in "${chat ? chat.title : chatId}".`, {
         reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'cat_menu' }]] }
     });
+});
+
+bot.action('cat_removechannel', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const config = loadConfig();
+    config.categoryStorageChannelId = null;
+    saveConfig(config);
+    await ctx.answerCbQuery('✅ Storage channel removed');
+    await renderCategoriesPanel(ctx);
 });
 
 bot.action('cat_setchannel_manual', async (ctx) => {
@@ -3906,7 +3927,7 @@ async function renderMegaUploadPanel(ctx) {
                 { text: `${config.megaUploadMode === 'personal' ? '✅ ' : ''}👤 Personal`, callback_data: 'mud_mode:personal' },
                 { text: `${config.megaUploadMode === 'channel' ? '✅ ' : ''}📤 Channel`, callback_data: 'mud_mode:channel' }
             ],
-            [{ text: '🎯 Set Channel', callback_data: 'mud_setchannel_menu' }],
+            [{ text: '🎯 Set Channel', callback_data: 'mud_setchannel_menu' }, ...(config.megaUploadChannelId ? [{ text: '🗑 Remove', callback_data: 'mud_removechannel' }] : [])],
             [{ text: '🔙 Back', callback_data: 'menu_fileshare' }]
         ]
     };
@@ -3931,6 +3952,16 @@ bot.action(/^mud_mode:(personal|channel)$/, async (ctx) => {
     config.megaUploadMode = mode;
     saveConfig(config);
     await ctx.answerCbQuery(mode === 'channel' ? '📤 Channel mode' : '👤 Personal mode');
+    await renderMegaUploadPanel(ctx);
+});
+
+bot.action('mud_removechannel', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    const config = loadConfig();
+    config.megaUploadChannelId = null;
+    config.megaUploadMode = 'personal';
+    saveConfig(config);
+    await ctx.answerCbQuery('✅ Channel removed — back to Personal mode');
     await renderMegaUploadPanel(ctx);
 });
 
@@ -4281,7 +4312,11 @@ async function renderFolderBrowse(ctx, adminId) {
         (folders.length ? '_Tap a subfolder to open it, or select this folder if it has what you want._' : '_No subfolders here._');
 
     const shown = folders.slice(0, 30);
-    const rows = shown.map((f, i) => [{ text: `📁 ${f.name}`, callback_data: `mfu_nav:${i}` }]);
+    const rows = shown.map((f, i) => {
+        const c = mfu.countFilesRecursive(f);
+        const countLabel = c.total === 0 ? 'empty' : `${c.total} • 🎬${c.video} 🖼${c.photo}`;
+        return [{ text: `📁 ${f.name} (${countLabel})`, callback_data: `mfu_nav:${i}` }];
+    });
     if (folders.length > shown.length) text += `\n\n_...and ${folders.length - shown.length} more (showing first ${shown.length})._`;
 
     const actionRow = [];
@@ -5753,6 +5788,120 @@ async function downloadTelegramFile(fileId) {
     }
 }
 
+// The channel/group itself is gone from the bot's perspective — kicked,
+// banned, deleted, or never actually reachable. Reused everywhere a channel
+// reference might go stale, not just auto-post.
+function isChannelGoneError(err) {
+    const message = (err && (err.description || err.message)) || '';
+    return isPermanentCopyError(message);
+}
+
+function knownChatLabel(chatId) {
+    const chat = getKnownChats().find(c => String(c.id) === String(chatId));
+    return chat ? chat.title : String(chatId);
+}
+
+// Strips `chatId` out of every place it could be configured as a channel —
+// force-sub, MEGA upload destination, VIP category storage channel, and
+// every admin's isolated auto-post destination/source channels — then posts
+// one consolidated notice to the log channel. Called both reactively (the
+// moment a send/check fails with a "gone" error) and proactively (the
+// periodic sweep below), so a banned/removed channel never has to be
+// noticed and cleaned up by hand.
+async function autoRemoveDeadChannel(chatId, err) {
+    const removedFrom = [];
+    const config = loadConfig();
+
+    if (config.forceSubGroupIds && config.forceSubGroupIds.some(id => String(id) === String(chatId))) {
+        config.forceSubGroupIds = config.forceSubGroupIds.filter(id => String(id) !== String(chatId));
+        removedFrom.push('Force-Sub list');
+    }
+    if (config.megaUploadChannelId && String(config.megaUploadChannelId) === String(chatId)) {
+        config.megaUploadChannelId = null;
+        config.megaUploadMode = 'personal';
+        removedFrom.push('MEGA Upload Destination');
+    }
+    if (config.categoryStorageChannelId && String(config.categoryStorageChannelId) === String(chatId)) {
+        config.categoryStorageChannelId = null;
+        removedFrom.push('VIP Category Storage Channel');
+    }
+    saveConfig(config);
+
+    for (const cfg of getAllAutopostConfigs()) {
+        let changed = false;
+        const patch = {};
+        if (cfg.channelId && String(cfg.channelId) === String(chatId)) {
+            patch.channelId = null;
+            changed = true;
+            removedFrom.push(`Auto-Post Destination (admin \`${cfg.adminId}\`)`);
+        }
+        if (cfg.sourceChannelIds && cfg.sourceChannelIds.some(id => String(id) === String(chatId))) {
+            patch.sourceChannelIds = cfg.sourceChannelIds.filter(id => String(id) !== String(chatId));
+            changed = true;
+            removedFrom.push(`Auto-Post Source (admin \`${cfg.adminId}\`)`);
+        }
+        if (changed) setAutopostConfig(cfg.adminId, patch);
+    }
+
+    if (removedFrom.length === 0) return false; // not referenced anywhere (already cleaned up)
+
+    const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const label = knownChatLabel(chatId);
+    await sendToLogChannel(
+        `❌ *Channel Removed (Auto-Detected)*\n\n` +
+        `*When:* ${timestamp} IST\n` +
+        `*Channel:* ${escapeMd(label)} (\`${chatId}\`)\n` +
+        `*Reason:* ${(err && (err.description || err.message)) || 'Bot no longer has access.'}\n` +
+        `*Removed From:* ${removedFrom.join(', ')}\n\n` +
+        `This channel was automatically removed because the bot appears to have been kicked/banned or lost access. Re-add it (with the bot as admin again) via the relevant menu if this was accidental.`,
+        `chan-removed:${chatId}`
+    );
+    return true;
+}
+
+// Collects every currently-configured channel/group ID across all features,
+// deduplicated (a channel can serve more than one role at once).
+function getAllConfiguredChannelIds() {
+    const config = loadConfig();
+    const ids = new Set();
+    (config.forceSubGroupIds || []).forEach(id => ids.add(String(id)));
+    if (config.megaUploadChannelId) ids.add(String(config.megaUploadChannelId));
+    if (config.categoryStorageChannelId) ids.add(String(config.categoryStorageChannelId));
+    for (const cfg of getAllAutopostConfigs()) {
+        if (cfg.channelId) ids.add(String(cfg.channelId));
+        (cfg.sourceChannelIds || []).forEach(id => ids.add(String(id)));
+    }
+    return Array.from(ids);
+}
+
+// Proactive sweep — checks the bot's own membership in every configured
+// channel/group, regardless of whether anything has actually tried to use
+// it recently. Catches a ban/kick/deletion that happened on a channel the
+// bot hasn't needed to touch since (e.g. a force-sub group nobody's
+// requested to join in a while). Runs every 30 minutes; see the scheduler
+// setup near the bottom of the file.
+async function sweepChannelHealth() {
+    if (!botId) return; // not started up yet
+    const ids = getAllConfiguredChannelIds();
+    for (const chatId of ids) {
+        try {
+            const member = await bot.telegram.getChatMember(chatId, botId);
+            if (member && (member.status === 'kicked' || member.status === 'left')) {
+                await autoRemoveDeadChannel(chatId, { message: `Bot membership status: ${member.status}` });
+            }
+        } catch (error) {
+            if (isChannelGoneError(error)) {
+                await autoRemoveDeadChannel(chatId, error);
+            }
+            // Anything else (transient network error, rate limit) is left
+            // alone — it'll be checked again on the next sweep.
+        }
+        // Small stagger between checks so a large channel list doesn't
+        // burst-call getChatMember and risk Telegram's rate limits.
+        await new Promise(resolve => setTimeout(resolve, 300));
+    }
+}
+
 // The destination channel itself is unreachable (bot removed as admin,
 // channel deleted, wrong/stale ID). This is a config problem, not a video
 // problem — reported distinctly from per-video retry/skip so admins get a
@@ -5918,12 +6067,14 @@ async function runAutopostForAdmin(adminId, { preview = false } = {}) {
             const outcome = await handleAutopostFailure(adminId, tag, `Telegram rejected the post: ${err.description}`);
             return { error: outcome === 'skipped' ? 'bad_thumbnail_skipped' : 'bad_thumbnail_retry' };
         }
-        if (err.description && err.description.toLowerCase().includes('chat not found')) {
+        if (isChannelGoneError(err)) {
             // Not a video problem — the destination channel itself can't be
             // reached (bot removed as admin, channel deleted, wrong ID,
             // etc). Don't count this against the video's retry budget —
-            // it'll be the very next video posted once the channel is fixed.
-            await logDestinationUnreachable(adminId, cfg.channelId, err);
+            // auto-remove the dead channel so the admin isn't left posting
+            // into a void, and log it clearly.
+            const removed = await autoRemoveDeadChannel(cfg.channelId, err);
+            if (!removed) await logDestinationUnreachable(adminId, cfg.channelId, err);
             return { error: 'destination_unreachable' };
         }
         await logError(`Auto-post send (admin ${adminId}, tag ${tag})`, err);
@@ -6077,7 +6228,7 @@ async function renderAutopostPanel(ctx) {
     const keyboard = {
         inline_keyboard: [
             [{ text: '➕ Add Source Channel', callback_data: 'ap_setsource_menu' }, { text: '➖ Remove Source Channel', callback_data: 'ap_removesource_menu' }],
-            [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }],
+            [{ text: '📤 Set Destination Channel', callback_data: 'ap_setchannel_menu' }, ...(cfg.channelId ? [{ text: '🗑 Remove', callback_data: 'ap_removechannel' }] : [])],
             [{ text: '🔍 Verify Destination (sends a test message)', callback_data: 'ap_verify_dest' }],
             [{ text: `⏱ Interval: ${formatIntervalMinutes(cfg.intervalMinutes)}`, callback_data: 'ap_interval_menu' }],
             [{ text: '✏️ Set Caption', callback_data: 'ap_caption' }],
@@ -6113,6 +6264,13 @@ bot.action('ap_setchannel_menu', async (ctx) => {
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: rows }
     });
+});
+
+bot.action('ap_removechannel', async (ctx) => {
+    if (!(await requireAdmin(ctx, true))) return;
+    setAutopostConfig(ctx.from.id, { channelId: null });
+    await ctx.answerCbQuery('✅ Destination channel removed');
+    await renderAutopostPanel(ctx);
 });
 
 bot.action(/^ap_setchannel:(-?\d+)$/, async (ctx) => {
@@ -6158,8 +6316,13 @@ bot.action('ap_verify_dest', async (ctx) => {
             { parse_mode: 'Markdown' }
         );
     } catch (error) {
-        await logDestinationUnreachable(ctx.from.id, cfg.channelId, error);
-        await ctx.reply(`❌ Could not reach \`${cfg.channelId}\`: ${error.description || error.message}\n\nRe-set it via 📤 Set Destination Channel.`, { parse_mode: 'Markdown' });
+        if (isChannelGoneError(error)) {
+            const removed = await autoRemoveDeadChannel(cfg.channelId, error);
+            await ctx.reply(`❌ Could not reach \`${cfg.channelId}\`: ${error.description || error.message}\n\n${removed ? 'It has been automatically removed from your Auto-Post settings.' : 'Re-set it via 📤 Set Destination Channel.'}`, { parse_mode: 'Markdown' });
+        } else {
+            await logDestinationUnreachable(ctx.from.id, cfg.channelId, error);
+            await ctx.reply(`❌ Could not reach \`${cfg.channelId}\`: ${error.description || error.message}\n\nRe-set it via 📤 Set Destination Channel.`, { parse_mode: 'Markdown' });
+        }
     }
 });
 
@@ -6363,10 +6526,11 @@ bot.action('ap_confirm', async (ctx) => {
         await ctx.answerCbQuery('✅ Posted!');
         await ctx.editMessageCaption('✅ Posted to channel.').catch(() => {});
     } catch (error) {
-        if (error.description && error.description.toLowerCase().includes('chat not found')) {
-            await logDestinationUnreachable(ctx.from.id, cfg.channelId, error);
-            await ctx.answerCbQuery('❌ Destination channel unreachable.');
-            await ctx.editMessageCaption('🚫 Failed — destination channel not found. I may have been removed as admin there, or the channel was deleted/ID is wrong. Re-set it via 📤 Set Destination Channel.').catch(() => {});
+        if (isChannelGoneError(error)) {
+            const removed = await autoRemoveDeadChannel(cfg.channelId, error);
+            if (!removed) await logDestinationUnreachable(ctx.from.id, cfg.channelId, error);
+            await ctx.answerCbQuery('❌ Destination channel unreachable — removed.');
+            await ctx.editMessageCaption('🚫 Failed — destination channel not found. I may have been removed as admin there, or the channel was deleted/ID is wrong. It has been removed from your Auto-Post settings — set a new one via 📤 Set Destination Channel.').catch(() => {});
         } else {
             await ctx.answerCbQuery('❌ Failed to post.');
             logError('Auto-post confirm', error);
@@ -7969,23 +8133,21 @@ bot.on('document', (ctx) => {
     }
 });
 
-bot.catch((err, ctx) => {
-    console.error('Bot error:', err);
-    try {
-        if (ctx.chat.type === 'private') {
-            ctx.reply('❌ An internal error occurred. Please try again.');
-        }
-    } catch (e) {
-        console.error('Failed to send error:', e);
-    }
-});
-
 // Catches any error thrown inside command/action handlers that wasn't
 // already try/caught locally, so a single bad update can't crash the bot
-// silently — it gets logged (and sent to the error log channel if set).
+// silently — it gets logged (and sent to the error log channel if set) AND
+// the user gets a plain "something went wrong" reply instead of silence.
+// (Previously this was split into two separate bot.catch() calls — Telegraf
+// only keeps the last one registered, so the user-facing reply below was
+// dead code until this merge.)
 bot.catch((error, ctx) => {
     if (isMessageNotModifiedError(error)) return; // harmless no-op, nothing to fix or log
     logError(`Handler error (${ctx.updateType})`, error);
+    try {
+        if (ctx.chat && ctx.chat.type === 'private') {
+            ctx.reply('❌ An internal error occurred. Please try again.').catch(() => {});
+        }
+    } catch (e) { /* best-effort */ }
 });
 
 process.on('unhandledRejection', (error) => {
@@ -7998,6 +8160,7 @@ process.on('uncaughtException', (error) => {
 
 bot.telegram.getMe().then(async botInfo => {
     botUsername = botInfo.username;
+    botId = botInfo.id;
     console.log(`🤖 Bot username: @${botUsername}`);
 
     console.log('🚀 Starting MEGA Downloader Bot...');
@@ -8045,6 +8208,18 @@ bot.telegram.getMe().then(async botInfo => {
     // *during* the downtime (bot was off) gets cleaned up right away instead
     // of waiting for the first 60s tick.
     processDuePendingDeletions().catch(err => logError('Pending deletion startup sweep', err));
+
+    // Proactive channel health sweep — catches a banned/kicked/deleted
+    // channel even if nothing has tried to use it since (see
+    // sweepChannelHealth() above). Runs every 30 minutes; first run is
+    // delayed 2 minutes after startup (not immediate) so it doesn't pile
+    // onto every other startup task hitting the Telegram API at once.
+    setInterval(() => {
+        sweepChannelHealth().catch(err => logError('Channel health sweep', err));
+    }, 30 * 60 * 1000);
+    setTimeout(() => {
+        sweepChannelHealth().catch(err => logError('Channel health sweep (startup)', err));
+    }, 2 * 60 * 1000);
 
     // Any Folder Upload job still marked 'running' means the bot went down
     // mid-upload last time (crash, VPS restart, pm2 respawn) — pick it back

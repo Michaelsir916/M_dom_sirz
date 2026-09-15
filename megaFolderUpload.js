@@ -174,6 +174,29 @@ function classifyFile(name) {
     return 'other';
 }
 
+// Recursively counts every file under `node` (including nested subfolders),
+// broken down by type. Pure in-memory walk — loadFolderTree() already pulls
+// the whole nested tree in one MEGA API call, so this doesn't cost any extra
+// network round-trips no matter how deep the folder goes. Used to show
+// "🎬3 🖼2" style counts next to each subfolder in the browse UI, so an
+// admin can tell what's inside before opening it.
+function countFilesRecursive(node) {
+    const counts = { total: 0, video: 0, photo: 0, other: 0 };
+    const { folders, files } = splitChildren(node);
+    for (const f of files) {
+        counts.total++;
+        counts[classifyFile(f.name)]++;
+    }
+    for (const sub of folders) {
+        const subCounts = countFilesRecursive(sub);
+        counts.total += subCounts.total;
+        counts.video += subCounts.video;
+        counts.photo += subCounts.photo;
+        counts.other += subCounts.other;
+    }
+    return counts;
+}
+
 // Timeout scales with size so small files fail fast and large ones aren't
 // cut off mid-transfer. Mirrors the same logic already used elsewhere in
 // this project for the single-link download flow.
@@ -248,6 +271,7 @@ module.exports = {
     splitChildren,
     walkPath,
     classifyFile,
+    countFilesRecursive,
     pickAccount,
     downloadFileNode,
     ensureAccountStorage

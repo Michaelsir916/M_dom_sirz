@@ -232,13 +232,33 @@ async function sendToLogChannel(text, dedupeKey) {
     }
 }
 
+// megajs decrypts every node in a folder's tree in one batch. If even one
+// file/folder inside has broken or unresolvable key data (most often
+// because it was shared into that folder from a different MEGA account, or
+// the folder itself has some data-integrity issue on MEGA's side), the
+// whole decrypt crashes with this exact signature deep inside megajs's own
+// code, in a place our try/catch around loadFolderTree() can't reach — it's
+// thrown from megajs's internal request/decrypt chain, not from the
+// Promise we wrap it in. The bot survives it fine (see the
+// unhandledRejection/uncaughtException handlers below, which keep it from
+// crashing the process), but the raw crypto stack trace alone isn't
+// self-explanatory, so we attach a plain-English hint here.
+function isMegaDecryptCrash(error) {
+    const message = (error && error.message) || '';
+    const stack = (error && error.stack) || '';
+    return /Decipheriv|decryptECB/.test(stack) || /data.*argument.*must be of type string/i.test(message);
+}
+
 async function logError(label, error) {
     const message = (error && error.message) ? error.message : String(error);
     const stack = (error && error.stack) ? error.stack.split('\n').slice(0, 4).join('\n') : '';
     console.error(`❌ ${label}:`, message);
     const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const hint = isMegaDecryptCrash(error)
+        ? `\n\n💡 *Likely cause:* a file/folder inside the MEGA folder link being loaded has broken or unresolvable key data — usually because it was shared into that folder from a different MEGA account. megajs decrypts the whole folder tree in one batch, so this one bad item crashes the whole load. Not fixable from the bot's side; open the same folder in MEGA's own app, find the odd-one-out item (often something imported/shared differently from the rest), remove or re-add it, and try again. The bot itself is unaffected — no restart needed.`
+        : '';
     const text = `🚨 *Bot Error*\n\n*When:* ${timestamp} IST\n*Where:* ${label}\n*Error:* \`${message}\`` +
-        (stack ? `\n\n\`\`\`\n${stack}\n\`\`\`` : '');
+        (stack ? `\n\n\`\`\`\n${stack}\n\`\`\`` : '') + hint;
     // Dedup key: same label + same error message within 5 min = one log entry only.
     await sendToLogChannel(text, `err:${label}:${message}`);
 }
@@ -5256,10 +5276,22 @@ async function runFolderUploadJob(jobId) {
                 result = await mfu.downloadFileNode(node, destPath);
             } catch (error) {
                 if (mfu.isQuotaError(error) && currentAccount) {
+                    const fromLabel = currentAccount.label;
                     setMegaAccountCooldown(currentAccount.id, Date.now() + 6 * 60 * 60 * 1000); // 6h cooldown
                     triedAccountIds.push(currentAccount.id);
                     try {
                         await reloadTree();
+                        const toLabel = currentAccount ? currentAccount.label : 'Anonymous (no account left)';
+                        await sendToLogChannel(
+                            `🔄 *MEGA Account Switched*\n\n` +
+                            `*Reason:* Quota/bandwidth limit hit\n` +
+                            `*From:* ${escapeMd(fromLabel)}\n` +
+                            `*To:* ${escapeMd(toLabel)}\n` +
+                            `*File:* \`${fileEntry.name}\`\n` +
+                            `*Job:* \`${jobId}\`\n\n` +
+                            `_${fromLabel} is on a 6h cooldown before being tried again._`,
+                            `acc-switch:${jobId}:${currentAccount ? currentAccount.id : 'anon'}:${Date.now()}`
+                        );
                         continue; // retry this same file through the next account
                     } catch (reloadErr) {
                         fileEntry.status = 'failed';
@@ -5276,6 +5308,23 @@ async function runFolderUploadJob(jobId) {
                     break;
                 }
             }
+        }
+
+        // Every account was tried (each hit a quota/bandwidth error in turn)
+        // and none worked — this is different from a single hard failure, so
+        // it gets its own clearer message instead of the generic fallback.
+        if (!result && fileEntry.status === 'pending' && attempts >= maxAttempts) {
+            fileEntry.status = 'failed';
+            fileEntry.error = `All ${getMegaAccounts().length || 1} MEGA account(s) hit quota/bandwidth limits while downloading this file`;
+        }
+        if (!result && fileEntry.status === 'failed') {
+            await sendToLogChannel(
+                `❌ *Folder Upload: File Failed*\n\n` +
+                `*File:* \`${fileEntry.name}\`\n` +
+                `*Job:* \`${jobId}\`\n` +
+                `*Reason:* ${escapeMd(fileEntry.error || 'Unknown')}`,
+                `file-failed:${jobId}:${fileEntry.name}`
+            );
         }
 
         if (result) {
@@ -5327,12 +5376,15 @@ async function runFolderUploadJob(jobId) {
     const folderKey = `${job.url}::${job.pathNames.join('/')}`;
     recordFolderUpload(folderKey, job.destinationType, job.destinationId, { fileCount: job.sentCount, folderName: job.folderName });
 
+    const failedOrSkipped = job.files.filter(f => f.status === 'failed' || f.status === 'skipped_corrupt');
+    const reasonLines = failedOrSkipped.slice(0, 5).map(f => `  • \`${f.name}\`: ${f.error || 'Unknown reason'}`).join('\n');
     const summary = `✅ *Folder Upload Complete*\n\n` +
         `📁 ${escapeMd(job.folderName)}\n` +
         `📤 Destination: ${job.destinationType === 'channel' ? '📢' : '💎'} ${escapeMd(job.destinationLabel)}\n` +
         `✅ Sent: ${job.sentCount}\n` +
         (job.failedCount > 0 ? `❌ Failed: ${job.failedCount}\n` : '') +
-        (job.skippedCount > 0 ? `⏭ Skipped (corrupt/other): ${job.skippedCount}\n` : '');
+        (job.skippedCount > 0 ? `⏭ Skipped (corrupt/other): ${job.skippedCount}\n` : '') +
+        (reasonLines ? `\n*Why:*\n${reasonLines}${failedOrSkipped.length > 5 ? `\n  _...and ${failedOrSkipped.length - 5} more — see log channel._` : ''}` : '');
 
     try {
         if (progressMsgId) await bot.telegram.deleteMessage(job.chatId, progressMsgId).catch(() => {});

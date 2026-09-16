@@ -131,7 +131,7 @@ function loadFolderTree(url, storage) {
         }
         if (!root) return reject(new Error('Could not parse MEGA folder link'));
 
-        const timeout = setTimeout(() => reject(new Error('Timed out loading folder from MEGA')), 30000);
+        const timeout = setTimeout(() => reject(new Error('Timed out loading folder from MEGA (30s). If this keeps happening for the same link, one item inside the folder may have broken/unreadable data — try opening the link in MEGA\'s own app to check.')), 30000);
         root.loadAttributes((err) => {
             clearTimeout(timeout);
             if (err) return reject(new Error(`Failed to load folder: ${err.message}`));
